@@ -1,0 +1,8 @@
+{
+  "name": "BSDatabase",
+  "description": "Mobile-optimized Battle Spirits trading card game database, and deck builder.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

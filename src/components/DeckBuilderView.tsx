@@ -1,0 +1,1472 @@
+import React, { useMemo, useRef, useState } from 'react';
+import {
+  Plus,
+  Minus,
+  Copy,
+  Check,
+  Trash2,
+  FolderPlus,
+  AlertTriangle,
+  Download,
+  Loader2,
+  FileText,
+  ClipboardPaste,
+  Globe,
+  X,
+  FileDown,
+  FileJson,
+  FileSpreadsheet,
+} from 'lucide-react';
+import {
+  BattleSpiritsCard,
+  BattleSymbolKind,
+  CardColor,
+  CardType,
+  Deck,
+  DeckEntry,
+  GameFormat,
+} from '../types/card';
+import { ALL_COLORS, ALL_TYPES, COLOR_META } from '../data/theme';
+import { SymbolIcon } from './SymbolIcon';
+import { DeckCompositionChart } from './DeckCompositionChart';
+import { DeckStatsPanel } from './DeckStatsPanel';
+import { exportDecklistImage } from '../utils/deckImageExporter';
+import { exportDeckAsFile } from '../utils/deckDataExporter';
+import {
+  buildImportedDeckEntries,
+  extractSetCodeFromCardNumber,
+  parseDecklistText,
+} from '../utils/decklistImport';
+
+interface DeckBuilderViewProps {
+  decks: Deck[];
+  activeDeckId: string;
+  cardsById: Record<string, BattleSpiritsCard>;
+  onSelectDeck: (deckId: string) => void;
+  onCreateDeck: (name: string, format: GameFormat, archetype: string) => void;
+  onChangeDeckFormat: (deckId: string, format: GameFormat) => void;
+  onRemoveIllegalCards: (deckId: string) => void;
+  onDeleteDeck: (deckId: string) => void;
+  onUpdateCardQty: (cardId: string, delta: number) => void;
+  onImportDeckEntries: (options: {
+    mode: 'replace' | 'merge' | 'new';
+    entries: DeckEntry[];
+    newDeckName?: string;
+    newDeckFormat?: GameFormat;
+    newDeckArchetype?: string;
+  }) => void;
+  onSyncMissingImportCards?: (queries: {
+    setCodes: string[];
+    queries: string[];
+  }) => Promise<number>;
+  onInspectCard: (card: BattleSpiritsCard) => void;
+  onBrowseCatalog: () => void;
+  onNotify?: (message: string) => void;
+}
+
+export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
+  decks,
+  activeDeckId,
+  cardsById,
+  onSelectDeck,
+  onCreateDeck,
+  onChangeDeckFormat,
+  onRemoveIllegalCards,
+  onDeleteDeck,
+  onUpdateCardQty,
+  onImportDeckEntries,
+  onSyncMissingImportCards,
+  onInspectCard,
+  onBrowseCatalog,
+  onNotify,
+}) => {
+  const [creating, setCreating] = useState(false);
+  const [newDeckName, setNewDeckName] = useState('');
+  const [newDeckFormat, setNewDeckFormat] = useState<GameFormat>('Standard');
+  const [newArchetype, setNewArchetype] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importMode, setImportMode] = useState<'replace' | 'merge' | 'new'>('replace');
+  const [importDeckName, setImportDeckName] = useState('');
+  const [importDeckFormat, setImportDeckFormat] = useState<GameFormat | null>(null);
+  const [syncingMissing, setSyncingMissing] = useState(false);
+  const importTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const [copied, setCopied] = useState(false);
+  const [showTextExport, setShowTextExport] = useState(false);
+  const [showExportOptions, setShowExportOptions] = useState(false);
+  const [lastExportedFormat, setLastExportedFormat] = useState<'json' | 'csv' | null>(null);
+  const [textFormatMode, setTextFormatMode] = useState<'grouped' | 'compact'>('grouped');
+  const [downloading, setDownloading] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const activeDeck = decks.find((d) => d.id === activeDeckId) || decks[0];
+  const activeFormat: GameFormat = activeDeck?.format || 'Eternal';
+  const allCardsList = useMemo(() => Object.values(cardsById), [cardsById]);
+
+  const effectiveImportMode: 'replace' | 'merge' | 'new' = activeDeck ? importMode : 'new';
+  const targetImportFormat: GameFormat =
+    effectiveImportMode === 'new' ? importDeckFormat || activeFormat : activeFormat;
+
+  const importPreview = useMemo(() => {
+    if (!importText.trim()) return null;
+    return parseDecklistText(importText, allCardsList, targetImportFormat);
+  }, [importText, allCardsList, targetImportFormat]);
+
+  const resolvedNewImportFormat: GameFormat =
+    importDeckFormat || importPreview?.detectedFormat || 'Eternal';
+
+  const resolvedEntries = activeDeck
+    ? activeDeck.entries
+        .map((entry) => ({
+          ...entry,
+          card: cardsById[entry.cardId],
+        }))
+        .filter((item): item is { cardId: string; quantity: number; card: BattleSpiritsCard } =>
+          Boolean(item.card)
+        )
+    : [];
+
+  const getMaxCopies = (card: BattleSpiritsCard) =>
+    card.restriction === 'Restricted <1>'
+      ? 1
+      : card.restriction === 'Restricted <2>'
+      ? 2
+      : 3;
+
+  const formatIllegalEntries = resolvedEntries.filter(
+    ({ card }) => activeFormat === 'Standard' && !card.formats.includes('Standard')
+  );
+
+  const restrictionViolations = resolvedEntries.filter(
+    ({ card, quantity }) => quantity > getMaxCopies(card)
+  );
+
+  const hasViolations = formatIllegalEntries.length > 0 || restrictionViolations.length > 0;
+
+  const totalCards = resolvedEntries.reduce((sum, item) => sum + item.quantity, 0);
+  const targetMin = 40;
+  const progressPct = Math.min(100, Math.round((totalCards / targetMin) * 100));
+
+  const [selectedCostBucket, setSelectedCostBucket] = useState<number | null>(null);
+
+  const costBuckets = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+  const costBreakdown = costBuckets.map((bucket) => {
+    const matching = resolvedEntries.filter(({ card }) =>
+      bucket === 8 ? card.cost >= 8 : card.cost === bucket
+    );
+    const total = matching.reduce((sum, item) => sum + item.quantity, 0);
+    const byColor = ALL_COLORS.map((color) => ({
+      color,
+      count: matching
+        .filter((item) => item.card.color === color)
+        .reduce((sum, item) => sum + item.quantity, 0),
+    })).filter((c) => c.count > 0);
+    return { bucket, total, byColor, cards: matching };
+  });
+  const maxCostBucket = Math.max(1, ...costBreakdown.map((b) => b.total));
+
+
+  const typeCounts = ALL_TYPES.reduce((acc, type) => {
+    acc[type] = resolvedEntries
+      .filter((e) => e.card.type === type)
+      .reduce((sum, e) => sum + e.quantity, 0);
+    return acc;
+  }, {} as Record<CardType, number>);
+
+  const colorCounts = ALL_COLORS.reduce((acc, color) => {
+    acc[color] = resolvedEntries
+      .filter((e) => e.card.color === color)
+      .reduce((sum, e) => sum + e.quantity, 0);
+    return acc;
+  }, {} as Record<CardColor, number>);
+
+  const activeBucketDetail =
+    selectedCostBucket !== null
+      ? costBreakdown.find((b) => b.bucket === selectedCostBucket) || null
+      : null;
+
+  const handleCreateSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = newDeckName.trim();
+    if (!trimmed) return;
+    onCreateDeck(trimmed, newDeckFormat, newArchetype.trim() || `${newDeckFormat} Build`);
+    setNewDeckName('');
+    setNewArchetype('');
+    setCreating(false);
+  };
+
+  const buildDecklistText = (mode: 'grouped' | 'compact' = textFormatMode) => {
+    if (!activeDeck) return '';
+    if (mode === 'compact') {
+      return [
+        `// ${activeDeck.name} (${activeFormat} · ${totalCards} cards)`,
+        ...resolvedEntries.map(
+          ({ card, quantity }) => `${quantity} ${card.cardNumber} ${card.name}`
+        ),
+      ].join('\n');
+    }
+
+    const sections: string[] = [
+      `// ${activeDeck.name} [${activeFormat}] (${totalCards} cards)`,
+    ];
+    for (const type of ALL_TYPES) {
+      const items = resolvedEntries.filter((e) => e.card.type === type);
+      if (items.length === 0) continue;
+      const typeQty = items.reduce((s, e) => s + e.quantity, 0);
+      sections.push('');
+      sections.push(`// ${type} (${typeQty})`);
+      for (const { card, quantity } of items) {
+        sections.push(`${quantity}x ${card.name} [${card.cardNumber}]`);
+      }
+    }
+    return sections.join('\n');
+  };
+
+  const copyTextToClipboard = async (text: string): Promise<boolean> => {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // fall through to textarea fallback for sandboxed iframes
+      }
+    }
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleCopyList = async () => {
+    if (!activeDeck || resolvedEntries.length === 0) return;
+    const text = buildDecklistText(textFormatMode);
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
+      setCopied(true);
+      onNotify?.(`Copied ${activeDeck.name} deck list to clipboard`);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      setShowTextExport(true);
+      onNotify?.('Select and copy the deck list text below');
+    }
+  };
+
+  const handleDownloadImage = async () => {
+    if (!activeDeck || resolvedEntries.length === 0 || downloading) return;
+    setDownloading(true);
+    try {
+      const filename = await exportDecklistImage(activeDeck, resolvedEntries);
+      setDownloaded(true);
+      onNotify?.(`Saved ${filename}`);
+      setTimeout(() => setDownloaded(false), 2400);
+    } catch {
+      onNotify?.('Could not generate decklist image');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleExportDeckFile = (fileFormat: 'json' | 'csv') => {
+    if (!activeDeck || resolvedEntries.length === 0) return;
+    try {
+      const filename = exportDeckAsFile(activeDeck, resolvedEntries, fileFormat);
+      setLastExportedFormat(fileFormat);
+      onNotify?.(`Exported ${filename}`);
+      setTimeout(() => setLastExportedFormat(null), 2400);
+    } catch {
+      onNotify?.(`Could not export ${fileFormat.toUpperCase()} file`);
+    }
+  };
+
+  const handlePasteFromClipboard = async () => {
+    if (navigator.clipboard?.readText) {
+      try {
+        const clip = await navigator.clipboard.readText();
+        if (clip.trim()) {
+          setImportText(clip);
+          onNotify?.('Pasted deck list from clipboard');
+          return;
+        }
+      } catch {
+        // clipboard read denied inside iframe; focus textarea instead
+      }
+    }
+    importTextareaRef.current?.focus();
+    onNotify?.('Paste your deck list text directly into the box');
+  };
+
+  const handleSyncMissing = async () => {
+    if (!importPreview || importPreview.unmatchedLines.length === 0 || !onSyncMissingImportCards) {
+      return;
+    }
+    setSyncingMissing(true);
+    try {
+      const setCodes: string[] = [];
+      const queries: string[] = [];
+      for (const line of importPreview.unmatchedLines) {
+        if (line.parsedCardNumber) {
+          const sc = extractSetCodeFromCardNumber(line.parsedCardNumber);
+          if (sc) setCodes.push(sc);
+          queries.push(line.parsedCardNumber);
+        } else if (line.parsedName) {
+          queries.push(line.parsedName);
+        }
+      }
+      const synced = await onSyncMissingImportCards({ setCodes, queries });
+      if (synced > 0) {
+        onNotify?.('Synced matching Wiki sets — re-checking deck list');
+      } else {
+        onNotify?.('No additional matching cards found on Wiki');
+      }
+    } finally {
+      setSyncingMissing(false);
+    }
+  };
+
+  const handleApplyImport = () => {
+    if (!importPreview || importPreview.aggregatedEntries.length === 0) return;
+
+    const existingEntries = activeDeck ? activeDeck.entries : [];
+    const { entries, cappedCards } = buildImportedDeckEntries(
+      importPreview.aggregatedEntries,
+      existingEntries,
+      effectiveImportMode
+    );
+
+    const resolvedFormat: GameFormat =
+      effectiveImportMode === 'new' ? resolvedNewImportFormat : activeFormat;
+
+    const resolvedName =
+      importDeckName.trim() ||
+      importPreview.detectedDeckName ||
+      `Imported ${resolvedFormat} Deck`;
+
+    onImportDeckEntries({
+      mode: effectiveImportMode,
+      entries,
+      newDeckName: resolvedName,
+      newDeckFormat: resolvedFormat,
+      newDeckArchetype: 'Imported List',
+    });
+
+    if (cappedCards.length > 0) {
+      onNotify?.(
+        `Applied restriction/3-copy cap to: ${cappedCards.slice(0, 3).join(', ')}${
+          cappedCards.length > 3 ? ` +${cappedCards.length - 3} more` : ''
+        }`
+      );
+    }
+
+    setImportText('');
+    setImportDeckName('');
+    setImportDeckFormat(null);
+    setImporting(false);
+  };
+
+  const deckStatusLabel = hasViolations
+    ? 'Format / Copy Violation'
+    : totalCards >= 40
+    ? `Legal (${activeFormat === 'Standard' ? 'STD' : 'ETN'})`
+    : `Need ${40 - totalCards} more`;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-2xl font-bold text-slate-900">Deck Builder</h1>
+          <p className="text-sm text-slate-500">
+            Build for Standard (Block A cards only) or Eternal (all-era cards), 40+ cards, max 3 copies unless restricted.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              setImporting((v) => !v);
+              setCreating(false);
+              if (!activeDeck) setImportMode('new');
+            }}
+            className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border ${
+              importing
+                ? 'bg-red-50 text-red-700 border-red-200'
+                : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
+            }`}
+          >
+            <ClipboardPaste className="w-4 h-4" />
+            <span>Import List</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setCreating((v) => !v);
+              setImporting(false);
+            }}
+            className="min-h-[44px] px-4 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shrink-0 cursor-pointer"
+          >
+            <FolderPlus className="w-4 h-4" />
+            <span>New Deck</span>
+          </button>
+        </div>
+      </div>
+
+      {importing && (
+        <div className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200 space-y-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="font-display text-base font-bold text-slate-900">
+                Import Deck List from Text
+              </h2>
+              <p className="text-xs text-slate-500">
+                Paste a deck list using Card Name + Number (e.g.{' '}
+                <code className="font-mono text-slate-700">3x Petristar [26RBS01-001]</code> or{' '}
+                <code className="font-mono text-slate-700">3 26RBS01-001 Petristar</code>) to match against the database.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setImporting(false)}
+              className="min-h-[36px] min-w-[36px] rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 flex items-center justify-center cursor-pointer"
+              aria-label="Close import panel"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Import Mode + Target Deck Settings */}
+          <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+            <div className="sm:col-span-5">
+              <div className="text-xs font-semibold text-slate-600 mb-1">Import Target</div>
+              <div className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-xl">
+                {(
+                  [
+                    { id: 'replace' as const, label: 'Replace Deck', disabled: !activeDeck },
+                    { id: 'merge' as const, label: 'Merge Into', disabled: !activeDeck },
+                    { id: 'new' as const, label: 'New Deck', disabled: false },
+                  ]
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    disabled={opt.disabled}
+                    onClick={() => setImportMode(opt.id)}
+                    className={`min-h-[36px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                      effectiveImportMode === opt.id
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {effectiveImportMode === 'new' ? (
+              <>
+                <div className="sm:col-span-4">
+                  <label
+                    htmlFor="import-deck-name"
+                    className="block text-xs font-semibold text-slate-600 mb-1"
+                  >
+                    New Deck Name
+                  </label>
+                  <input
+                    id="import-deck-name"
+                    type="text"
+                    value={importDeckName}
+                    onChange={(e) => setImportDeckName(e.target.value)}
+                    placeholder={importPreview?.detectedDeckName || 'e.g., Imported Red Dragon'}
+                    className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
+                  />
+                </div>
+                <div className="sm:col-span-3">
+                  <div className="text-xs font-semibold text-slate-600 mb-1">Format</div>
+                  <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl">
+                    {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => {
+                      const activeFmt = resolvedNewImportFormat;
+                      return (
+                        <button
+                          key={fmt}
+                          type="button"
+                          onClick={() => setImportDeckFormat(fmt)}
+                          className={`min-h-[36px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                            activeFmt === fmt
+                              ? fmt === 'Standard'
+                                ? 'bg-sky-700 text-white shadow-sm'
+                                : 'bg-amber-700 text-white shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          {fmt}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="sm:col-span-7 flex items-center min-h-[44px] px-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-600">
+                {effectiveImportMode === 'replace' ? (
+                  <span>
+                    Will replace cards in{' '}
+                    <strong className="text-slate-900">{activeDeck?.name}</strong> ({activeFormat})
+                  </span>
+                ) : (
+                  <span>
+                    Will add matched cards to{' '}
+                    <strong className="text-slate-900">{activeDeck?.name}</strong> (enforcing copy limits)
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Paste Textarea */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <label
+                htmlFor="decklist-import-textarea"
+                className="text-xs font-semibold text-slate-700"
+              >
+                Deck List Text
+              </label>
+              <div className="flex items-center gap-2">
+                {importText && (
+                  <button
+                    type="button"
+                    onClick={() => setImportText('')}
+                    className="text-xs font-semibold text-slate-500 hover:text-slate-800 cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handlePasteFromClipboard}
+                  className="min-h-[32px] px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <ClipboardPaste className="w-3.5 h-3.5" />
+                  <span>Paste Clipboard</span>
+                </button>
+              </div>
+            </div>
+            <textarea
+              ref={importTextareaRef}
+              id="decklist-import-textarea"
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              rows={6}
+              placeholder={`// Example formats:\n3x Petristar [26RBS01-001]\n3 RP26-01 The ThunderEmperorDragon Siegwurm\n2x Flame Dance (26RBS01-085)\n3x Blizzard Wall [BSC22-144]`}
+              className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50/50 font-mono text-xs text-slate-800 leading-relaxed focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-600"
+            />
+          </div>
+
+          {/* Live Automatic Match Preview */}
+          {importPreview && importPreview.totalParsedLines > 0 && (
+            <div className="space-y-3 pt-2 border-t border-slate-100">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-semibold text-slate-900">
+                  Match Preview:{' '}
+                  <span className="font-mono text-emerald-700 tabular-nums">
+                    {importPreview.totalMatchedCards} cards
+                  </span>{' '}
+                  ({importPreview.matchedLines.length} matched
+                  {importPreview.unmatchedLines.length > 0 && (
+                    <span className="text-amber-700">
+                      , {importPreview.unmatchedLines.length} unmatched
+                    </span>
+                  )}
+                  )
+                </div>
+
+                {importPreview.unmatchedLines.length > 0 && onSyncMissingImportCards && (
+                  <button
+                    type="button"
+                    onClick={handleSyncMissing}
+                    disabled={syncingMissing}
+                    className="min-h-[36px] px-3 rounded-lg bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {syncingMissing ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Globe className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {syncingMissing ? 'Searching Wiki...' : 'Lookup Unmatched on Wiki'}
+                    </span>
+                  </button>
+                )}
+              </div>
+
+              {importPreview.matchedLines.length > 0 && (
+                <div className="max-h-56 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white">
+                  {importPreview.matchedLines.map((line) => {
+                    const card = line.matchedCard!;
+                    const isIllegalStd =
+                      targetImportFormat === 'Standard' && !card.formats.includes('Standard');
+                    return (
+                      <div
+                        key={`match-${line.lineNumber}`}
+                        className="px-3 py-2 flex items-center justify-between gap-3 text-xs"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onInspectCard(card)}
+                          className="min-w-0 flex-1 flex items-center gap-2 text-left cursor-pointer hover:underline"
+                        >
+                          <SymbolIcon color={card.color} size="xs" variant="gem" />
+                          <span className="font-semibold text-slate-900 truncate">
+                            {card.name}
+                          </span>
+                          <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                            {card.cardNumber}
+                          </span>
+                          {isIllegalStd && (
+                            <span className="text-[11px] font-semibold text-amber-700 shrink-0">
+                              (ETN Only)
+                            </span>
+                          )}
+                        </button>
+                        <div className="flex items-center gap-2.5 shrink-0">
+                          <span className="text-[11px] text-slate-500">
+                            {line.confidence === 'exact-number'
+                              ? 'By Number'
+                              : line.confidence === 'exact-name'
+                              ? 'By Name'
+                              : 'Fuzzy Name'}
+                          </span>
+                          <span className="font-mono font-bold text-slate-900 tabular-nums">
+                            ×{line.quantity}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {importPreview.unmatchedLines.length > 0 && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 space-y-1.5">
+                  <div className="text-xs font-semibold text-amber-900">
+                    Unmatched Lines ({importPreview.unmatchedLines.length})
+                  </div>
+                  <ul className="space-y-1 text-[11px] text-amber-900/90 font-mono">
+                    {importPreview.unmatchedLines.map((line) => (
+                      <li key={`unmatched-${line.lineNumber}`} className="truncate">
+                        Line {line.lineNumber}: {line.rawText}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() => setImporting(false)}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleApplyImport}
+              disabled={!importPreview || importPreview.totalMatchedCards === 0}
+              className="min-h-[44px] px-5 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer"
+            >
+              {effectiveImportMode === 'new'
+                ? `Create Deck (${importPreview?.totalMatchedCards || 0} Cards)`
+                : effectiveImportMode === 'merge'
+                ? `Add ${importPreview?.totalMatchedCards || 0} Cards`
+                : `Import ${importPreview?.totalMatchedCards || 0} Cards`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {creating && (
+        <form
+          onSubmit={handleCreateSubmit}
+          className="p-4 rounded-2xl bg-white border border-slate-200 grid grid-cols-1 sm:grid-cols-12 gap-3 items-end"
+        >
+          <div className="sm:col-span-4">
+            <label htmlFor="new-deck-name" className="block text-xs font-semibold text-slate-600 mb-1">
+              Deck Name
+            </label>
+            <input
+              id="new-deck-name"
+              type="text"
+              value={newDeckName}
+              onChange={(e) => setNewDeckName(e.target.value)}
+              placeholder="e.g., Olym Thunderbolt Control"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
+              required
+            />
+          </div>
+          <div className="sm:col-span-3">
+            <div className="block text-xs font-semibold text-slate-600 mb-1">Format</div>
+            <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl">
+              {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => (
+                <button
+                  key={fmt}
+                  type="button"
+                  onClick={() => setNewDeckFormat(fmt)}
+                  className={`min-h-[36px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                    newDeckFormat === fmt
+                      ? fmt === 'Standard'
+                        ? 'bg-sky-700 text-white shadow-sm'
+                        : 'bg-amber-700 text-white shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {fmt}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="sm:col-span-3">
+            <label htmlFor="new-deck-arch" className="block text-xs font-semibold text-slate-600 mb-1">
+              Archetype
+            </label>
+            <input
+              id="new-deck-arch"
+              type="text"
+              value={newArchetype}
+              onChange={(e) => setNewArchetype(e.target.value)}
+              placeholder="e.g., Contract Saga"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
+            />
+          </div>
+          <div className="sm:col-span-2 flex gap-2">
+            <button
+              type="submit"
+              className="flex-1 min-h-[44px] px-4 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 cursor-pointer"
+            >
+              Create
+            </button>
+            <button
+              type="button"
+              onClick={() => setCreating(false)}
+              className="min-h-[44px] px-3 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
+        {decks.map((deck) => {
+          const isSelected = deck.id === activeDeck?.id;
+          const count = deck.entries.reduce((s, e) => s + e.quantity, 0);
+          const fmtShort = (deck.format || 'Eternal') === 'Standard' ? 'STD' : 'ETN';
+          return (
+            <button
+              key={deck.id}
+              type="button"
+              onClick={() => {
+                onSelectDeck(deck.id);
+                setSelectedCostBucket(null);
+                setConfirmDeleteId(null);
+              }}
+              className={`min-h-[44px] px-4 py-2 rounded-xl text-left border shrink-0 transition-colors cursor-pointer ${
+                isSelected
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-800 border-slate-200 hover:border-slate-300'
+              }`}
+            >
+              <div className="text-xs font-semibold whitespace-nowrap">{deck.name}</div>
+              <div
+                className={`text-[11px] font-mono tabular-nums ${
+                  isSelected ? 'text-slate-300' : 'text-slate-500'
+                }`}
+              >
+                {fmtShort} · {count} cards · {deck.archetype}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      {!activeDeck && (
+        <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-3">
+          <h2 className="font-display text-lg font-bold text-slate-900">No Decks Yet</h2>
+          <p className="text-sm text-slate-500">
+            Create a Standard or Eternal deck to start adding Battle Spirits cards.
+          </p>
+          <button
+            type="button"
+            onClick={() => setCreating(true)}
+            className="min-h-[44px] px-5 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center gap-2 hover:bg-slate-800 cursor-pointer"
+          >
+            <FolderPlus className="w-4 h-4" />
+            <span>Create New Deck</span>
+          </button>
+        </div>
+      )}
+
+      {activeDeck && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+          <div className="lg:col-span-5 space-y-4">
+            <div className="p-4 rounded-2xl bg-white border border-slate-200 space-y-5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="font-display text-lg font-bold text-slate-900 truncate">
+                    {activeDeck.name}
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    {activeDeck.archetype} · Updated {activeDeck.updatedAt}
+                  </p>
+                </div>
+
+                <div className="text-right shrink-0">
+                  <div className="font-mono text-xl font-bold tabular-nums text-slate-900">
+                    {totalCards}
+                    <span className="text-sm font-normal text-slate-400"> / 40+</span>
+                  </div>
+                  <div
+                    className={`text-[11px] font-semibold ${
+                      hasViolations
+                        ? 'text-amber-700'
+                        : totalCards >= 40
+                        ? 'text-emerald-700'
+                        : 'text-amber-700'
+                    }`}
+                  >
+                    {deckStatusLabel}
+                  </div>
+                </div>
+              </div>
+
+              {/* Deck Format Toggle */}
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="text-xs font-semibold text-slate-600">Target Format</span>
+                <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+                  {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => (
+                    <button
+                      key={fmt}
+                      type="button"
+                      onClick={() => onChangeDeckFormat(activeDeck.id, fmt)}
+                      className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                        activeFormat === fmt
+                          ? fmt === 'Standard'
+                            ? 'bg-sky-700 text-white shadow-sm'
+                            : 'bg-amber-700 text-white shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {fmt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {hasViolations && (
+                <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 space-y-2.5 text-xs text-amber-950">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      {formatIllegalEntries.length > 0 && (
+                        <p>
+                          <span className="font-semibold">
+                            {formatIllegalEntries.length} card
+                            {formatIllegalEntries.length === 1 ? '' : 's'} not legal in Standard:
+                          </span>{' '}
+                          {formatIllegalEntries.map((e) => e.card.name).join(', ')}.
+                        </p>
+                      )}
+                      {restrictionViolations.length > 0 && (
+                        <p>
+                          <span className="font-semibold">Restriction limit exceeded:</span>{' '}
+                          {restrictionViolations
+                            .map((e) => `${e.card.name} (${e.card.restriction})`)
+                            .join(', ')}
+                          .
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onRemoveIllegalCards(activeDeck.id)}
+                      className="min-h-[36px] px-3 rounded-lg bg-amber-700 text-white font-semibold hover:bg-amber-800 cursor-pointer"
+                    >
+                      Fix / Remove Illegal
+                    </button>
+                    {formatIllegalEntries.length > 0 && activeFormat === 'Standard' && (
+                      <button
+                        type="button"
+                        onClick={() => onChangeDeckFormat(activeDeck.id, 'Eternal')}
+                        className="min-h-[36px] px-3 rounded-lg bg-white border border-amber-300 text-amber-900 font-semibold hover:bg-amber-100 cursor-pointer"
+                      >
+                        Switch to Eternal
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${
+                    totalCards >= 40 && !hasViolations ? 'bg-emerald-600' : 'bg-red-600'
+                  }`}
+                  style={{ width: `${progressPct}%` }}
+                />
+              </div>
+
+              <DeckStatsPanel resolvedEntries={resolvedEntries} totalCards={totalCards} />
+
+              {/* Interactive Cost Distribution Histogram */}
+              <div className="pt-2 border-t border-slate-100">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <span className="text-xs font-semibold text-slate-700">
+                    Cost Distribution Histogram
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Tap bar to inspect
+                  </span>
+                </div>
+
+                <div className="relative">
+                  <div
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-x-0 top-5 bottom-6 flex flex-col justify-between"
+                  >
+                    <div className="border-t border-dashed border-slate-200/80" />
+                    <div className="border-t border-dashed border-slate-200/80" />
+                    <div className="border-t border-slate-200" />
+                  </div>
+
+                  <div className="relative grid grid-cols-9 gap-1.5 items-end h-36">
+                    {costBreakdown.map(({ bucket, total, byColor }) => {
+                      const isActive = selectedCostBucket === bucket;
+                      const heightPct = total > 0 ? Math.max(12, (total / maxCostBucket) * 100) : 0;
+                      return (
+                        <button
+                          key={bucket}
+                          type="button"
+                          onClick={() =>
+                            setSelectedCostBucket((prev) => (prev === bucket ? null : bucket))
+                          }
+                          className={`group h-full flex flex-col items-center justify-end gap-1 rounded-lg px-0.5 py-1 transition-colors cursor-pointer ${
+                            isActive ? 'bg-slate-100' : 'hover:bg-slate-50'
+                          }`}
+                          aria-label={`Cost ${bucket === 8 ? '8 plus' : bucket}: ${total} cards`}
+                          aria-pressed={isActive}
+                        >
+                          <span
+                            className={`font-mono text-[11px] font-semibold tabular-nums h-4 leading-4 ${
+                              total > 0 ? 'text-slate-900' : 'text-transparent'
+                            }`}
+                          >
+                            {total}
+                          </span>
+
+                          <div className="w-full flex-1 flex items-end px-0.5">
+                            {total > 0 ? (
+                              <div
+                                className={`w-full rounded-t-md overflow-hidden flex flex-col-reverse transition-all ${
+                                  isActive ? 'ring-2 ring-slate-900 ring-offset-1' : ''
+                                }`}
+                                style={{ height: `${heightPct}%` }}
+                              >
+                                {byColor.map(({ color, count }) => (
+                                  <div
+                                    key={color}
+                                    style={{
+                                      height: `${(count / total) * 100}%`,
+                                      backgroundColor: COLOR_META[color].hex,
+                                    }}
+                                  />
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="w-full h-1 rounded-full bg-slate-200/70" />
+                            )}
+                          </div>
+
+                          <span
+                            className={`font-mono text-[11px] tabular-nums ${
+                              isActive ? 'font-bold text-slate-900' : 'text-slate-500'
+                            }`}
+                          >
+                            {bucket === 8 ? '8+' : bucket}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {activeBucketDetail && (
+                  <div className="mt-3 p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-900">
+                        Cost {activeBucketDetail.bucket === 8 ? '8+' : activeBucketDetail.bucket} Cards
+                      </span>
+                      <span className="font-mono text-slate-600 tabular-nums">
+                        {activeBucketDetail.total} cards (
+                        {totalCards > 0
+                          ? Math.round((activeBucketDetail.total / totalCards) * 100)
+                          : 0}
+                        %)
+                      </span>
+                    </div>
+                    {activeBucketDetail.cards.length === 0 ? (
+                      <p className="text-xs text-slate-500">No cards at this cost in deck.</p>
+                    ) : (
+                      <ul className="space-y-1.5">
+                        {activeBucketDetail.cards.map(({ card, quantity }) => (
+                          <li
+                            key={card.id}
+                            className="flex items-center justify-between gap-2 text-xs text-slate-700"
+                          >
+                            <span className="inline-flex items-center gap-1.5 min-w-0">
+                              <SymbolIcon color={card.color} size="xs" variant="gem" />
+                              <span className="truncate">{card.name}</span>
+                            </span>
+                            <span className="font-mono font-semibold tabular-nums shrink-0">
+                              ×{quantity}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Visual Breakdown by Type & Attribute */}
+              <div className="space-y-4 pt-2 border-t border-slate-100">
+                <div>
+                  <div className="flex items-center justify-between text-xs mb-2">
+                    <span className="font-semibold text-slate-700">Attribute Mix</span>
+                    <span className="font-mono text-slate-500 tabular-nums">{totalCards} total</span>
+                  </div>
+                  {totalCards > 0 ? (
+                    <div className="h-2.5 w-full rounded-full overflow-hidden flex bg-slate-100">
+                      {ALL_COLORS.filter((c) => colorCounts[c] > 0).map((c) => (
+                        <div
+                          key={c}
+                          style={{
+                            width: `${(colorCounts[c] / totalCards) * 100}%`,
+                            backgroundColor: COLOR_META[c].hex,
+                          }}
+                          title={`${c}: ${colorCounts[c]} cards`}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="h-2.5 w-full rounded-full bg-slate-100" />
+                  )}
+                  <div className="mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                    {ALL_COLORS.filter((c) => colorCounts[c] > 0).map((c) => (
+                      <div key={c} className="flex items-center justify-between text-slate-700">
+                        <span className="inline-flex items-center gap-1.5">
+                          <SymbolIcon color={c} size="xs" variant="gem" />
+                          <span className={`font-semibold ${COLOR_META[c].text}`}>{c}</span>
+                        </span>
+                        <span className="font-mono font-semibold tabular-nums">
+                          {colorCounts[c]}{' '}
+                          <span className="text-[11px] font-normal text-slate-400">
+                            ({totalCards > 0 ? Math.round((colorCounts[c] / totalCards) * 100) : 0}%)
+                          </span>
+                        </span>
+                      </div>
+                    ))}
+                    {ALL_COLORS.every((c) => colorCounts[c] === 0) && (
+                      <div className="text-slate-400 col-span-2">No cards added yet</div>
+                    )}
+                  </div>
+                </div>
+
+                <DeckCompositionChart typeCounts={typeCounts} totalCards={totalCards} />
+              </div>
+
+              <div className="space-y-2.5 pt-2 border-t border-slate-100">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDownloadImage}
+                    disabled={resolvedEntries.length === 0 || downloading}
+                    className="flex-1 min-w-[140px] min-h-[44px] px-4 rounded-xl bg-red-600 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-red-700 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                  >
+                    {downloading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : downloaded ? (
+                      <Check className="w-4 h-4" />
+                    ) : (
+                      <Download className="w-4 h-4" />
+                    )}
+                    <span>
+                      {downloading
+                        ? 'Generating PNG...'
+                        : downloaded
+                        ? 'Image Saved'
+                        : 'Download Decklist'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCopyList}
+                    disabled={resolvedEntries.length === 0}
+                    className="flex-1 min-w-[140px] min-h-[44px] px-4 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-slate-800 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                  >
+                    {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                    <span>{copied ? 'Copied Deck List' : 'Copy Deck List'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowExportOptions((v) => !v);
+                      setShowTextExport(false);
+                    }}
+                    disabled={resolvedEntries.length === 0}
+                    className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0 disabled:opacity-45 ${
+                      showExportOptions
+                        ? 'border-slate-900 bg-slate-900 text-white'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                    aria-expanded={showExportOptions}
+                    aria-label="Export deck as JSON or CSV file"
+                  >
+                    <FileDown className="w-4 h-4" />
+                    <span>Export Deck</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowTextExport((v) => !v);
+                      setShowExportOptions(false);
+                    }}
+                    disabled={resolvedEntries.length === 0}
+                    className="min-h-[44px] px-3 rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-45 text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                    aria-expanded={showTextExport}
+                    aria-label="Preview text deck list format"
+                  >
+                    <FileText className="w-4 h-4" />
+                    <span>{showTextExport ? 'Hide Text' : 'Text Format'}</span>
+                  </button>
+                </div>
+
+                {showExportOptions && resolvedEntries.length > 0 && (
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-800">
+                          Export Deck for Offline Storage
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          Download {activeDeck.name} ({totalCards} cards) as JSON backup or CSV spreadsheet.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowExportOptions(false)}
+                        className="min-h-[32px] min-w-[32px] rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 flex items-center justify-center cursor-pointer"
+                        aria-label="Close export options"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleExportDeckFile('json')}
+                        className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        {lastExportedFormat === 'json' ? (
+                          <Check className="w-4 h-4 text-emerald-600" />
+                        ) : (
+                          <FileJson className="w-4 h-4 text-amber-600" />
+                        )}
+                        <span>
+                          {lastExportedFormat === 'json' ? 'JSON Downloaded' : 'Download JSON (.json)'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleExportDeckFile('csv')}
+                        className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        {lastExportedFormat === 'csv' ? (
+                          <Check className="w-4 h-4 text-emerald-600" />
+                        ) : (
+                          <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                        )}
+                        <span>
+                          {lastExportedFormat === 'csv' ? 'CSV Downloaded' : 'Download CSV (.csv)'}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {showTextExport && resolvedEntries.length > 0 && (
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slate-600">
+                        Export Format
+                      </span>
+                      <div className="inline-flex items-center gap-1 p-0.5 bg-slate-200/80 rounded-lg">
+                        {[
+                          { id: 'grouped' as const, label: 'Name + [Number]' },
+                          { id: 'compact' as const, label: 'Qty Number Name' },
+                        ].map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setTextFormatMode(opt.id)}
+                            className={`min-h-[28px] px-2.5 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                              textFormatMode === opt.id
+                                ? 'bg-white text-slate-900 shadow-sm'
+                                : 'text-slate-600 hover:text-slate-900'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <textarea
+                      readOnly
+                      value={buildDecklistText(textFormatMode)}
+                      rows={Math.min(10, Math.max(4, resolvedEntries.length + 3))}
+                      onFocus={(e) => e.target.select()}
+                      aria-label="Exportable Battle Spirits deck list text"
+                      className="w-full p-2.5 rounded-lg bg-white border border-slate-200 font-mono text-[11px] text-slate-800 leading-relaxed focus:outline-none focus:ring-2 focus:ring-red-600"
+                    />
+                  </div>
+                )}
+
+                {confirmDeleteId === activeDeck.id ? (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-red-900">
+                      Delete &ldquo;{activeDeck.name}&rdquo;?
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteId(null)}
+                        className="min-h-[36px] px-3 rounded-lg bg-white border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmDeleteId(null);
+                          onDeleteDeck(activeDeck.id);
+                        }}
+                        className="min-h-[36px] px-3 rounded-lg bg-red-600 text-white text-xs font-semibold hover:bg-red-700 cursor-pointer"
+                      >
+                        Confirm Delete
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteId(activeDeck.id)}
+                    className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 text-slate-600 hover:text-red-700 hover:border-red-200 hover:bg-red-50 text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>Delete Deck</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:col-span-7">
+            <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-slate-900">
+                  Deck Roster ({resolvedEntries.length} unique)
+                </h3>
+                <button
+                  type="button"
+                  onClick={onBrowseCatalog}
+                  className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 cursor-pointer"
+                >
+                  + Add Cards
+                </button>
+              </div>
+
+              {resolvedEntries.length === 0 ? (
+                <div className="p-8 text-center space-y-3">
+                  <p className="text-sm text-slate-500">
+                    This deck is currently empty. Add cards from the search view or import a text deck list.
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={onBrowseCatalog}
+                      className="min-h-[44px] px-5 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 cursor-pointer"
+                    >
+                      Search Card Database
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImportMode('replace');
+                        setImporting(true);
+                        setTimeout(() => importTextareaRef.current?.focus(), 60);
+                      }}
+                      className="min-h-[44px] px-4 rounded-xl border border-slate-200 bg-white text-slate-800 text-xs font-semibold hover:bg-slate-50 inline-flex items-center gap-2 cursor-pointer"
+                    >
+                      <ClipboardPaste className="w-4 h-4" />
+                      <span>Import Deck List</span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <ul className="divide-y divide-slate-100">
+                  {resolvedEntries.map(({ card, quantity }) => {
+                    const meta = COLOR_META[card.color];
+                    const maxCopies = getMaxCopies(card);
+                    const isIllegalInStd =
+                      activeFormat === 'Standard' && !card.formats.includes('Standard');
+                    const isOverRestricted = quantity > maxCopies;
+
+                    const reductionEntries = (
+                      Object.entries(card.reduction) as [BattleSymbolKind, number][]
+                    ).filter(([, n]) => n > 0);
+                    const rowColors =
+                      card.colors && card.colors.length > 0
+                        ? card.colors
+                        : card.secondaryColor
+                        ? [card.color, card.secondaryColor]
+                        : [card.color];
+
+                    return (
+                      <li
+                        key={card.id}
+                        className={`px-3 sm:px-4 py-2.5 flex items-center justify-between gap-3 ${
+                          isIllegalInStd || isOverRestricted ? 'bg-amber-50/50' : ''
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onInspectCard(card)}
+                          className="min-w-0 flex-1 flex items-center gap-3 text-left min-h-[44px] cursor-pointer"
+                        >
+                          <div
+                            className="w-9 h-9 rounded-lg flex flex-col items-center justify-center font-mono text-xs font-bold text-white shrink-0 tabular-nums"
+                            style={{ backgroundColor: meta.hex }}
+                          >
+                            <span>{card.cost}</span>
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-slate-900 truncate flex items-center gap-1.5">
+                              {rowColors.slice(0, 3).map((c) => (
+                                <SymbolIcon key={c} color={c} size="xs" variant="gem" />
+                              ))}
+                              <span className="truncate">{card.name}</span>
+                            </div>
+                            <div className="text-xs text-slate-500 flex flex-wrap items-center gap-1">
+                              <span className="font-mono">{card.cardNumber}</span>
+                              <span>·</span>
+                              <span className={`font-semibold ${meta.text}`}>
+                                {rowColors.length > 2
+                                  ? `${rowColors.length}-Color`
+                                  : rowColors.join('/')}
+                              </span>
+                              <span>{card.subtypeLabel || card.type}</span>
+                              {reductionEntries.length > 0 && (
+                                <>
+                                  <span>·</span>
+                                  <span className="inline-flex items-center gap-0.5 align-middle">
+                                    {reductionEntries.map(([rColor, count]) =>
+                                      Array.from({ length: Math.min(count, 4) }).map((_, i) => (
+                                        <SymbolIcon
+                                          key={`${rColor}-${i}`}
+                                          color={rColor}
+                                          size="xs"
+                                          variant="reduction"
+                                        />
+                                      ))
+                                    )}
+                                  </span>
+                                </>
+                              )}
+                              <span>·</span>
+                              <span>{card.rarity}</span>
+                              <span>·</span>
+                              <span
+                                className={
+                                  isIllegalInStd
+                                    ? 'text-amber-700 font-semibold'
+                                    : card.formats.includes('Standard')
+                                    ? 'text-sky-700 font-semibold'
+                                    : 'text-amber-700 font-semibold'
+                                }
+                              >
+                                {isIllegalInStd
+                                  ? 'ETN Only (Illegal in STD)'
+                                  : card.formats.includes('Standard')
+                                  ? 'STD/ETN'
+                                  : 'ETN'}
+                              </span>
+                              {card.restriction && card.restriction !== 'Unlimited' && (
+                                <>
+                                  <span> · </span>
+                                  <span className="text-red-700 font-semibold">
+                                    {card.restriction}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </button>
+
+                        <div className="flex items-center border border-slate-200 rounded-xl overflow-hidden shrink-0 bg-white">
+                          <button
+                            type="button"
+                            onClick={() => onUpdateCardQty(card.id, -1)}
+                            className="min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-700 hover:bg-slate-100 cursor-pointer"
+                            aria-label={`Remove one ${card.name}`}
+                          >
+                            <Minus className="w-4 h-4" />
+                          </button>
+                          <span className="px-2 font-mono text-sm font-bold tabular-nums min-w-[1.75rem] text-center">
+                            {quantity}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onUpdateCardQty(card.id, 1)}
+                            disabled={quantity >= maxCopies}
+                            className="min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-700 hover:bg-slate-100 disabled:opacity-35 cursor-pointer"
+                            aria-label={`Add one ${card.name}`}
+                          >
+                            <Plus className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
