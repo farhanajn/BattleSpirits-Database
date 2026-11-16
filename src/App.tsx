@@ -34,6 +34,7 @@ import { FilterControls, FilterSheet } from './components/FilterSheet';
 import { DeckBuilderView } from './components/DeckBuilderView';
 import { RulingsView } from './components/RulingsView';
 import { CatalogMenuView } from './components/CatalogMenuView';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { getMaxCardCopies, isTokenCard } from './utils/cardRules';
 import { decodeSharedDeck, SharedDeckPayload } from './utils/deckShare';
 import {
@@ -230,10 +231,11 @@ function sanitizeCardTextTemplates(card: BattleSpiritsCard): BattleSpiritsCard {
       .replace(/SuAdcon\s+([^\]\n]+)/gi, '[Summon/Advent Condition: $1]')
       .replace(/\bSumcon\s+([^\]\n]+)/gi, '[Summon Condition: $1]');
 
-  const hasDirtyEffect = card.effects.some((e) =>
-    /\b(?:SuAdcon|Sumcon)\b/i.test(`${e.timing} ${e.text}`)
+  const safeEffects = Array.isArray(card.effects) ? card.effects : [];
+  const hasDirtyEffect = safeEffects.some((e) =>
+    /\b(?:SuAdcon|Sumcon)\b/i.test(`${e?.timing || ''} ${e?.text || ''}`)
   );
-  if (!hasDirtyEffect) return card;
+  if (!hasDirtyEffect) return safeEffects === card.effects ? card : { ...card, effects: safeEffects };
 
   let extractedSummon = card.summonCondition;
   const cleanedEffects = card.effects.map((e) => {
@@ -316,8 +318,20 @@ function mergeCardsIntoMap(
       ...(existing || {}),
       ...c,
       id: targetId,
-      name: c.name || existing?.name || c.cardNumber,
+      name: c.name || existing?.name || c.cardNumber || targetId,
       jpName: c.jpName || existing?.jpName || '',
+      cardNumber: c.cardNumber || existing?.cardNumber || 'WIKI',
+      setCode: c.setCode || existing?.setCode || 'BS01',
+      setName: c.setName || existing?.setName || 'Battle Spirits',
+      color: c.color && COLOR_META[c.color] ? c.color : existing?.color || 'Red',
+      cost: Number.isFinite(Number(c.cost)) ? Number(c.cost) : existing?.cost ?? 0,
+      rarity: c.rarity || existing?.rarity || 'C',
+      formats:
+        Array.isArray(c.formats) && c.formats.length > 0
+          ? c.formats
+          : Array.isArray(existing?.formats) && existing.formats.length > 0
+          ? existing.formats
+          : ['Eternal'],
       type: c.type || existing?.type || 'Spirit',
       subtypeLabel: c.subtypeLabel ?? existing?.subtypeLabel,
       isRevival: isRev,
@@ -410,13 +424,27 @@ export default function App() {
       if (saved !== null) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          return parsed.map((d) => ({
-            ...d,
-            format: d.format === 'Standard' || d.format === 'Eternal' ? d.format : 'Eternal',
-            entries: Array.isArray(d.entries)
-              ? d.entries.filter((e: DeckEntry) => !isTokenCard(cardsMap[e.cardId]))
-              : [],
-          }));
+          return parsed
+            .filter((d): d is Record<string, any> => Boolean(d && typeof d === 'object' && d.id))
+            .map((d) => ({
+              id: String(d.id),
+              name: String(d.name || 'Untitled Deck'),
+              format: d.format === 'Standard' || d.format === 'Eternal' ? d.format : 'Eternal',
+              archetype: String(d.archetype || 'Custom Build'),
+              updatedAt: String(d.updatedAt || new Date().toISOString().slice(0, 10)),
+              entries: Array.isArray(d.entries)
+                ? d.entries
+                    .filter(
+                      (e: any): e is DeckEntry =>
+                        Boolean(e && typeof e === 'object' && typeof e.cardId === 'string')
+                    )
+                    .map((e: DeckEntry) => ({
+                      cardId: e.cardId,
+                      quantity: Math.max(0, Math.round(Number(e.quantity) || 0)),
+                    }))
+                    .filter((e: DeckEntry) => e.quantity > 0 && !isTokenCard(cardsMap[e.cardId]))
+                : [],
+            }));
         }
       }
     } catch {
@@ -903,9 +931,9 @@ export default function App() {
     if (activeTab === 'search') {
       return filteredCards;
     }
-    if (activeTab === 'decks' && activeDeck) {
+    if (activeTab === 'decks' && activeDeck && Array.isArray(activeDeck.entries)) {
       return activeDeck.entries
-        .map((e) => cardsMap[e.cardId])
+        .map((e) => (e && e.cardId ? cardsMap[e.cardId] : undefined))
         .filter((c): c is BattleSpiritsCard => Boolean(c));
     }
     if (activeTab === 'catalog') {
@@ -1703,22 +1731,28 @@ export default function App() {
         )}
 
         {activeTab === 'decks' && (
-          <DeckBuilderView
-            decks={decks}
-            activeDeckId={activeDeck?.id || ''}
-            cardsById={cardsMap}
-            onSelectDeck={setActiveDeckId}
-            onCreateDeck={handleCreateDeck}
-            onChangeDeckFormat={handleChangeDeckFormat}
-            onRemoveIllegalCards={handleRemoveIllegalCards}
-            onDeleteDeck={handleDeleteDeck}
-            onUpdateCardQty={handleUpdateDeckQty}
-            onImportDeckEntries={handleImportDeckEntries}
-            onSyncMissingImportCards={handleSyncMissingImportCards}
-            onInspectCard={setSelectedCard}
-            onBrowseCatalog={openSearchTab}
-            onNotify={showToast}
-          />
+          <ErrorBoundary
+            fallbackTitle="Unable to render Deck Builder"
+            resetLabel="Reset Deck View"
+            onReset={() => setActiveTab('catalog')}
+          >
+            <DeckBuilderView
+              decks={decks}
+              activeDeckId={activeDeck?.id || ''}
+              cardsById={cardsMap}
+              onSelectDeck={setActiveDeckId}
+              onCreateDeck={handleCreateDeck}
+              onChangeDeckFormat={handleChangeDeckFormat}
+              onRemoveIllegalCards={handleRemoveIllegalCards}
+              onDeleteDeck={handleDeleteDeck}
+              onUpdateCardQty={handleUpdateDeckQty}
+              onImportDeckEntries={handleImportDeckEntries}
+              onSyncMissingImportCards={handleSyncMissingImportCards}
+              onInspectCard={setSelectedCard}
+              onBrowseCatalog={openSearchTab}
+              onNotify={showToast}
+            />
+          </ErrorBoundary>
         )}
 
         {activeTab === 'rules' && <RulingsView />}

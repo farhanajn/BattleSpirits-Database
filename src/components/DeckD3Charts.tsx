@@ -18,12 +18,30 @@ interface DeckD3ChartsProps {
   onSelectCostBucket: (bucket: number | null) => void;
 }
 
+const VALID_COLOR_SET = new Set<CardColor>(ALL_COLORS);
+
 function getCardColorList(card: BattleSpiritsCard): CardColor[] {
-  if (card.colors && card.colors.length > 0) return card.colors;
-  if (card.secondaryColor && card.secondaryColor !== card.color) {
-    return [card.color, card.secondaryColor];
+  const candidates: CardColor[] = [];
+  if (Array.isArray(card.colors) && card.colors.length > 0) {
+    for (const c of card.colors) {
+      if (VALID_COLOR_SET.has(c) && !candidates.includes(c)) {
+        candidates.push(c);
+      }
+    }
   }
-  return [card.color];
+  if (candidates.length === 0) {
+    if (card.color && VALID_COLOR_SET.has(card.color)) {
+      candidates.push(card.color);
+    }
+    if (
+      card.secondaryColor &&
+      VALID_COLOR_SET.has(card.secondaryColor) &&
+      card.secondaryColor !== card.color
+    ) {
+      candidates.push(card.secondaryColor);
+    }
+  }
+  return candidates.length > 0 ? candidates : ['Red'];
 }
 
 export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
@@ -74,15 +92,23 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
   const costBreakdown = useMemo<CostBucketSummary[]>(() => {
     const buckets = [0, 1, 2, 3, 4, 5, 6, 7, 8];
     return buckets.map((bucket) => {
-      const matching = resolvedEntries.filter(({ card }) =>
-        bucket === 8 ? card.cost >= 8 : card.cost === bucket
+      const matching = resolvedEntries.filter(({ card }) => {
+        const c = Number.isFinite(Number(card.cost)) ? Number(card.cost) : 0;
+        return bucket === 8 ? c >= 8 : c === bucket;
+      });
+      const total = matching.reduce(
+        (sum, item) => sum + (Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : 0),
+        0
       );
-      const total = matching.reduce((sum, item) => sum + item.quantity, 0);
       const byColor = ALL_COLORS.map((color) => ({
         color,
         count: matching
-          .filter((item) => item.card.color === color)
-          .reduce((sum, item) => sum + item.quantity, 0),
+          .filter((item) => getCardColorList(item.card)[0] === color)
+          .reduce(
+            (sum, item) =>
+              sum + (Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : 0),
+            0
+          ),
       })).filter((c) => c.count > 0);
       return { bucket, total, byColor, cards: matching };
     });
@@ -96,18 +122,20 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
     let hasMulticolor = false;
     for (const { card, quantity } of resolvedEntries) {
+      const safeQty = Number.isFinite(Number(quantity)) ? Number(quantity) : 0;
       const cardColors = getCardColorList(card);
       if (cardColors.length > 1) hasMulticolor = true;
       for (const c of cardColors) {
-        counts[c] += quantity;
+        if (c in counts) counts[c] += safeQty;
       }
     }
 
+    const safeTotal = totalCards > 0 ? totalCards : 0;
     const items = ALL_COLORS.map((color) => ({
       color,
       count: counts[color],
-      pct: totalCards > 0 ? Math.round((counts[color] / totalCards) * 100) : 0,
-      hex: COLOR_META[color].hex,
+      pct: safeTotal > 0 ? Math.round((counts[color] / safeTotal) * 100) : 0,
+      hex: (COLOR_META[color] || COLOR_META.Red).hex,
     }));
 
     return { counts, items, hasMulticolor };
@@ -118,7 +146,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
     const svgEl = curveSvgRef.current;
     if (!svgEl) return;
 
-    const width = Math.max(240, curveWidth);
+    const width = Math.max(240, Number.isFinite(curveWidth) ? curveWidth : 380);
     const height = 184;
     const margin = { top: 22, right: 10, bottom: 26, left: 26 };
     const innerWidth = width - margin.left - margin.right;
@@ -164,11 +192,10 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
           .attr('stroke-dasharray', '3,3')
       );
 
-    // Y axis
+    // Y axis (updated synchronously on selection so tick/domain cleanup never races a D3 transition)
     root
       .select<SVGGElement>('g.d3-y-axis')
-      .transition()
-      .duration(220)
+      .interrupt()
       .call(
         d3
           .axisLeft(y)
@@ -218,7 +245,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
           g.append('rect').attr('class', 'd3-col-highlight');
           g.append('rect').attr('class', 'd3-empty-tick');
           g.append('g').attr('class', 'd3-segments');
-          g.append('text').attr('class', 'd3-bar-label');
+          g.append('text').attr('class', 'd3-bar-label').attr('y', innerHeight);
           g.append('rect').attr('class', 'd3-hit-area').attr('fill', 'transparent');
           return g;
         },
@@ -288,12 +315,14 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
           (update) => update,
           (exit) =>
             exit
+              .interrupt()
               .transition()
               .duration(180)
               .attr('y', innerHeight)
               .attr('height', 0)
               .remove()
         )
+        .interrupt()
         .transition()
         .duration(250)
         .ease(d3.easeCubicOut)
@@ -307,6 +336,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
       // Count label above bar
       col
         .select<SVGTextElement>('text.d3-bar-label')
+        .interrupt()
         .attr('x', bx + bw / 2)
         .attr('text-anchor', 'middle')
         .attr('font-size', '10px')
@@ -341,7 +371,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
     const svgEl = colorSvgRef.current;
     if (!svgEl) return;
 
-    const width = Math.max(240, colorWidth);
+    const width = Math.max(240, Number.isFinite(colorWidth) ? colorWidth : 380);
     const height = 166;
     const margin = { top: 22, right: 10, bottom: 26, left: 26 };
     const innerWidth = width - margin.left - margin.right;
@@ -391,8 +421,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
     root
       .select<SVGGElement>('g.d3-color-y-axis')
-      .transition()
-      .duration(220)
+      .interrupt()
       .call(
         d3
           .axisLeft(y)
@@ -435,7 +464,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
             .attr('y', innerHeight)
             .attr('height', 0);
           g.append('rect').attr('class', 'd3-color-zero');
-          g.append('text').attr('class', 'd3-color-label');
+          g.append('text').attr('class', 'd3-color-label').attr('y', innerHeight);
           g.append('rect').attr('class', 'd3-color-hit').attr('fill', 'transparent');
           return g;
         },
@@ -452,6 +481,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
       col
         .select<SVGRectElement>('rect.d3-color-rect')
+        .interrupt()
         .attr('rx', 5)
         .attr('fill', d.hex)
         .transition()
@@ -473,6 +503,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
       col
         .select<SVGTextElement>('text.d3-color-label')
+        .interrupt()
         .attr('x', bx + bw / 2)
         .attr('text-anchor', 'middle')
         .attr('font-size', '10px')

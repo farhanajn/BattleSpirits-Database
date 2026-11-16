@@ -13,7 +13,7 @@ export const SymbolIcon: React.FC<SymbolIconProps> = ({
   size = 'sm',
   variant = 'reduction',
 }) => {
-  const meta = SYMBOL_META[color];
+  const meta = SYMBOL_META[color] || SYMBOL_META.Red;
   const dim = size === 'xs' ? 'w-4 h-4' : size === 'sm' ? 'w-5 h-5' : 'w-6 h-6';
 
   if (variant === 'reduction') {
@@ -78,7 +78,7 @@ export const ColorSymbolBadge: React.FC<ColorSymbolBadgeProps> = ({
   return (
     <span className="inline-flex items-center gap-1 flex-wrap justify-end">
       {resolvedColors.map((c, idx) => {
-        const meta = COLOR_META[c];
+        const meta = COLOR_META[c] || COLOR_META.Red;
         return (
           <React.Fragment key={c}>
             {idx > 0 && <span className="text-slate-400">/</span>}

@@ -17,6 +17,12 @@ import {
   Network,
   Maximize2,
   Ban,
+  Scale,
+  Share2,
+  Copy,
+  Check,
+  Download,
+  BookOpen,
 } from 'lucide-react';
 import { BattleSpiritsCard, BattleSymbolKind, GameFormat } from '../types/card';
 import { COLOR_META } from '../data/theme';
@@ -28,6 +34,10 @@ import {
 } from './SymbolIcon';
 import { analyzeCardSynergies } from '../utils/cardSynergy';
 import { formatRestrictionSummary, getMaxCardCopies, isTokenCard } from '../utils/cardRules';
+import {
+  CardShareImageResult,
+  generateCardShareImage,
+} from '../utils/cardShareImage';
 
 interface CardDetailSheetProps {
   card: BattleSpiritsCard | null;
@@ -119,6 +129,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   const [openRulingIdx, setOpenRulingIdx] = useState<number | null>(0);
   const [selectedArtIdx, setSelectedArtIdx] = useState(0);
   const [fullImageOpen, setFullImageOpen] = useState(false);
+  const [rulingsModalOpen, setRulingsModalOpen] = useState(false);
+  const [rulingsQuery, setRulingsQuery] = useState('');
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [generatingShareImage, setGeneratingShareImage] = useState(false);
+  const [shareResult, setShareResult] = useState<CardShareImageResult | null>(null);
+  const [shareError, setShareError] = useState<string | null>(null);
+  const [shareFeedback, setShareFeedback] = useState<{
+    kind: 'copied' | 'shared' | 'downloaded' | 'info';
+    text: string;
+  } | null>(null);
   const [hydrating, setHydrating] = useState(false);
 
   const [compareMode, setCompareMode] = useState(false);
@@ -138,6 +158,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   const [dragOffsetX, setDragOffsetX] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [slideStage, setSlideStage] = useState<'idle' | 'pre-next' | 'pre-prev'>('idle');
+  const shareGenSeqRef = React.useRef(0);
   const touchGestureRef = React.useRef<{
     x: number;
     y: number;
@@ -147,8 +168,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   } | null>(null);
 
   useEffect(() => {
+    shareGenSeqRef.current += 1;
     setSelectedArtIdx(0);
     setOpenRulingIdx(0);
+    setRulingsModalOpen(false);
+    setRulingsQuery('');
+    setShareModalOpen(false);
+    setShareError(null);
+    setShareFeedback(null);
+    setGeneratingShareImage(false);
+    setShareResult(null);
     setCompareMode(false);
     setSynergyMode(false);
     setSynergyFilter('all');
@@ -165,8 +194,18 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   useEffect(() => {
     if (!card) {
       setFullImageOpen(false);
+      setRulingsModalOpen(false);
+      setShareModalOpen(false);
     }
   }, [card]);
+
+  useEffect(() => {
+    return () => {
+      if (shareResult?.objectUrl) {
+        URL.revokeObjectURL(shareResult.objectUrl);
+      }
+    };
+  }, [shareResult]);
 
   // Settle brief directional slide-in transition when swiping/sliding to adjacent card
   useEffect(() => {
@@ -313,14 +352,18 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (e.key === 'ArrowLeft' && prevCard) {
+      if (e.key === 'ArrowLeft' && prevCard && !rulingsModalOpen && !shareModalOpen) {
         e.preventDefault();
         navigateAdjacent('prev');
-      } else if (e.key === 'ArrowRight' && nextCard) {
+      } else if (e.key === 'ArrowRight' && nextCard && !rulingsModalOpen && !shareModalOpen) {
         e.preventDefault();
         navigateAdjacent('next');
       } else if (e.key === 'Escape') {
-        if (fullImageOpen) {
+        if (shareModalOpen) {
+          setShareModalOpen(false);
+        } else if (rulingsModalOpen) {
+          setRulingsModalOpen(false);
+        } else if (fullImageOpen) {
           setFullImageOpen(false);
         } else {
           onClose();
@@ -329,12 +372,29 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [card, prevCard, nextCard, fullImageOpen, navigateAdjacent, onClose]);
+  }, [
+    card,
+    prevCard,
+    nextCard,
+    fullImageOpen,
+    rulingsModalOpen,
+    shareModalOpen,
+    navigateAdjacent,
+    onClose,
+  ]);
 
   if (!card) return null;
 
   const handleSwipeTouchStart = (e: React.TouchEvent) => {
-    if (!hasNavigation || e.touches.length !== 1 || pickerOpen) return;
+    if (
+      !hasNavigation ||
+      e.touches.length !== 1 ||
+      pickerOpen ||
+      rulingsModalOpen ||
+      shareModalOpen
+    ) {
+      return;
+    }
     const targetEl = e.target as HTMLElement | null;
     const blocked = Boolean(
       targetEl?.closest('[data-no-swipe="true"], input, textarea, select')
@@ -468,6 +528,130 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
       ? card.galleryImages
       : [{ url: card.artworkImage, caption: `${card.name} — Card Art` }];
   const activeArt = gallery[selectedArtIdx] || gallery[0];
+
+  const handleOpenShareModal = async () => {
+    const seq = ++shareGenSeqRef.current;
+    setShareModalOpen(true);
+    setShareError(null);
+    setShareFeedback(null);
+    setGeneratingShareImage(true);
+    try {
+      const result = await generateCardShareImage(card, activeArt?.url);
+      if (shareGenSeqRef.current !== seq) {
+        URL.revokeObjectURL(result.objectUrl);
+        return;
+      }
+      setShareResult(result);
+    } catch {
+      if (shareGenSeqRef.current === seq) {
+        setShareError('Could not render card image in this browser.');
+      }
+    } finally {
+      if (shareGenSeqRef.current === seq) {
+        setGeneratingShareImage(false);
+      }
+    }
+  };
+
+  const handleCopyShareImage = async () => {
+    if (!shareResult) return;
+    try {
+      if (
+        typeof navigator !== 'undefined' &&
+        navigator.clipboard &&
+        typeof navigator.clipboard.write === 'function' &&
+        typeof ClipboardItem !== 'undefined'
+      ) {
+        await navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': shareResult.blob }),
+        ]);
+        setShareFeedback({
+          kind: 'copied',
+          text: 'Image copied! Ready to paste into Discord, WhatsApp, or X.',
+        });
+        return;
+      }
+    } catch {
+      // Fall through to informative message below
+    }
+    setShareFeedback({
+      kind: 'info',
+      text: 'Clipboard image copy is blocked here — use Share or Save PNG.',
+    });
+  };
+
+  const handleNativeShareImage = async () => {
+    if (!shareResult) return;
+    const shareTitle = `${card.name} (${card.cardNumber})`;
+    const shareText = `${card.name} · ${card.color} ${card.type} · Cost ${card.cost} (${card.setCode})`;
+
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        const imageFile = new File([shareResult.blob], shareResult.filename, {
+          type: 'image/png',
+        });
+        if (
+          typeof navigator.canShare === 'function' &&
+          navigator.canShare({ files: [imageFile] })
+        ) {
+          await navigator.share({
+            files: [imageFile],
+            title: shareTitle,
+            text: shareText,
+          });
+          setShareFeedback({
+            kind: 'shared',
+            text: 'Shared card image.',
+          });
+          return;
+        }
+
+        await navigator.share({
+          title: shareTitle,
+          text: shareText,
+          url: window.location.href,
+        });
+        setShareFeedback({
+          kind: 'shared',
+          text: 'Opened share sheet.',
+        });
+        return;
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return;
+        }
+      }
+    }
+
+    setShareFeedback({
+      kind: 'info',
+      text: 'Device share sheet is unavailable here — use Copy Image or Save PNG.',
+    });
+  };
+
+  const handleDownloadShareImage = () => {
+    if (!shareResult) return;
+    const link = document.createElement('a');
+    link.href = shareResult.objectUrl;
+    link.download = shareResult.filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setShareFeedback({
+      kind: 'downloaded',
+      text: 'Saved social card PNG.',
+    });
+  };
+
+  const filteredModalRulings = rulingsQuery.trim()
+    ? card.rulings.filter((r) => {
+        const q = rulingsQuery.trim().toLowerCase();
+        return (
+          r.question.toLowerCase().includes(q) ||
+          r.answer.toLowerCase().includes(q)
+        );
+      })
+    : card.rulings;
 
   const renderSymbolsList = (
     entries: [BattleSymbolKind, number][],
@@ -1189,7 +1373,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end lg:items-center justify-center bg-black/50 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm sm:p-4"
       role="dialog"
       aria-modal="true"
       aria-labelledby="card-detail-title"
@@ -1197,37 +1381,40 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     >
       <div
         className={`w-full ${
-          (compareMode && compareCard) || synergyMode ? 'lg:max-w-5xl' : 'lg:max-w-2xl'
-        } max-h-[92vh] bg-white rounded-t-3xl lg:rounded-3xl overflow-hidden flex flex-col shadow-2xl transition-[max-width] duration-200`}
+          (compareMode && compareCard) || synergyMode
+            ? 'lg:max-w-5xl'
+            : 'sm:max-w-2xl lg:max-w-3xl'
+        } max-h-[92vh] sm:max-h-[90vh] bg-white rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col shadow-2xl transition-[max-width] duration-200`}
         onClick={(e) => e.stopPropagation()}
         onTouchStart={handleSwipeTouchStart}
         onTouchMove={handleSwipeTouchMove}
         onTouchEnd={handleSwipeTouchEnd}
         onTouchCancel={handleSwipeTouchEnd}
       >
-        <div className="lg:hidden pt-3 pb-1 flex items-center justify-center relative shrink-0">
+        <div className="sm:hidden pt-2.5 pb-1 flex items-center justify-center shrink-0">
           <div className="w-10 h-1.5 bg-slate-300 rounded-full" />
-          {hasNavigation && (
-            <span className="absolute right-4 text-[10px] font-mono text-slate-400 tabular-nums">
-              {navIndex + 1}/{navigableCards.length}
-            </span>
-          )}
         </div>
 
-        <div className="px-4 sm:px-6 py-3 border-b border-slate-100 flex items-center justify-between gap-2 shrink-0">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-slate-500">
-              <span className="font-mono tabular-nums">{card.cardNumber}</span>
-              <span aria-hidden="true">·</span>
-              <span>
-                {card.setCode} — {card.setName}
+        {/* Row 1: Title, Metadata & Close Button (Full-width readable across mobile/tablet/desktop) */}
+        <div className="px-4 sm:px-6 pt-2 sm:pt-4 pb-3 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0 bg-white">
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs font-medium text-slate-600">
+              <span className="font-mono font-semibold text-slate-800 tabular-nums shrink-0">
+                {card.cardNumber}
               </span>
-              <span aria-hidden="true">·</span>
-              <span className={meta.text}>{card.rarity}</span>
+              <span aria-hidden="true" className="text-slate-400">·</span>
+              <span className="font-semibold text-slate-700 truncate max-w-[160px] sm:max-w-none">
+                {card.setCode}
+                <span className="hidden sm:inline font-normal text-slate-500">
+                  {' '}— {card.setName}
+                </span>
+              </span>
+              <span aria-hidden="true" className="text-slate-400">·</span>
+              <span className={`font-bold shrink-0 ${meta.text}`}>{card.rarity}</span>
             </div>
             <h2
               id="card-detail-title"
-              className="font-display text-lg sm:text-xl font-bold text-slate-900 truncate"
+              className="mt-1 font-display text-lg sm:text-xl lg:text-[22px] font-bold text-slate-950 leading-snug line-clamp-2"
             >
               {compareMode && compareCard
                 ? `${card.name} vs ${compareCard.name}`
@@ -1235,48 +1422,62 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 ? `Synergy Analysis — ${card.name}`
                 : card.name}
             </h2>
+            {card.setName && (
+              <p className="sm:hidden mt-0.5 text-[11px] text-slate-500 truncate">
+                {card.setName}
+              </p>
+            )}
           </div>
 
-          <div className="flex items-center gap-1.5 shrink-0">
-            {hasNavigation && (
-              <div className="inline-flex items-center rounded-xl border border-slate-200 bg-slate-50 overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => navigateAdjacent('prev')}
-                  disabled={!prevCard}
-                  className="min-h-[40px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-200/70 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
-                  aria-label={prevCard ? `Previous card: ${prevCard.name}` : 'No previous card'}
-                  title={prevCard ? `Previous: ${prevCard.name}` : 'Start of list'}
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <span className="hidden sm:inline px-1.5 font-mono text-[11px] font-semibold text-slate-600 tabular-nums">
-                  {navIndex + 1}/{navigableCards.length}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => navigateAdjacent('next')}
-                  disabled={!nextCard}
-                  className="min-h-[40px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-200/70 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
-                  aria-label={nextCard ? `Next card: ${nextCard.name}` : 'No next card'}
-                  title={nextCard ? `Next: ${nextCard.name}` : 'End of list'}
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-              </div>
-            )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="min-h-[44px] min-w-[44px] -mr-1.5 -mt-0.5 flex items-center justify-center rounded-xl text-slate-600 bg-slate-100/80 sm:bg-transparent hover:bg-slate-100 hover:text-slate-950 transition-colors shrink-0 cursor-pointer"
+            aria-label="Close card details"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Row 2: Dedicated Action & Card Navigation Toolbar */}
+        <div
+          data-no-swipe="true"
+          className="px-4 sm:px-6 py-2 bg-slate-50/90 border-b border-slate-200/80 flex items-center justify-between gap-2 shrink-0"
+        >
+          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0 flex-1 py-0.5">
+            <button
+              type="button"
+              onClick={() => setRulingsModalOpen(true)}
+              className="min-h-[44px] sm:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              aria-label={`Official rulings for ${card.name}`}
+            >
+              <Scale className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+              <span>
+                Rulings{card.rulings.length > 0 ? ` (${card.rulings.length})` : ''}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenShareModal}
+              className="min-h-[44px] sm:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              aria-label={`Share social image for ${card.name}`}
+            >
+              <Share2 className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+              <span>Share</span>
+            </button>
 
             <button
               type="button"
               onClick={handleToggleSynergy}
-              className={`min-h-[44px] px-3 sm:px-3.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              className={`min-h-[44px] sm:min-h-[38px] px-3 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 border ${
                 synergyMode
-                  ? 'bg-red-600 text-white hover:bg-red-700'
-                  : 'bg-slate-100 text-slate-800 hover:bg-slate-200'
+                  ? 'bg-red-600 border-red-600 text-white hover:bg-red-700'
+                  : 'bg-white border-slate-200 text-slate-800 hover:bg-slate-100'
               }`}
               aria-pressed={synergyMode}
             >
-              <Network className="w-4 h-4" />
+              <Network className="w-3.5 h-3.5 shrink-0" />
               <span className="hidden sm:inline">
                 {synergyMode ? 'Exit Synergy' : 'Analyze Synergy'}
               </span>
@@ -1286,29 +1487,48 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             <button
               type="button"
               onClick={handleToggleCompare}
-              className={`min-h-[44px] px-3 sm:px-3.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              className={`min-h-[44px] sm:min-h-[38px] px-3 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 border ${
                 compareMode
-                  ? 'bg-slate-900 text-white hover:bg-slate-800'
-                  : 'bg-slate-100 text-slate-800 hover:bg-slate-200'
+                  ? 'bg-slate-900 border-slate-900 text-white hover:bg-slate-800'
+                  : 'bg-white border-slate-200 text-slate-800 hover:bg-slate-100'
               }`}
               aria-pressed={compareMode}
             >
-              <Columns2 className="w-4 h-4" />
+              <Columns2 className="w-3.5 h-3.5 shrink-0" />
               <span className="hidden sm:inline">
                 {compareMode ? 'Exit Compare' : 'Compare'}
               </span>
               <span className="sm:hidden">{compareMode ? 'Exit' : 'Compare'}</span>
             </button>
-
-            <button
-              type="button"
-              onClick={onClose}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 hover:text-slate-900 transition-colors shrink-0 cursor-pointer"
-              aria-label="Close card details"
-            >
-              <X className="w-5 h-5" />
-            </button>
           </div>
+
+          {hasNavigation && (
+            <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white overflow-hidden shrink-0">
+              <button
+                type="button"
+                onClick={() => navigateAdjacent('prev')}
+                disabled={!prevCard}
+                className="min-h-[44px] sm:min-h-[38px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-100 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
+                aria-label={prevCard ? `Previous card: ${prevCard.name}` : 'No previous card'}
+                title={prevCard ? `Previous: ${prevCard.name}` : 'Start of list'}
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <span className="px-1.5 font-mono text-[11px] font-semibold text-slate-600 tabular-nums">
+                {navIndex + 1}/{navigableCards.length}
+              </span>
+              <button
+                type="button"
+                onClick={() => navigateAdjacent('next')}
+                disabled={!nextCard}
+                className="min-h-[44px] sm:min-h-[38px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-100 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
+                aria-label={nextCard ? `Next card: ${nextCard.name}` : 'No next card'}
+                title={nextCard ? `Next: ${nextCard.name}` : 'End of list'}
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          )}
         </div>
 
         <div
@@ -1424,8 +1644,8 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             renderComparisonView(card, compareCard)
           ) : (
             <>
-              <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-start">
-                <div className="sm:col-span-6 space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 sm:gap-5 items-start">
+                <div className="sm:col-span-5 space-y-2">
                   <div className="relative rounded-2xl overflow-hidden border border-slate-200 bg-slate-950 p-1.5 sm:p-2">
                     <button
                       type="button"
@@ -1491,7 +1711,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   )}
 
                   {hasNavigation && (
-                    <div className="sm:hidden flex items-center justify-between text-[11px] text-slate-400 px-1">
+                    <div className="sm:hidden flex items-center justify-between text-[11px] text-slate-500 px-1">
                       <span>Swipe left or right for adjacent cards</span>
                       <span className="font-mono tabular-nums">
                         {navIndex + 1} / {navigableCards.length}
@@ -1500,7 +1720,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   )}
                 </div>
 
-                <div className="sm:col-span-6 space-y-3">
+                <div className="sm:col-span-7 space-y-3">
                   <div className="grid grid-cols-2 gap-2.5">
                     <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80">
                       <div className="text-xs text-slate-500">Summon Cost</div>
@@ -1776,9 +1996,18 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
               {card.rulings.length > 0 && (
                 <div>
-                  <h3 className="text-xs font-semibold text-slate-500 mb-2">
-                    Official Card Rulings Q&amp;A
-                  </h3>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <h3 className="text-xs font-semibold text-slate-500">
+                      Official Card Rulings Q&amp;A ({card.rulings.length})
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => setRulingsModalOpen(true)}
+                      className="text-xs font-semibold text-red-700 hover:text-red-800 hover:underline cursor-pointer"
+                    >
+                      Open Rulings Modal
+                    </button>
+                  </div>
                   <div className="border border-slate-200 rounded-xl divide-y divide-slate-100 overflow-hidden">
                     {card.rulings.map((r, idx) => {
                       const isOpen = openRulingIdx === idx;
@@ -1798,7 +2027,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                           </button>
                           {isOpen && (
                             <div className="px-3.5 pb-3 text-xs text-slate-600 leading-relaxed bg-slate-50/70">
-                              A: {r.answer}
+                              A: <EffectTextWithSymbols text={r.answer} />
                             </div>
                           )}
                         </div>
@@ -1861,6 +2090,264 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           )}
         </div>
       </div>
+
+      {rulingsModalOpen && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="rulings-modal-title"
+          data-no-swipe="true"
+          onClick={(e) => {
+            e.stopPropagation();
+            setRulingsModalOpen(false);
+          }}
+        >
+          <div
+            className="w-full sm:max-w-2xl max-h-[88vh] bg-white rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 sm:px-6 py-4 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+                  <Scale className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                  <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                    {card.cardNumber}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Official Rulings ({card.rulings.length})
+                  </span>
+                </div>
+                <h3
+                  id="rulings-modal-title"
+                  className="mt-1 font-display text-lg sm:text-xl font-bold text-slate-950 leading-snug line-clamp-2"
+                >
+                  {card.name}
+                </h3>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setRulingsModalOpen(false)}
+                className="min-h-[44px] min-w-[44px] -mr-1.5 -mt-0.5 flex items-center justify-center rounded-xl text-slate-600 hover:bg-slate-100 hover:text-slate-950 shrink-0 cursor-pointer"
+                aria-label="Close official rulings modal"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {card.rulings.length >= 3 && (
+              <div className="px-4 sm:px-6 py-2.5 bg-slate-50 border-b border-slate-100 shrink-0">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={rulingsQuery}
+                    onChange={(e) => setRulingsQuery(e.target.value)}
+                    placeholder="Filter Q&A rulings by keyword..."
+                    className="w-full min-h-[40px] pl-9 pr-3 rounded-xl bg-white border border-slate-200 text-xs sm:text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="overflow-y-auto flex-1 px-4 sm:px-6 py-4 space-y-3">
+              {hydrating && card.rulings.length === 0 ? (
+                <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center gap-2.5 text-xs sm:text-sm text-slate-600">
+                  <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
+                  <span>Loading official Q&amp;A rulings from Battle Spirits Wiki...</span>
+                </div>
+              ) : filteredModalRulings.length > 0 ? (
+                filteredModalRulings.map((r, idx) => (
+                  <div
+                    key={`${idx}-${r.question.slice(0, 24)}`}
+                    className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-2"
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <span className="font-mono text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 px-2 py-0.5 rounded-lg shrink-0 tabular-nums mt-0.5">
+                        Q{idx + 1}
+                      </span>
+                      <p className="text-xs sm:text-sm font-bold text-slate-900 leading-snug">
+                        <EffectTextWithSymbols text={r.question} />
+                      </p>
+                    </div>
+                    <div className="pl-2 border-l-2 border-slate-300 ml-3 text-xs sm:text-sm text-slate-700 leading-relaxed whitespace-pre-line">
+                      <span className="font-semibold text-slate-900">Answer: </span>
+                      <EffectTextWithSymbols text={r.answer} />
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200 text-center space-y-3">
+                  <BookOpen className="w-8 h-8 text-slate-400 mx-auto" />
+                  <div className="space-y-1">
+                    <div className="text-sm font-bold text-slate-900">
+                      {rulingsQuery.trim()
+                        ? 'No rulings match your search'
+                        : 'No official Q&A rulings recorded'}
+                    </div>
+                    <p className="text-xs text-slate-500 max-w-md mx-auto">
+                      {rulingsQuery.trim()
+                        ? `No Q&A entries matched "${rulingsQuery.trim()}".`
+                        : `${card.name} does not have card-specific Q&A entries in the current card dataset.`}
+                    </p>
+                  </div>
+                  {!rulingsQuery.trim() && card.wikiUrl && (
+                    <a
+                      href={card.wikiUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="min-h-[44px] px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <span>View Card Page on Battle Spirits Wiki</span>
+                      <ExternalLink className="w-3.5 h-3.5 text-slate-500" />
+                    </a>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="px-4 sm:px-6 py-3 pb-safe border-t border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
+              {card.wikiUrl ? (
+                <a
+                  href={card.wikiUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <span>Wiki Page</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              ) : (
+                <div />
+              )}
+              <button
+                type="button"
+                onClick={() => setRulingsModalOpen(false)}
+                className="min-h-[44px] px-5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {shareModalOpen && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="share-modal-title"
+          data-no-swipe="true"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShareModalOpen(false);
+          }}
+        >
+          <div
+            className="w-full sm:max-w-2xl max-h-[90vh] bg-white rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 sm:px-6 py-4 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+                  <Share2 className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                  <span>Social Card Image · 1200×630</span>
+                </div>
+                <h3
+                  id="share-modal-title"
+                  className="mt-1 font-display text-lg sm:text-xl font-bold text-slate-950 truncate"
+                >
+                  Share {card.name}
+                </h3>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShareModalOpen(false)}
+                className="min-h-[44px] min-w-[44px] -mr-1.5 -mt-0.5 flex items-center justify-center rounded-xl text-slate-600 hover:bg-slate-100 hover:text-slate-950 shrink-0 cursor-pointer"
+                aria-label="Close share image modal"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto flex-1 px-4 sm:px-6 py-4 space-y-4">
+              <div className="rounded-2xl overflow-hidden bg-slate-950 border border-slate-200 aspect-[1200/630] flex items-center justify-center">
+                {generatingShareImage ? (
+                  <div className="flex flex-col items-center gap-2 text-slate-300 text-xs">
+                    <Loader2 className="w-6 h-6 animate-spin text-red-500" />
+                    <span>Rendering social share card...</span>
+                  </div>
+                ) : shareError ? (
+                  <div className="p-6 text-center text-xs text-red-300">
+                    {shareError}
+                  </div>
+                ) : shareResult ? (
+                  <img
+                    src={shareResult.objectUrl}
+                    alt={`${card.name} social share preview`}
+                    className="w-full h-full object-contain"
+                  />
+                ) : null}
+              </div>
+
+              {shareFeedback && (
+                <div
+                  className={`p-3 rounded-xl text-xs font-medium flex items-center gap-2 ${
+                    shareFeedback.kind === 'info'
+                      ? 'bg-amber-50 border border-amber-200 text-amber-900'
+                      : 'bg-emerald-50 border border-emerald-200 text-emerald-900'
+                  }`}
+                >
+                  {shareFeedback.kind !== 'info' && (
+                    <Check className="w-4 h-4 text-emerald-700 shrink-0" />
+                  )}
+                  <span>{shareFeedback.text}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <button
+                  type="button"
+                  onClick={handleCopyShareImage}
+                  disabled={!shareResult || generatingShareImage}
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-900 inline-flex items-center justify-center gap-2 disabled:opacity-40 cursor-pointer transition-colors"
+                >
+                  {shareFeedback?.kind === 'copied' ? (
+                    <Check className="w-4 h-4 text-emerald-600" />
+                  ) : (
+                    <Copy className="w-4 h-4 text-slate-600" />
+                  )}
+                  <span>Copy Image</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleNativeShareImage}
+                  disabled={!shareResult || generatingShareImage}
+                  className="min-h-[44px] px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 disabled:opacity-40 cursor-pointer transition-colors"
+                >
+                  <Share2 className="w-4 h-4" />
+                  <span>Share</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDownloadShareImage}
+                  disabled={!shareResult || generatingShareImage}
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 disabled:opacity-40 cursor-pointer transition-colors"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Save PNG</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {fullImageOpen && (
         <div

@@ -50,18 +50,19 @@ export const DeckStatsPanel: React.FC<DeckStatsPanelProps> = ({
     let cardsWithFamily = 0;
 
     for (const { card, quantity } of resolvedEntries) {
-      weightedBaseCost += card.cost * quantity;
+      const safeCost = Number.isFinite(Number(card.cost)) ? Number(card.cost) : 0;
+      const safeQty = Number.isFinite(Number(quantity)) ? Number(quantity) : 0;
+      weightedBaseCost += safeCost * safeQty;
 
-      const cardTotalRed = (Object.values(card.reduction) as (number | undefined)[]).reduce<number>(
-        (s, v) => s + (v || 0),
-        0
-      );
-      const minCost = Math.max(0, card.cost - cardTotalRed);
-      weightedMinCost += minCost * quantity;
+      const cardTotalRed = (
+        Object.values(card.reduction || {}) as (number | undefined)[]
+      ).reduce<number>((s, v) => s + (Number(v) || 0), 0);
+      const minCost = Math.max(0, safeCost - cardTotalRed);
+      weightedMinCost += minCost * safeQty;
 
-      if (card.cost <= 2) earlyCurveCount += quantity;
-      else if (card.cost <= 4) midCurveCount += quantity;
-      else highCurveCount += quantity;
+      if (safeCost <= 2) earlyCurveCount += safeQty;
+      else if (safeCost <= 4) midCurveCount += safeQty;
+      else highCurveCount += safeQty;
 
       for (const sym of ALL_SYMBOLS) {
         const boardQty = card.symbols?.[sym] || 0;

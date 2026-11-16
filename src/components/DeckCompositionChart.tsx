@@ -55,8 +55,14 @@ export const DeckCompositionChart: React.FC<DeckCompositionChartProps> = ({
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
-          <div className="sm:col-span-6 relative h-44 w-full">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="sm:col-span-6 relative h-44 w-full min-w-0">
+            <ResponsiveContainer
+              width="100%"
+              height="100%"
+              minWidth={140}
+              minHeight={160}
+              initialDimension={{ width: 220, height: 176 }}
+            >
               <PieChart>
                 <Pie
                   data={data}

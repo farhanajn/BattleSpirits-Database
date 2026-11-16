@@ -29,11 +29,11 @@ interface TestHandPanelProps {
 }
 
 function getMinCost(card: BattleSpiritsCard): number {
-  const totalRed = (Object.values(card.reduction) as (number | undefined)[]).reduce<number>(
-    (sum, val) => sum + (val || 0),
-    0
-  );
-  return Math.max(0, card.cost - totalRed);
+  const totalRed = (
+    Object.values(card.reduction || {}) as (number | undefined)[]
+  ).reduce<number>((sum, val) => sum + (Number(val) || 0), 0);
+  const cost = Number.isFinite(Number(card.cost)) ? Number(card.cost) : 0;
+  return Math.max(0, cost - totalRed);
 }
 
 export const TestHandPanel: React.FC<TestHandPanelProps> = ({
@@ -138,7 +138,7 @@ export const TestHandPanel: React.FC<TestHandPanelProps> = ({
     keyId: string,
     isContractSlot: boolean = false
   ) => {
-    const meta = COLOR_META[card.color];
+    const meta = COLOR_META[card.color] || COLOR_META.Red;
     const minCost = getMinCost(card);
     const reductionEntries = (
       Object.entries(card.reduction || {}) as [BattleSymbolKind, number][]

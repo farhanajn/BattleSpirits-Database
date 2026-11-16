@@ -125,21 +125,25 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const resolvedNewImportFormat: GameFormat =
     importDeckFormat || importPreview?.detectedFormat || 'Eternal';
 
+  const safeDeckEntries = Array.isArray(activeDeck?.entries) ? activeDeck.entries : [];
   const resolvedEntries = activeDeck
-    ? activeDeck.entries
+    ? safeDeckEntries
+        .filter((entry): entry is DeckEntry => Boolean(entry && typeof entry.cardId === 'string'))
         .map((entry) => ({
           ...entry,
+          quantity: Math.max(0, Math.round(Number(entry.quantity) || 0)),
           card: cardsById[entry.cardId],
         }))
         .filter((item): item is { cardId: string; quantity: number; card: BattleSpiritsCard } =>
-          Boolean(item.card)
+          Boolean(item.card && item.quantity > 0)
         )
     : [];
 
   const getMaxCopies = (card: BattleSpiritsCard) => getMaxCardCopies(card);
 
   const formatIllegalEntries = resolvedEntries.filter(
-    ({ card }) => activeFormat === 'Standard' && !card.formats.includes('Standard')
+    ({ card }) =>
+      activeFormat === 'Standard' && !(card.formats || ['Eternal']).includes('Standard')
   );
 
   const restrictionViolations = resolvedEntries.filter(
@@ -627,7 +631,8 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                   {importPreview.matchedLines.map((line) => {
                     const card = line.matchedCard!;
                     const isIllegalStd =
-                      targetImportFormat === 'Standard' && !card.formats.includes('Standard');
+                      targetImportFormat === 'Standard' &&
+                      !(card.formats || ['Eternal']).includes('Standard');
                     return (
                       <div
                         key={`match-${line.lineNumber}`}
@@ -788,7 +793,8 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
       <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
         {decks.map((deck) => {
           const isSelected = deck.id === activeDeck?.id;
-          const count = deck.entries.reduce((s, e) => s + e.quantity, 0);
+          const entriesList = Array.isArray(deck.entries) ? deck.entries : [];
+          const count = entriesList.reduce((s, e) => s + (Number(e?.quantity) || 0), 0);
           const fmtShort = (deck.format || 'Eternal') === 'Standard' ? 'STD' : 'ETN';
           return (
             <button
@@ -1268,21 +1274,26 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
               ) : (
                 <ul className="divide-y divide-slate-100">
                   {resolvedEntries.map(({ card, quantity }) => {
-                    const meta = COLOR_META[card.color];
+                    const meta = COLOR_META[card.color] || COLOR_META.Red;
+                    const cardFormats = card.formats || ['Eternal'];
                     const maxCopies = getMaxCopies(card);
                     const isIllegalInStd =
-                      activeFormat === 'Standard' && !card.formats.includes('Standard');
+                      activeFormat === 'Standard' && !cardFormats.includes('Standard');
                     const isOverRestricted = quantity > maxCopies;
 
                     const reductionEntries = (
-                      Object.entries(card.reduction) as [BattleSymbolKind, number][]
+                      Object.entries(card.reduction || {}) as [BattleSymbolKind, number][]
                     ).filter(([, n]) => n > 0);
-                    const rowColors =
+                    const rawRowColors =
                       card.colors && card.colors.length > 0
                         ? card.colors
                         : card.secondaryColor
                         ? [card.color, card.secondaryColor]
                         : [card.color];
+                    const rowColors = Array.from(
+                      new Set(rawRowColors.filter((c) => Boolean(c && COLOR_META[c])))
+                    );
+                    if (rowColors.length === 0) rowColors.push('Red');
 
                     return (
                       <li
@@ -1342,14 +1353,14 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                                 className={
                                   isIllegalInStd
                                     ? 'text-amber-700 font-semibold'
-                                    : card.formats.includes('Standard')
+                                    : cardFormats.includes('Standard')
                                     ? 'text-sky-700 font-semibold'
                                     : 'text-amber-700 font-semibold'
                                 }
                               >
                                 {isIllegalInStd
                                   ? 'ETN Only (Illegal in STD)'
-                                  : card.formats.includes('Standard')
+                                  : cardFormats.includes('Standard')
                                   ? 'STD/ETN'
                                   : 'ETN'}
                               </span>
