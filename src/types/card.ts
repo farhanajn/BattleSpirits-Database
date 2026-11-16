@@ -109,11 +109,20 @@ export interface DeckEntry {
   quantity: number;
 }
 
+export interface DeckFolder {
+  id: string;
+  name: string;
+  color?: CardColor;
+  createdAt: string;
+}
+
 export interface Deck {
   id: string;
   name: string;
   format: GameFormat;
   archetype: string;
+  folderId?: string;
+  category?: string;
   updatedAt: string;
   entries: DeckEntry[];
 }

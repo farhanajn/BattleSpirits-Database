@@ -19,16 +19,24 @@ import {
   Share2,
   Link2,
   Shuffle,
+  Folder,
+  FolderOpen,
+  ChevronDown,
+  ChevronRight,
+  Pencil,
+  Search,
 } from 'lucide-react';
 import {
   BattleSpiritsCard,
   BattleSymbolKind,
+  CardColor,
   CardType,
   Deck,
   DeckEntry,
+  DeckFolder,
   GameFormat,
 } from '../types/card';
-import { ALL_TYPES, COLOR_META } from '../data/theme';
+import { ALL_COLORS, ALL_TYPES, COLOR_META } from '../data/theme';
 import { SymbolIcon } from './SymbolIcon';
 import { DeckCompositionChart } from './DeckCompositionChart';
 import { DeckStatsPanel } from './DeckStatsPanel';
@@ -46,10 +54,20 @@ import {
 
 interface DeckBuilderViewProps {
   decks: Deck[];
+  folders?: DeckFolder[];
   activeDeckId: string;
   cardsById: Record<string, BattleSpiritsCard>;
   onSelectDeck: (deckId: string) => void;
-  onCreateDeck: (name: string, format: GameFormat, archetype: string) => void;
+  onCreateDeck: (
+    name: string,
+    format: GameFormat,
+    archetype: string,
+    folderId?: string
+  ) => void;
+  onCreateFolder?: (name: string, color?: CardColor) => string;
+  onRenameFolder?: (folderId: string, name: string, color?: CardColor) => void;
+  onDeleteFolder?: (folderId: string) => void;
+  onMoveDeckToFolder?: (deckId: string, folderId?: string) => void;
   onChangeDeckFormat: (deckId: string, format: GameFormat) => void;
   onRemoveIllegalCards: (deckId: string) => void;
   onDeleteDeck: (deckId: string) => void;
@@ -60,6 +78,7 @@ interface DeckBuilderViewProps {
     newDeckName?: string;
     newDeckFormat?: GameFormat;
     newDeckArchetype?: string;
+    newDeckFolderId?: string;
   }) => void;
   onSyncMissingImportCards?: (queries: {
     setCodes: string[];
@@ -72,10 +91,15 @@ interface DeckBuilderViewProps {
 
 export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   decks,
+  folders = [],
   activeDeckId,
   cardsById,
   onSelectDeck,
   onCreateDeck,
+  onCreateFolder,
+  onRenameFolder,
+  onDeleteFolder,
+  onMoveDeckToFolder,
   onChangeDeckFormat,
   onRemoveIllegalCards,
   onDeleteDeck,
@@ -90,11 +114,13 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const [newDeckName, setNewDeckName] = useState('');
   const [newDeckFormat, setNewDeckFormat] = useState<GameFormat>('Standard');
   const [newArchetype, setNewArchetype] = useState('');
+  const [newDeckFolderId, setNewDeckFolderId] = useState<string>('');
   const [importing, setImporting] = useState(false);
   const [importText, setImportText] = useState('');
   const [importMode, setImportMode] = useState<'replace' | 'merge' | 'new'>('replace');
   const [importDeckName, setImportDeckName] = useState('');
   const [importDeckFormat, setImportDeckFormat] = useState<GameFormat | null>(null);
+  const [importDeckFolderId, setImportDeckFolderId] = useState<string>('');
   const [syncingMissing, setSyncingMissing] = useState(false);
   const importTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [copied, setCopied] = useState(false);
@@ -109,9 +135,84 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [testingHand, setTestingHand] = useState(false);
 
+  const [selectedFolderFilter, setSelectedFolderFilter] = useState<string>('all');
+  const [collapsedFolderIds, setCollapsedFolderIds] = useState<Record<string, boolean>>({});
+  const [deckSearchQuery, setDeckSearchQuery] = useState('');
+  const [folderFormMode, setFolderFormMode] = useState<'closed' | 'create' | 'rename'>('closed');
+  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+  const [folderFormName, setFolderFormName] = useState('');
+  const [folderFormColor, setFolderFormColor] = useState<CardColor | ''>('Red');
+  const [confirmDeleteFolderId, setConfirmDeleteFolderId] = useState<string | null>(null);
+
   const activeDeck = decks.find((d) => d.id === activeDeckId) || decks[0];
   const activeFormat: GameFormat = activeDeck?.format || 'Eternal';
   const allCardsList = useMemo(() => Object.values(cardsById), [cardsById]);
+
+  const folderIdsSet = useMemo(() => new Set(folders.map((f) => f.id)), [folders]);
+  const effectiveFolderFilter =
+    selectedFolderFilter === 'all' ||
+    selectedFolderFilter === 'uncategorized' ||
+    folderIdsSet.has(selectedFolderFilter)
+      ? selectedFolderFilter
+      : 'all';
+
+  const folderGroups = useMemo(() => {
+    const q = deckSearchQuery.trim().toLowerCase();
+    const matchesSearch = (d: Deck) => {
+      if (!q) return true;
+      return (
+        d.name.toLowerCase().includes(q) ||
+        (d.archetype || '').toLowerCase().includes(q) ||
+        (d.category || '').toLowerCase().includes(q)
+      );
+    };
+
+    const groups: {
+      id: string;
+      name: string;
+      color?: CardColor;
+      decks: Deck[];
+      isUncategorized?: boolean;
+    }[] = [];
+
+    for (const folder of folders) {
+      const inFolder = decks.filter((d) => d.folderId === folder.id && matchesSearch(d));
+      groups.push({
+        id: folder.id,
+        name: folder.name,
+        color: folder.color,
+        decks: inFolder,
+      });
+    }
+
+    const uncategorized = decks.filter(
+      (d) => (!d.folderId || !folderIdsSet.has(d.folderId)) && matchesSearch(d)
+    );
+    if (uncategorized.length > 0 || folders.length === 0) {
+      groups.push({
+        id: 'uncategorized',
+        name: folders.length > 0 ? 'Uncategorized' : 'Saved Decks',
+        decks: uncategorized,
+        isUncategorized: true,
+      });
+    }
+
+    return {
+      allGroups: groups,
+      uncategorizedCount: decks.filter((d) => !d.folderId || !folderIdsSet.has(d.folderId))
+        .length,
+    };
+  }, [decks, folders, folderIdsSet, deckSearchQuery]);
+
+  const visibleFolderGroups = useMemo(() => {
+    if (effectiveFolderFilter === 'all') return folderGroups.allGroups;
+    return folderGroups.allGroups.filter((g) => g.id === effectiveFolderFilter);
+  }, [folderGroups.allGroups, effectiveFolderFilter]);
+
+  const activeFolderObj =
+    effectiveFolderFilter !== 'all' && effectiveFolderFilter !== 'uncategorized'
+      ? folders.find((f) => f.id === effectiveFolderFilter) || null
+      : null;
 
   const effectiveImportMode: 'replace' | 'merge' | 'new' = activeDeck ? importMode : 'new';
   const targetImportFormat: GameFormat =
@@ -169,10 +270,34 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     e.preventDefault();
     const trimmed = newDeckName.trim();
     if (!trimmed) return;
-    onCreateDeck(trimmed, newDeckFormat, newArchetype.trim() || `${newDeckFormat} Build`);
+    onCreateDeck(
+      trimmed,
+      newDeckFormat,
+      newArchetype.trim() || `${newDeckFormat} Build`,
+      newDeckFolderId || undefined
+    );
     setNewDeckName('');
     setNewArchetype('');
+    setNewDeckFolderId('');
     setCreating(false);
+  };
+
+  const handleFolderFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = folderFormName.trim();
+    if (!trimmed) return;
+    const chosenColor = folderFormColor || undefined;
+    if (folderFormMode === 'rename' && editingFolderId) {
+      onRenameFolder?.(editingFolderId, trimmed, chosenColor);
+    } else if (folderFormMode === 'create' && onCreateFolder) {
+      const createdId = onCreateFolder(trimmed, chosenColor);
+      if (createdId) {
+        setSelectedFolderFilter(createdId);
+      }
+    }
+    setFolderFormName('');
+    setEditingFolderId(null);
+    setFolderFormMode('closed');
   };
 
   const buildDecklistText = (mode: 'grouped' | 'compact' = textFormatMode) => {
@@ -353,6 +478,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
       newDeckName: resolvedName,
       newDeckFormat: resolvedFormat,
       newDeckArchetype: 'Imported List',
+      newDeckFolderId: importDeckFolderId || undefined,
     });
 
     if (cappedCards.length > 0) {
@@ -366,6 +492,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     setImportText('');
     setImportDeckName('');
     setImportDeckFormat(null);
+    setImportDeckFolderId('');
     setImporting(false);
   };
 
@@ -411,7 +538,9 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
               setImporting((v) => !v);
               setCreating(false);
               setTestingHand(false);
+              setFolderFormMode('closed');
               if (!activeDeck) setImportMode('new');
+              if (activeFolderObj) setImportDeckFolderId(activeFolderObj.id);
             }}
             className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border whitespace-nowrap ${
               importing
@@ -422,12 +551,36 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
             <ClipboardPaste className="w-4 h-4" />
             <span>Import List</span>
           </button>
+          {onCreateFolder && (
+            <button
+              type="button"
+              onClick={() => {
+                setFolderFormMode((prev) => (prev === 'create' ? 'closed' : 'create'));
+                setEditingFolderId(null);
+                setFolderFormName('');
+                setFolderFormColor('Red');
+                setCreating(false);
+                setImporting(false);
+                setTestingHand(false);
+              }}
+              className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border whitespace-nowrap ${
+                folderFormMode === 'create'
+                  ? 'bg-slate-100 text-slate-900 border-slate-300'
+                  : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Folder className="w-4 h-4" />
+              <span>New Folder</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
               setCreating((v) => !v);
               setImporting(false);
               setTestingHand(false);
+              setFolderFormMode('closed');
+              if (activeFolderObj) setNewDeckFolderId(activeFolderObj.id);
             }}
             className="min-h-[44px] px-4 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shrink-0 cursor-pointer whitespace-nowrap"
           >
@@ -491,7 +644,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
             {effectiveImportMode === 'new' ? (
               <>
-                <div className="sm:col-span-4">
+                <div className="sm:col-span-3">
                   <label
                     htmlFor="import-deck-name"
                     className="block text-xs font-semibold text-slate-600 mb-1"
@@ -507,7 +660,28 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                     className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
                   />
                 </div>
-                <div className="sm:col-span-3">
+                <div className="sm:col-span-2">
+                  <label
+                    htmlFor="import-deck-folder"
+                    className="block text-xs font-semibold text-slate-600 mb-1"
+                  >
+                    Folder
+                  </label>
+                  <select
+                    id="import-deck-folder"
+                    value={importDeckFolderId}
+                    onChange={(e) => setImportDeckFolderId(e.target.value)}
+                    className="w-full min-h-[44px] px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-600"
+                  >
+                    <option value="">Uncategorized</option>
+                    {folders.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="sm:col-span-2">
                   <div className="text-xs font-semibold text-slate-600 mb-1">Format</div>
                   <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl">
                     {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => {
@@ -517,7 +691,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                           key={fmt}
                           type="button"
                           onClick={() => setImportDeckFormat(fmt)}
-                          className={`min-h-[36px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          className={`min-h-[36px] px-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
                             activeFmt === fmt
                               ? fmt === 'Standard'
                                 ? 'bg-sky-700 text-white shadow-sm'
@@ -525,7 +699,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                               : 'text-slate-600 hover:text-slate-900'
                           }`}
                         >
-                          {fmt}
+                          {fmt === 'Standard' ? 'STD' : 'ETN'}
                         </button>
                       );
                     })}
@@ -719,12 +893,86 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
         </div>
       )}
 
+      {folderFormMode !== 'closed' && (
+        <form
+          onSubmit={handleFolderFormSubmit}
+          className="p-4 rounded-2xl bg-white border border-slate-200 grid grid-cols-1 sm:grid-cols-12 gap-3 items-end"
+        >
+          <div className="sm:col-span-5">
+            <label
+              htmlFor="deck-folder-name"
+              className="block text-xs font-semibold text-slate-600 mb-1"
+            >
+              {folderFormMode === 'rename' ? 'Rename Folder / Category' : 'New Folder / Category Name'}
+            </label>
+            <input
+              id="deck-folder-name"
+              type="text"
+              value={folderFormName}
+              onChange={(e) => setFolderFormName(e.target.value)}
+              placeholder="e.g., Tournament Meta, Dragon Brews, Testing"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
+              required
+            />
+          </div>
+
+          <div className="sm:col-span-4">
+            <div className="block text-xs font-semibold text-slate-600 mb-1">
+              Folder Color Accent
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 min-h-[44px]">
+              {ALL_COLORS.map((c) => {
+                const selected = folderFormColor === c;
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => setFolderFormColor(c)}
+                    className={`min-h-[36px] min-w-[36px] rounded-xl border inline-flex items-center justify-center cursor-pointer transition-all ${
+                      selected
+                        ? 'border-slate-900 ring-2 ring-slate-900/20 bg-slate-50'
+                        : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                    title={c}
+                    aria-label={`Folder color ${c}`}
+                  >
+                    <span
+                      className="w-4 h-4 rounded-full"
+                      style={{ backgroundColor: COLOR_META[c].hex }}
+                    />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="sm:col-span-3 flex gap-2">
+            <button
+              type="submit"
+              className="flex-1 min-h-[44px] px-4 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 cursor-pointer"
+            >
+              {folderFormMode === 'rename' ? 'Save Folder' : 'Create Folder'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setFolderFormMode('closed');
+                setEditingFolderId(null);
+              }}
+              className="min-h-[44px] px-3 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
       {creating && (
         <form
           onSubmit={handleCreateSubmit}
           className="p-4 rounded-2xl bg-white border border-slate-200 grid grid-cols-1 sm:grid-cols-12 gap-3 items-end"
         >
-          <div className="sm:col-span-4">
+          <div className="sm:col-span-3">
             <label htmlFor="new-deck-name" className="block text-xs font-semibold text-slate-600 mb-1">
               Deck Name
             </label>
@@ -738,7 +986,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
               required
             />
           </div>
-          <div className="sm:col-span-3">
+          <div className="sm:col-span-2">
             <div className="block text-xs font-semibold text-slate-600 mb-1">Format</div>
             <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl">
               {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => (
@@ -754,7 +1002,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  {fmt}
+                  {fmt === 'Standard' ? 'STD' : 'ETN'}
                 </button>
               ))}
             </div>
@@ -771,6 +1019,24 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
               placeholder="e.g., Contract Saga"
               className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
             />
+          </div>
+          <div className="sm:col-span-2">
+            <label htmlFor="new-deck-folder" className="block text-xs font-semibold text-slate-600 mb-1">
+              Folder
+            </label>
+            <select
+              id="new-deck-folder"
+              value={newDeckFolderId}
+              onChange={(e) => setNewDeckFolderId(e.target.value)}
+              className="w-full min-h-[44px] px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-600"
+            >
+              <option value="">Uncategorized</option>
+              {folders.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="sm:col-span-2 flex gap-2">
             <button
@@ -790,40 +1056,283 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
         </form>
       )}
 
-      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
-        {decks.map((deck) => {
-          const isSelected = deck.id === activeDeck?.id;
-          const entriesList = Array.isArray(deck.entries) ? deck.entries : [];
-          const count = entriesList.reduce((s, e) => s + (Number(e?.quantity) || 0), 0);
-          const fmtShort = (deck.format || 'Eternal') === 'Standard' ? 'STD' : 'ETN';
-          return (
-            <button
-              key={deck.id}
-              type="button"
-              onClick={() => {
-                onSelectDeck(deck.id);
-                setSelectedCostBucket(null);
-                setConfirmDeleteId(null);
-                setShareUrl(null);
-              }}
-              className={`min-h-[44px] px-4 py-2 rounded-xl text-left border shrink-0 transition-colors cursor-pointer ${
-                isSelected
-                  ? 'bg-slate-900 text-white border-slate-900'
-                  : 'bg-white text-slate-800 border-slate-200 hover:border-slate-300'
-              }`}
-            >
-              <div className="text-xs font-semibold whitespace-nowrap">{deck.name}</div>
-              <div
-                className={`text-[11px] font-mono tabular-nums ${
-                  isSelected ? 'text-slate-300' : 'text-slate-500'
+      {/* Deck Folders & Category Organizer */}
+      {(decks.length > 0 || folders.length > 0) && (
+        <div className="bg-white border border-slate-200 rounded-2xl p-3 sm:p-4 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5 flex-1 min-w-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedFolderFilter('all');
+                  setConfirmDeleteFolderId(null);
+                }}
+                className={`min-h-[38px] px-3 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 border transition-colors cursor-pointer ${
+                  effectiveFolderFilter === 'all'
+                    ? 'bg-slate-900 text-white border-slate-900'
+                    : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
                 }`}
               >
-                {fmtShort} · {count} cards · {deck.archetype}
+                All Decks ({decks.length})
+              </button>
+
+              {folders.map((folder) => {
+                const countInFolder = decks.filter((d) => d.folderId === folder.id).length;
+                const active = effectiveFolderFilter === folder.id;
+                const dotColor = folder.color ? COLOR_META[folder.color]?.hex : '#64748b';
+                return (
+                  <button
+                    key={folder.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedFolderFilter(folder.id);
+                      setConfirmDeleteFolderId(null);
+                    }}
+                    className={`min-h-[38px] px-3 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 border inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: dotColor }}
+                    />
+                    <span>{folder.name}</span>
+                    <span
+                      className={`font-mono text-[11px] tabular-nums ${
+                        active ? 'text-slate-300' : 'text-slate-400'
+                      }`}
+                    >
+                      ({countInFolder})
+                    </span>
+                  </button>
+                );
+              })}
+
+              {(folderGroups.uncategorizedCount > 0 || folders.length > 0) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedFolderFilter('uncategorized');
+                    setConfirmDeleteFolderId(null);
+                  }}
+                  className={`min-h-[38px] px-3 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 border transition-colors cursor-pointer ${
+                    effectiveFolderFilter === 'uncategorized'
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  Uncategorized ({folderGroups.uncategorizedCount})
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {decks.length >= 4 && (
+                <div className="relative flex-1 sm:w-48">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={deckSearchQuery}
+                    onChange={(e) => setDeckSearchQuery(e.target.value)}
+                    placeholder="Filter decks..."
+                    aria-label="Filter deck lists"
+                    className="w-full min-h-[38px] pl-8 pr-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
+                  />
+                </div>
+              )}
+
+              {activeFolderObj && (
+                <div className="flex items-center gap-1 shrink-0">
+                  {onRenameFolder && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFolderFormMode('rename');
+                        setEditingFolderId(activeFolderObj.id);
+                        setFolderFormName(activeFolderObj.name);
+                        setFolderFormColor(activeFolderObj.color || 'Red');
+                        setCreating(false);
+                      }}
+                      className="min-h-[38px] px-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 inline-flex items-center gap-1 cursor-pointer"
+                      aria-label={`Rename folder ${activeFolderObj.name}`}
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Rename</span>
+                    </button>
+                  )}
+                  {onDeleteFolder && (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteFolderId(activeFolderObj.id)}
+                      className="min-h-[38px] px-2.5 rounded-xl border border-slate-200 bg-white hover:bg-red-50 hover:border-red-200 text-xs font-semibold text-slate-600 hover:text-red-700 inline-flex items-center gap-1 cursor-pointer"
+                      aria-label={`Delete folder ${activeFolderObj.name}`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {confirmDeleteFolderId && activeFolderObj?.id === confirmDeleteFolderId && (
+            <div className="p-3 rounded-xl bg-red-50 border border-red-200 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-red-900">
+                Remove folder &ldquo;{activeFolderObj.name}&rdquo;? Decks inside will stay saved under Uncategorized.
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteFolderId(null)}
+                  className="min-h-[34px] px-3 rounded-lg bg-white border border-slate-200 font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onDeleteFolder?.(activeFolderObj.id);
+                    setConfirmDeleteFolderId(null);
+                    setSelectedFolderFilter('all');
+                  }}
+                  className="min-h-[34px] px-3 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700 cursor-pointer"
+                >
+                  Remove Folder
+                </button>
               </div>
-            </button>
-          );
-        })}
-      </div>
+            </div>
+          )}
+
+          {/* Grouped Folder Sections & Deck Cards */}
+          <div className="space-y-3">
+            {visibleFolderGroups.map((group) => {
+              const isCollapsed = Boolean(collapsedFolderIds[group.id]) && effectiveFolderFilter === 'all';
+              const dotHex = group.color ? COLOR_META[group.color]?.hex : '#94a3b8';
+
+              return (
+                <div
+                  key={group.id}
+                  className="rounded-xl border border-slate-200/90 bg-slate-50/50 overflow-hidden"
+                >
+                  <div className="px-3 py-2 bg-slate-100/70 border-b border-slate-200/70 flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCollapsedFolderIds((prev) => ({
+                          ...prev,
+                          [group.id]: !prev[group.id],
+                        }))
+                      }
+                      className="flex items-center gap-2 text-left min-w-0 flex-1 cursor-pointer"
+                      aria-expanded={!isCollapsed}
+                    >
+                      {effectiveFolderFilter === 'all' &&
+                        (isCollapsed ? (
+                          <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
+                        ))}
+                      {isCollapsed ? (
+                        <Folder className="w-4 h-4 shrink-0" style={{ color: dotHex }} />
+                      ) : (
+                        <FolderOpen className="w-4 h-4 shrink-0" style={{ color: dotHex }} />
+                      )}
+                      <span className="text-xs font-bold text-slate-800 truncate">
+                        {group.name}
+                      </span>
+                      <span className="font-mono text-[11px] font-semibold text-slate-500 tabular-nums shrink-0">
+                        {group.decks.length} {group.decks.length === 1 ? 'deck' : 'decks'}
+                      </span>
+                    </button>
+
+                    {!group.isUncategorized && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCreating(true);
+                          setImporting(false);
+                          setTestingHand(false);
+                          setFolderFormMode('closed');
+                          setNewDeckFolderId(group.id);
+                        }}
+                        className="text-[11px] font-semibold text-red-700 hover:underline shrink-0 cursor-pointer"
+                      >
+                        + Add Deck
+                      </button>
+                    )}
+                  </div>
+
+                  {!isCollapsed && (
+                    <div className="p-2.5">
+                      {group.decks.length === 0 ? (
+                        <div className="py-3 px-2 text-xs text-slate-500 text-center">
+                          {deckSearchQuery.trim()
+                            ? `No decks matching "${deckSearchQuery.trim()}" in this folder.`
+                            : 'Empty folder — create a new deck or move an existing deck here.'}
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                          {group.decks.map((deck) => {
+                            const isSelected = deck.id === activeDeck?.id;
+                            const entriesList = Array.isArray(deck.entries) ? deck.entries : [];
+                            const count = entriesList.reduce(
+                              (s, e) => s + (Number(e?.quantity) || 0),
+                              0
+                            );
+                            const fmtShort =
+                              (deck.format || 'Eternal') === 'Standard' ? 'STD' : 'ETN';
+                            return (
+                              <button
+                                key={deck.id}
+                                type="button"
+                                onClick={() => {
+                                  onSelectDeck(deck.id);
+                                  setSelectedCostBucket(null);
+                                  setConfirmDeleteId(null);
+                                  setShareUrl(null);
+                                }}
+                                className={`min-h-[44px] px-3.5 py-2.5 rounded-xl text-left border transition-colors cursor-pointer ${
+                                  isSelected
+                                    ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
+                                    : 'bg-white text-slate-800 border-slate-200 hover:border-slate-300'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-xs font-bold truncate">{deck.name}</span>
+                                  <span
+                                    className={`font-mono text-[10px] font-bold shrink-0 ${
+                                      isSelected
+                                        ? 'text-slate-300'
+                                        : fmtShort === 'STD'
+                                        ? 'text-sky-700'
+                                        : 'text-amber-700'
+                                    }`}
+                                  >
+                                    {fmtShort}
+                                  </span>
+                                </div>
+                                <div
+                                  className={`mt-0.5 text-[11px] font-mono tabular-nums truncate ${
+                                    isSelected ? 'text-slate-300' : 'text-slate-500'
+                                  }`}
+                                >
+                                  {count}/40+ cards · {deck.archetype}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {!activeDeck && (
         <div className="p-8 rounded-2xl bg-white border border-slate-200 text-center space-y-3">
@@ -885,27 +1394,59 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                 </div>
               </div>
 
-              {/* Deck Format Toggle */}
-              <div className="flex items-center justify-between gap-3 pt-1">
-                <span className="text-xs font-semibold text-slate-600">Target Format</span>
-                <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
-                  {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => (
-                    <button
-                      key={fmt}
-                      type="button"
-                      onClick={() => onChangeDeckFormat(activeDeck.id, fmt)}
-                      className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                        activeFormat === fmt
-                          ? fmt === 'Standard'
-                            ? 'bg-sky-700 text-white shadow-sm'
-                            : 'bg-amber-700 text-white shadow-sm'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      {fmt}
-                    </button>
-                  ))}
+              {/* Deck Format & Folder Controls */}
+              <div className="space-y-2.5 pt-1">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-xs font-semibold text-slate-600">Target Format</span>
+                  <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+                    {(['Standard', 'Eternal'] as GameFormat[]).map((fmt) => (
+                      <button
+                        key={fmt}
+                        type="button"
+                        onClick={() => onChangeDeckFormat(activeDeck.id, fmt)}
+                        className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                          activeFormat === fmt
+                            ? fmt === 'Standard'
+                              ? 'bg-sky-700 text-white shadow-sm'
+                              : 'bg-amber-700 text-white shadow-sm'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {fmt}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+
+                {onMoveDeckToFolder && (
+                  <div className="flex items-center justify-between gap-3">
+                    <label
+                      htmlFor="active-deck-folder-select"
+                      className="text-xs font-semibold text-slate-600 shrink-0"
+                    >
+                      Folder / Category
+                    </label>
+                    <select
+                      id="active-deck-folder-select"
+                      value={
+                        activeDeck.folderId && folderIdsSet.has(activeDeck.folderId)
+                          ? activeDeck.folderId
+                          : ''
+                      }
+                      onChange={(e) =>
+                        onMoveDeckToFolder(activeDeck.id, e.target.value || undefined)
+                      }
+                      className="min-h-[38px] max-w-[210px] px-2.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-white text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-600"
+                    >
+                      <option value="">Uncategorized</option>
+                      {folders.map((f) => (
+                        <option key={f.id} value={f.id}>
+                          {f.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
 
               {hasViolations && (

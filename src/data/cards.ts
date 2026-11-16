@@ -1,4 +1,10 @@
-import { BattleSpiritsCard, Deck, KeywordGlossaryItem, ProductSet } from '../types/card';
+import {
+  BattleSpiritsCard,
+  Deck,
+  DeckFolder,
+  KeywordGlossaryItem,
+  ProductSet,
+} from '../types/card';
 
 const ART = {
   redDragon: '/src/assets/images/bs_red_dragon_1794715408095.jpg',
@@ -2289,12 +2295,29 @@ export const BATTLE_SPIRITS_CARDS: BattleSpiritsCard[] = [
   },
 ];
 
+export const PRESET_DECK_FOLDERS: DeckFolder[] = [
+  {
+    id: 'folder-std-meta',
+    name: 'Standard Block A',
+    color: 'Red',
+    createdAt: '2026-11-14',
+  },
+  {
+    id: 'folder-etn-classics',
+    name: 'Eternal Classics',
+    color: 'Purple',
+    createdAt: '2026-11-14',
+  },
+];
+
 export const PRESET_DECKS: Deck[] = [
   {
     id: 'deck-std-genesis-pulse',
     name: 'Genesis Pulse Alliance (STD)',
     format: 'Standard',
     archetype: 'Standard Block A · 26RBS01 & RP26',
+    folderId: 'folder-std-meta',
+    category: 'Standard Block A',
     updatedAt: '2026-11-14',
     entries: [
       { cardId: '26rbs01-26rbs01-001', quantity: 3 },
@@ -2309,6 +2332,8 @@ export const PRESET_DECKS: Deck[] = [
     name: 'Eternal Emperor Siegwurm (ETN)',
     format: 'Eternal',
     archetype: 'Eternal · Bannerace & Astral Dragon',
+    folderId: 'folder-etn-classics',
+    category: 'Eternal Classics',
     updatedAt: '2026-11-14',
     entries: [
       { cardId: 'bs77-bs77-001', quantity: 3 },

@@ -12,7 +12,12 @@ import {
   AlertTriangle,
   Ban,
 } from 'lucide-react';
-import { BATTLE_SPIRITS_CARDS, PRESET_DECKS, PRODUCT_SETS } from './data/cards';
+import {
+  BATTLE_SPIRITS_CARDS,
+  PRESET_DECKS,
+  PRESET_DECK_FOLDERS,
+  PRODUCT_SETS,
+} from './data/cards';
 import { ALL_COLORS, COLOR_META } from './data/theme';
 import {
   BattleSpiritsCard,
@@ -22,6 +27,7 @@ import {
   ColorFilter,
   Deck,
   DeckEntry,
+  DeckFolder,
   FilterState,
   FormatFilter,
   GameFormat,
@@ -35,6 +41,7 @@ import { DeckBuilderView } from './components/DeckBuilderView';
 import { RulingsView } from './components/RulingsView';
 import { CatalogMenuView } from './components/CatalogMenuView';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAControls';
 import { getMaxCardCopies, isTokenCard } from './utils/cardRules';
 import { decodeSharedDeck, SharedDeckPayload } from './utils/deckShare';
 import {
@@ -44,6 +51,11 @@ import {
   normalizeCardName,
   normalizeCardNumber,
 } from './utils/decklistImport';
+import {
+  loadOfflineSnapshot,
+  saveOfflineCards,
+  saveOfflineMeta,
+} from './utils/offlineCardStore';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'rules';
 
@@ -185,6 +197,7 @@ export function getCardColors(card: BattleSpiritsCard): CardColor[] {
 }
 
 const STORAGE_DECKS_KEY = 'spiritsdex_decks_v1';
+const STORAGE_DECK_FOLDERS_KEY = 'spiritsdex_deck_folders_v1';
 const STORAGE_ACTIVE_DECK_KEY = 'spiritsdex_active_deck_v1';
 const STORAGE_WIKI_CARDS_KEY = 'spiritsdex_wiki_cards_v4';
 
@@ -418,6 +431,28 @@ export default function App() {
     return initial;
   });
 
+  const [deckFolders, setDeckFolders] = useState<DeckFolder[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_DECK_FOLDERS_KEY);
+      if (saved !== null) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((f): f is Record<string, any> => Boolean(f && typeof f === 'object' && f.id))
+            .map((f) => ({
+              id: String(f.id),
+              name: String(f.name || 'Untitled Folder').trim() || 'Untitled Folder',
+              color: f.color && COLOR_META[f.color as CardColor] ? (f.color as CardColor) : undefined,
+              createdAt: String(f.createdAt || new Date().toISOString().slice(0, 10)),
+            }));
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return PRESET_DECK_FOLDERS;
+  });
+
   const [decks, setDecks] = useState<Deck[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_DECKS_KEY);
@@ -431,6 +466,12 @@ export default function App() {
               name: String(d.name || 'Untitled Deck'),
               format: d.format === 'Standard' || d.format === 'Eternal' ? d.format : 'Eternal',
               archetype: String(d.archetype || 'Custom Build'),
+              ...(typeof d.folderId === 'string' && d.folderId.trim()
+                ? { folderId: d.folderId.trim() }
+                : {}),
+              ...(typeof d.category === 'string' && d.category.trim()
+                ? { category: d.category.trim() }
+                : {}),
               updatedAt: String(d.updatedAt || new Date().toISOString().slice(0, 10)),
               entries: Array.isArray(d.entries)
                 ? d.entries
@@ -528,9 +569,10 @@ export default function App() {
           }
         }
         setProductSets(merged);
+        void saveOfflineMeta({ productSets: merged });
       })
       .catch(() => {
-        // fallback cleanly to initial PRODUCT_SETS
+        // fallback cleanly to cached or initial PRODUCT_SETS
       });
     return () => {
       cancelled = true;
@@ -545,6 +587,7 @@ export default function App() {
       .then((data: BanListSnapshot | null) => {
         if (cancelled || !data || !data.byCardNumber) return;
         setBanList(data);
+        void saveOfflineMeta({ banList: data });
         setCardsMap((prev) => {
           const next = { ...prev };
           for (const [id, card] of Object.entries(next)) {
@@ -557,7 +600,7 @@ export default function App() {
         });
       })
       .catch(() => {
-        // keep default restrictions gracefully if offline
+        // keep cached or default restrictions gracefully if offline
       });
     return () => {
       cancelled = true;
@@ -646,6 +689,14 @@ export default function App() {
     }
   }, [decks]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_DECK_FOLDERS_KEY, JSON.stringify(deckFolders));
+    } catch {
+      // ignore
+    }
+  }, [deckFolders]);
+
   // Automatically strip any Token cards from saved decks once card metadata is loaded
   useEffect(() => {
     const hasAnyTokenEntry = decks.some((deck) =>
@@ -660,7 +711,48 @@ export default function App() {
     );
   }, [cardsMap, decks]);
 
-  // Persist any non-bundled wiki cards used in saved decks so deck rosters survive reloads
+  // Restore full cached Wiki cards, set directory, and banlist from IndexedDB on startup (offline resilience)
+  useEffect(() => {
+    let cancelled = false;
+    loadOfflineSnapshot().then((snapshot) => {
+      if (cancelled) return;
+      if (snapshot.banList) {
+        setBanList((curr) => curr || snapshot.banList!);
+      }
+      if (snapshot.productSets && snapshot.productSets.length > 0) {
+        setProductSets((curr) =>
+          curr.length <= PRODUCT_SETS.length ? snapshot.productSets! : curr
+        );
+      }
+      if (snapshot.cards.length > 0) {
+        setCardsMap(
+          (prev) =>
+            mergeCardsIntoMap(prev, snapshot.cards, {
+              banList: snapshot.banList || null,
+            }).next
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist all hydrated or fetched card metadata into IndexedDB (debounced) so offline browsing & card details stay complete
+  useEffect(() => {
+    const bundledIds = new Set(BATTLE_SPIRITS_CARDS.map((c) => c.id));
+    const timeout = window.setTimeout(() => {
+      const toCache = Object.values(cardsMap).filter(
+        (c) => Boolean(c.isWikiLoaded) || !bundledIds.has(c.id)
+      );
+      if (toCache.length > 0) {
+        void saveOfflineCards(toCache);
+      }
+    }, 650);
+    return () => window.clearTimeout(timeout);
+  }, [cardsMap]);
+
+  // Persist any non-bundled wiki cards used in saved decks into localStorage as a fast synchronous backup
   useEffect(() => {
     try {
       const bundledIds = new Set(BATTLE_SPIRITS_CARDS.map((c) => c.id));
@@ -681,6 +773,22 @@ export default function App() {
   const showToast = (msg: string) => {
     setToastMsg(msg);
   };
+
+  useEffect(() => {
+    const handleOfflineReady = () => {
+      try {
+        const flagKey = 'spiritsdex_sw_cached_notified_v1';
+        if (!localStorage.getItem(flagKey)) {
+          localStorage.setItem(flagKey, '1');
+          setToastMsg('Core card database cached for offline browsing');
+        }
+      } catch {
+        setToastMsg('Core card database cached for offline browsing');
+      }
+    };
+    window.addEventListener('spiritsdex:offline-ready', handleOfflineReady);
+    return () => window.removeEventListener('spiritsdex:offline-ready', handleOfflineReady);
+  }, []);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -754,16 +862,29 @@ export default function App() {
 
         setLoadedSetCodes((prev) => ({ ...prev, [upper]: true }));
       } catch (err) {
-        setSetErrorMsg(
-          err instanceof Error
-            ? err.message
-            : `Failed to fetch ${upper} from Battle Spirits Wiki`
+        const hasCachedSetCards = Object.values(cardsMap).some((c) =>
+          upper === 'TOKENS'
+            ? Boolean(c.isToken)
+            : upper === 'REVIVAL'
+            ? Boolean(c.isRevival)
+            : c.setCode.toUpperCase() === upper
         );
+        if (hasCachedSetCards && typeof navigator !== 'undefined' && !navigator.onLine) {
+          setSetErrorMsg(null);
+        } else {
+          setSetErrorMsg(
+            typeof navigator !== 'undefined' && !navigator.onLine
+              ? `Offline Mode — connect to the internet once to sync ${upper} cards.`
+              : err instanceof Error
+              ? err.message
+              : `Failed to fetch ${upper} from Battle Spirits Wiki`
+          );
+        }
       } finally {
         setLoadingSetCode((prev) => (prev === upper ? null : prev));
       }
     },
-    [loadedSetCodes, banList]
+    [loadedSetCodes, banList, cardsMap]
   );
 
   // Automatically fetch a set whenever filters.setCode is set to a specific set
@@ -828,7 +949,11 @@ export default function App() {
         showToast(`No additional Wiki card pages matched "${q}"`);
       }
     } catch {
-      showToast('Unable to reach Battle Spirits Wiki search right now');
+      showToast(
+        typeof navigator !== 'undefined' && !navigator.onLine
+          ? 'Offline Mode — showing matching cards from local cache'
+          : 'Unable to reach Battle Spirits Wiki search right now'
+      );
     } finally {
       setSearchingWiki(false);
     }
@@ -1043,19 +1168,103 @@ export default function App() {
     }
   };
 
-  const handleCreateDeck = (name: string, format: GameFormat, archetype: string) => {
+  const handleCreateDeck = (
+    name: string,
+    format: GameFormat,
+    archetype: string,
+    folderId?: string
+  ) => {
     const id = `deck-${Date.now()}`;
+    const matchedFolder = folderId ? deckFolders.find((f) => f.id === folderId) : undefined;
     const newDeck: Deck = {
       id,
       name,
       format,
       archetype,
+      ...(matchedFolder ? { folderId: matchedFolder.id, category: matchedFolder.name } : {}),
       updatedAt: new Date().toISOString().slice(0, 10),
       entries: [],
     };
     setDecks((prev) => [newDeck, ...prev]);
     setActiveDeckId(id);
-    showToast(`Created ${format} deck "${name}"`);
+    showToast(
+      matchedFolder
+        ? `Created ${format} deck "${name}" in ${matchedFolder.name}`
+        : `Created ${format} deck "${name}"`
+    );
+  };
+
+  const handleCreateFolder = (name: string, color?: CardColor): string => {
+    const cleanName = name.trim();
+    if (!cleanName) return '';
+    const existing = deckFolders.find(
+      (f) => f.name.toLowerCase() === cleanName.toLowerCase()
+    );
+    if (existing) {
+      showToast(`Folder "${existing.name}" already exists`);
+      return existing.id;
+    }
+    const id = `folder-${Date.now()}`;
+    const folder: DeckFolder = {
+      id,
+      name: cleanName,
+      color,
+      createdAt: new Date().toISOString().slice(0, 10),
+    };
+    setDeckFolders((prev) => [...prev, folder]);
+    showToast(`Created folder "${cleanName}"`);
+    return id;
+  };
+
+  const handleRenameFolder = (folderId: string, name: string, color?: CardColor) => {
+    const cleanName = name.trim();
+    if (!cleanName) return;
+    setDeckFolders((prev) =>
+      prev.map((f) =>
+        f.id === folderId ? { ...f, name: cleanName, color: color ?? f.color } : f
+      )
+    );
+    setDecks((prev) =>
+      prev.map((d) => (d.folderId === folderId ? { ...d, category: cleanName } : d))
+    );
+    showToast(`Updated folder "${cleanName}"`);
+  };
+
+  const handleDeleteFolder = (folderId: string) => {
+    const target = deckFolders.find((f) => f.id === folderId);
+    setDeckFolders((prev) => prev.filter((f) => f.id !== folderId));
+    setDecks((prev) =>
+      prev.map((d) =>
+        d.folderId === folderId ? { ...d, folderId: undefined, category: undefined } : d
+      )
+    );
+    if (target) {
+      showToast(`Removed folder "${target.name}" (decks moved to Uncategorized)`);
+    }
+  };
+
+  const handleMoveDeckToFolder = (deckId: string, folderId?: string) => {
+    const matchedFolder = folderId ? deckFolders.find((f) => f.id === folderId) : undefined;
+    setDecks((prev) =>
+      prev.map((d) =>
+        d.id === deckId
+          ? {
+              ...d,
+              folderId: matchedFolder?.id,
+              category: matchedFolder?.name,
+              updatedAt: new Date().toISOString().slice(0, 10),
+            }
+          : d
+      )
+    );
+    const deck = decks.find((d) => d.id === deckId);
+    if (deck) {
+      showToast(
+        matchedFolder
+          ? `Moved "${deck.name}" to ${matchedFolder.name}`
+          : `Moved "${deck.name}" to Uncategorized`
+      );
+    }
   };
 
   const handleChangeDeckFormat = (deckId: string, format: GameFormat) => {
@@ -1119,23 +1328,29 @@ export default function App() {
     newDeckName,
     newDeckFormat,
     newDeckArchetype,
+    newDeckFolderId,
   }: {
     mode: 'replace' | 'merge' | 'new';
     entries: DeckEntry[];
     newDeckName?: string;
     newDeckFormat?: GameFormat;
     newDeckArchetype?: string;
+    newDeckFolderId?: string;
   }) => {
     const today = new Date().toISOString().slice(0, 10);
     if (mode === 'new' || !activeDeck) {
       const id = `deck-${Date.now()}`;
       const fmt: GameFormat = newDeckFormat || 'Eternal';
       const name = (newDeckName || '').trim() || `Imported ${fmt} Deck`;
+      const matchedFolder = newDeckFolderId
+        ? deckFolders.find((f) => f.id === newDeckFolderId)
+        : undefined;
       const newDeck: Deck = {
         id,
         name,
         format: fmt,
         archetype: (newDeckArchetype || '').trim() || 'Imported List',
+        ...(matchedFolder ? { folderId: matchedFolder.id, category: matchedFolder.name } : {}),
         updatedAt: today,
         entries,
       };
@@ -1410,6 +1625,7 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-2 shrink-0">
+            <PWAInstallButton />
             <button
               type="button"
               onClick={() => setActiveTab('decks')}
@@ -1738,10 +1954,15 @@ export default function App() {
           >
             <DeckBuilderView
               decks={decks}
+              folders={deckFolders}
               activeDeckId={activeDeck?.id || ''}
               cardsById={cardsMap}
               onSelectDeck={setActiveDeckId}
               onCreateDeck={handleCreateDeck}
+              onCreateFolder={handleCreateFolder}
+              onRenameFolder={handleRenameFolder}
+              onDeleteFolder={handleDeleteFolder}
+              onMoveDeckToFolder={handleMoveDeckToFolder}
               onChangeDeckFormat={handleChangeDeckFormat}
               onRemoveIllegalCards={handleRemoveIllegalCards}
               onDeleteDeck={handleDeleteDeck}
@@ -1757,6 +1978,9 @@ export default function App() {
 
         {activeTab === 'rules' && <RulingsView />}
       </main>
+
+      {/* Offline Status Banner */}
+      <OfflineIndicator />
 
       {/* Inline Toast Feedback */}
       {toastMsg && (

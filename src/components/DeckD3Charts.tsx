@@ -192,10 +192,9 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
           .attr('stroke-dasharray', '3,3')
       );
 
-    // Y axis (updated synchronously on selection so tick/domain cleanup never races a D3 transition)
+    // Y axis (updated synchronously with zero d3-transition dependency)
     root
       .select<SVGGElement>('g.d3-y-axis')
-      .interrupt()
       .call(
         d3
           .axisLeft(y)
@@ -306,26 +305,13 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
             enter
               .append('rect')
               .attr('class', 'd3-seg')
-              .attr('x', bx)
-              .attr('width', bw)
-              .attr('y', innerHeight)
-              .attr('height', 0)
-              .attr('fill', (s) => s.hex)
-              .attr('rx', (s) => (s.isTop ? 3 : 0)),
+              .style(
+                'transition',
+                'y 220ms cubic-bezier(0.22, 1, 0.36, 1), height 220ms cubic-bezier(0.22, 1, 0.36, 1)'
+              ),
           (update) => update,
-          (exit) =>
-            exit
-              .interrupt()
-              .transition()
-              .duration(180)
-              .attr('y', innerHeight)
-              .attr('height', 0)
-              .remove()
+          (exit) => exit.remove()
         )
-        .interrupt()
-        .transition()
-        .duration(250)
-        .ease(d3.easeCubicOut)
         .attr('x', bx)
         .attr('width', bw)
         .attr('y', (s) => s.yTop)
@@ -336,18 +322,15 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
       // Count label above bar
       col
         .select<SVGTextElement>('text.d3-bar-label')
-        .interrupt()
+        .style('transition', 'y 220ms cubic-bezier(0.22, 1, 0.36, 1)')
         .attr('x', bx + bw / 2)
+        .attr('y', Math.max(10, y(d.total) - 5))
         .attr('text-anchor', 'middle')
         .attr('font-size', '10px')
         .attr('font-weight', '700')
         .attr('font-family', 'ui-monospace, SFMono-Regular, monospace')
         .attr('fill', isSelected ? '#b91c1c' : '#0f172a')
-        .text(d.total > 0 ? String(d.total) : '')
-        .transition()
-        .duration(250)
-        .ease(d3.easeCubicOut)
-        .attr('y', Math.max(10, y(d.total) - 5));
+        .text(d.total > 0 ? String(d.total) : '');
 
       // Invisible full-column click/hover hitbox
       col
@@ -421,7 +404,6 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
     root
       .select<SVGGElement>('g.d3-color-y-axis')
-      .interrupt()
       .call(
         d3
           .axisLeft(y)
@@ -481,12 +463,12 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
       col
         .select<SVGRectElement>('rect.d3-color-rect')
-        .interrupt()
+        .style(
+          'transition',
+          'y 220ms cubic-bezier(0.22, 1, 0.36, 1), height 220ms cubic-bezier(0.22, 1, 0.36, 1)'
+        )
         .attr('rx', 5)
         .attr('fill', d.hex)
-        .transition()
-        .duration(250)
-        .ease(d3.easeCubicOut)
         .attr('x', bx)
         .attr('width', bw)
         .attr('y', targetY)
@@ -503,18 +485,15 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
 
       col
         .select<SVGTextElement>('text.d3-color-label')
-        .interrupt()
+        .style('transition', 'y 220ms cubic-bezier(0.22, 1, 0.36, 1)')
         .attr('x', bx + bw / 2)
+        .attr('y', Math.max(10, targetY - 5))
         .attr('text-anchor', 'middle')
         .attr('font-size', '10px')
         .attr('font-weight', '700')
         .attr('font-family', 'ui-monospace, SFMono-Regular, monospace')
         .attr('fill', '#0f172a')
-        .text(d.count > 0 ? `${d.count}` : '')
-        .transition()
-        .duration(250)
-        .ease(d3.easeCubicOut)
-        .attr('y', Math.max(10, targetY - 5));
+        .text(d.count > 0 ? `${d.count}` : '');
 
       col
         .select<SVGRectElement>('rect.d3-color-hit')

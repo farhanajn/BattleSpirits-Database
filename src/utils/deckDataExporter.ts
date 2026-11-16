@@ -48,6 +48,7 @@ export function buildDeckJsonString(
       name: deck.name,
       format: deck.format || 'Eternal',
       archetype: deck.archetype,
+      ...(deck.category ? { category: deck.category } : {}),
       updatedAt: deck.updatedAt,
       totalCards,
       uniqueCards: sorted.length,
