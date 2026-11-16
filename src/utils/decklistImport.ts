@@ -1,4 +1,5 @@
 import { BattleSpiritsCard, DeckEntry, GameFormat } from '../types/card';
+import { getMaxCardCopies, isTokenCard } from './cardRules';
 
 export type ImportMatchConfidence =
   | 'exact-number'
@@ -461,12 +462,14 @@ export function buildImportedDeckEntries(
   }
 
   for (const { card, quantity } of aggregatedEntries) {
-    const maxCopies =
-      card.restriction === 'Restricted <1>'
-        ? 1
-        : card.restriction === 'Restricted <2>'
-        ? 2
-        : 3;
+    const maxCopies = getMaxCardCopies(card);
+    if (maxCopies === 0) {
+      const label = isTokenCard(card)
+        ? `${card.name} (Token — outside deck)`
+        : `${card.name} (Banned)`;
+      if (!cappedCards.includes(label)) cappedCards.push(label);
+      continue;
+    }
     const prevQty = nextMap.get(card.id) || 0;
     const combined = prevQty + quantity;
     const clamped = Math.min(maxCopies, combined);

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import {
   buildWikiDirectory,
   fetchWikiImageBytes,
+  getWikiBanList,
   getWikiCardDetail,
   getWikiSet,
   hydrateWikiCardsBatch,
@@ -23,6 +24,16 @@ async function startServer() {
   app.get('/api/wiki/directory', (_req, res) => {
     const sets = buildWikiDirectory();
     res.json({ sets });
+  });
+
+  app.get('/api/wiki/banlist', async (_req, res) => {
+    try {
+      const banlist = await getWikiBanList();
+      res.json(banlist);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load banlist';
+      res.status(500).json({ error: message });
+    }
   });
 
   app.get('/api/wiki/sets/:setCode', async (req, res) => {

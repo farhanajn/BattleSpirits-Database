@@ -8,6 +8,9 @@ import {
   X,
   Loader2,
   Globe,
+  Share2,
+  AlertTriangle,
+  Ban,
 } from 'lucide-react';
 import { BATTLE_SPIRITS_CARDS, PRESET_DECKS, PRODUCT_SETS } from './data/cards';
 import { ALL_COLORS, COLOR_META } from './data/theme';
@@ -31,8 +34,25 @@ import { FilterControls, FilterSheet } from './components/FilterSheet';
 import { DeckBuilderView } from './components/DeckBuilderView';
 import { RulingsView } from './components/RulingsView';
 import { CatalogMenuView } from './components/CatalogMenuView';
+import { getMaxCardCopies, isTokenCard } from './utils/cardRules';
+import { decodeSharedDeck, SharedDeckPayload } from './utils/deckShare';
+import {
+  buildImportedDeckEntries,
+  compactCardNumber,
+  extractSetCodeFromCardNumber,
+  normalizeCardName,
+  normalizeCardNumber,
+} from './utils/decklistImport';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'rules';
+
+type CardRestrictionValue = NonNullable<BattleSpiritsCard['restriction']>;
+
+interface BanListSnapshot {
+  effectiveDate?: string;
+  byCardNumber: Record<string, CardRestrictionValue>;
+  byName: Record<string, CardRestrictionValue>;
+}
 
 const INITIAL_FILTERS: FilterState = {
   search: '',
@@ -92,13 +112,25 @@ const VALID_SORTS: FilterState['sortBy'][] = [
   'name',
 ];
 
-function parseStateFromUrl(): { tab: AppTab; filters: FilterState } {
+function parseStateFromUrl(): {
+  tab: AppTab;
+  filters: FilterState;
+  sharedDeck: SharedDeckPayload | null;
+} {
   if (typeof window === 'undefined') {
-    return { tab: 'catalog', filters: INITIAL_FILTERS };
+    return { tab: 'catalog', filters: INITIAL_FILTERS, sharedDeck: null };
   }
   const params = new URLSearchParams(window.location.search);
+  const rawShare = params.get('share');
+  const sharedDeck = rawShare ? decodeSharedDeck(rawShare) : null;
+
   const rawTab = params.get('tab') as AppTab | null;
-  const tab: AppTab = rawTab && VALID_TABS.includes(rawTab) ? rawTab : 'catalog';
+  const tab: AppTab =
+    rawTab && VALID_TABS.includes(rawTab)
+      ? rawTab
+      : sharedDeck
+      ? 'decks'
+      : 'catalog';
 
   const rawFmt = params.get('fmt') as FormatFilter | null;
   const rawVer = params.get('ver') as FilterState['version'] | null;
@@ -110,6 +142,7 @@ function parseStateFromUrl(): { tab: AppTab; filters: FilterState } {
 
   return {
     tab,
+    sharedDeck,
     filters: {
       search: params.get('q') || '',
       format: rawFmt && VALID_FORMATS.includes(rawFmt) ? rawFmt : 'All',
@@ -160,10 +193,183 @@ function matchesFormatFilter(formats: GameFormat[], filter: FormatFilter): boole
   return !formats.includes('Standard') && formats.includes('Eternal');
 }
 
+function normalizeBanName(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\u2018\u2019`´]/g, "'")
+    .replace(/\s*\(revival\)\s*/gi, '')
+    .replace(/\s+/g, ' ');
+}
+
+function resolveBanRestriction(
+  card: BattleSpiritsCard,
+  banList: BanListSnapshot | null
+): BattleSpiritsCard['restriction'] {
+  if (!banList) return card.restriction || 'Unlimited';
+  const codeKey = normalizeCardNumber(card.cardNumber || '');
+  if (codeKey && banList.byCardNumber[codeKey]) {
+    return banList.byCardNumber[codeKey];
+  }
+  const compactKey = compactCardNumber(card.cardNumber || '');
+  if (compactKey && banList.byCardNumber[compactKey]) {
+    return banList.byCardNumber[compactKey];
+  }
+  const nameKey = normalizeBanName(card.name || '');
+  if (nameKey) {
+    const verKey = `${nameKey}|${card.isRevival ? 'rv' : 'orig'}`;
+    if (banList.byName[verKey]) return banList.byName[verKey];
+    if (banList.byName[nameKey]) return banList.byName[nameKey];
+  }
+  return card.restriction || 'Unlimited';
+}
+
+function sanitizeCardTextTemplates(card: BattleSpiritsCard): BattleSpiritsCard {
+  const cleanStr = (s: string) =>
+    s
+      .replace(/SuAdcon\s+([^\]\n]+)/gi, '[Summon/Advent Condition: $1]')
+      .replace(/\bSumcon\s+([^\]\n]+)/gi, '[Summon Condition: $1]');
+
+  const hasDirtyEffect = card.effects.some((e) =>
+    /\b(?:SuAdcon|Sumcon)\b/i.test(`${e.timing} ${e.text}`)
+  );
+  if (!hasDirtyEffect) return card;
+
+  let extractedSummon = card.summonCondition;
+  const cleanedEffects = card.effects.map((e) => {
+    const nextText = cleanStr(e.text);
+    const nextTiming = cleanStr(e.timing);
+    if (!extractedSummon) {
+      const m = `${nextTiming}\n${nextText}`.match(
+        /\[(?:Summon(?:\/Advent)?|Advent)\s+Condition:\s*([^\]]+)\]/i
+      );
+      if (m) extractedSummon = m[1].trim();
+    }
+    return { timing: nextTiming, text: nextText };
+  });
+
+  return {
+    ...card,
+    effects: cleanedEffects,
+    summonCondition: extractedSummon,
+  };
+}
+
+function mergeCardsIntoMap(
+  prev: Record<string, BattleSpiritsCard>,
+  incomingCards: BattleSpiritsCard[],
+  options?: {
+    banList?: BanListSnapshot | null;
+    forceRevival?: boolean;
+    forceToken?: boolean;
+  }
+): { next: Record<string, BattleSpiritsCard>; addedCount: number } {
+  const next = { ...prev };
+  const keyToId = new Map<string, string>();
+
+  const indexCard = (c: BattleSpiritsCard) => {
+    const ver = c.isRevival ? 'rv' : 'orig';
+    const normNum = normalizeCardNumber(c.cardNumber || '');
+    if (normNum && normNum !== 'WIKI') {
+      const nk = `num:${normNum}|${ver}`;
+      if (!keyToId.has(nk)) keyToId.set(nk, c.id);
+    }
+    const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
+    if (cleanName) {
+      const nmKey = `name:${cleanName}|${ver}`;
+      if (!keyToId.has(nmKey)) keyToId.set(nmKey, c.id);
+    }
+    if (!c.isRevival && c.wikiTitle) {
+      const wkKey = `wiki:${c.wikiTitle.trim().toLowerCase()}|orig`;
+      if (!keyToId.has(wkKey)) keyToId.set(wkKey, c.id);
+    }
+  };
+
+  for (const b of BATTLE_SPIRITS_CARDS) indexCard(b);
+  for (const existing of Object.values(next)) indexCard(existing);
+
+  let addedCount = 0;
+
+  for (const rawCard of incomingCards) {
+    const c = sanitizeCardTextTemplates(rawCard);
+    const isRev = options?.forceRevival ?? Boolean(c.isRevival);
+    const ver = isRev ? 'rv' : 'orig';
+    const normNum = normalizeCardNumber(c.cardNumber || '');
+    const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
+
+    let targetId = next[c.id] ? c.id : undefined;
+    if (!targetId && normNum && normNum !== 'WIKI') {
+      targetId = keyToId.get(`num:${normNum}|${ver}`);
+    }
+    if (!targetId && !isRev && c.wikiTitle) {
+      targetId = keyToId.get(`wiki:${c.wikiTitle.trim().toLowerCase()}|orig`);
+    }
+    if (!targetId && !isRev && cleanName) {
+      targetId = keyToId.get(`name:${cleanName}|orig`);
+    }
+    if (!targetId) targetId = c.id;
+
+    const existing = next[targetId];
+    if (!existing) addedCount++;
+
+    const merged: BattleSpiritsCard = {
+      ...(existing || {}),
+      ...c,
+      id: targetId,
+      name: c.name || existing?.name || c.cardNumber,
+      jpName: c.jpName || existing?.jpName || '',
+      type: c.type || existing?.type || 'Spirit',
+      subtypeLabel: c.subtypeLabel ?? existing?.subtypeLabel,
+      isRevival: isRev,
+      isToken: options?.forceToken ?? c.isToken ?? existing?.isToken,
+      colors: c.colors && c.colors.length > 0 ? c.colors : existing?.colors,
+      families: c.families && c.families.length > 0 ? c.families : existing?.families || [],
+      levels: c.levels && c.levels.length > 0 ? c.levels : existing?.levels,
+      braveCondition: c.braveCondition ?? existing?.braveCondition,
+      braveBonusBp: c.braveBonusBp ?? existing?.braveBonusBp,
+      summonCondition: c.summonCondition ?? existing?.summonCondition,
+      symbols:
+        c.symbols && Object.keys(c.symbols).length > 0
+          ? c.symbols
+          : existing?.symbols || {},
+      reduction:
+        c.reduction && Object.keys(c.reduction).length > 0
+          ? c.reduction
+          : existing?.reduction || {},
+      effects: c.effects && c.effects.length > 0 ? c.effects : existing?.effects || [],
+      keywords: c.keywords && c.keywords.length > 0 ? c.keywords : existing?.keywords || [],
+      flavorText: c.flavorText || existing?.flavorText || '',
+      illustrator: c.illustrator || existing?.illustrator || '',
+      artworkImage: c.artworkImage || existing?.artworkImage || '',
+      galleryImages:
+        c.galleryImages && c.galleryImages.length > 0
+          ? c.galleryImages
+          : existing?.galleryImages,
+      rulings: c.rulings && c.rulings.length > 0 ? c.rulings : existing?.rulings || [],
+      wikiTitle: c.wikiTitle || existing?.wikiTitle,
+      isWikiLoaded: Boolean(c.isWikiLoaded || existing?.isWikiLoaded),
+    };
+
+    if (options?.banList) {
+      merged.restriction = resolveBanRestriction(merged, options.banList);
+    }
+
+    next[targetId] = merged;
+    indexCard(merged);
+  }
+
+  return { next, addedCount };
+}
+
 export default function App() {
   const initialFromUrl = useMemo(() => parseStateFromUrl(), []);
   const [activeTab, setActiveTab] = useState<AppTab>(initialFromUrl.tab);
   const [filters, setFilters] = useState<FilterState>(initialFromUrl.filters);
+  const [pendingSharedDeck, setPendingSharedDeck] = useState<SharedDeckPayload | null>(
+    initialFromUrl.sharedDeck
+  );
+  const [syncingSharedCards, setSyncingSharedCards] = useState(false);
+  const [banList, setBanList] = useState<BanListSnapshot | null>(null);
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [selectedCard, setSelectedCard] = useState<BattleSpiritsCard | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -185,11 +391,11 @@ export default function App() {
       if (savedWiki) {
         const parsed = JSON.parse(savedWiki);
         if (parsed && typeof parsed === 'object') {
-          for (const [id, card] of Object.entries(parsed)) {
-            if (!initial[id] && card && typeof card === 'object') {
-              initial[id] = card as BattleSpiritsCard;
-            }
-          }
+          const cachedList = Object.values(parsed).filter(
+            (c): c is BattleSpiritsCard => Boolean(c && typeof c === 'object')
+          );
+          const { next } = mergeCardsIntoMap(initial, cachedList);
+          return next;
         }
       }
     } catch {
@@ -207,6 +413,9 @@ export default function App() {
           return parsed.map((d) => ({
             ...d,
             format: d.format === 'Standard' || d.format === 'Eternal' ? d.format : 'Eternal',
+            entries: Array.isArray(d.entries)
+              ? d.entries.filter((e: DeckEntry) => !isTokenCard(cardsMap[e.cardId]))
+              : [],
           }));
         }
       }
@@ -230,18 +439,20 @@ export default function App() {
 
   // Sync activeTab + filters to URL query string so refreshing stays on the exact view/filters
   useEffect(() => {
+    if (pendingSharedDeck) return;
     const nextSearch = buildUrlSearch(activeTab, filters);
     if (window.location.search !== nextSearch) {
       const nextUrl = `${window.location.pathname}${nextSearch}${window.location.hash}`;
       window.history.replaceState(null, '', nextUrl);
     }
-  }, [activeTab, filters]);
+  }, [activeTab, filters, pendingSharedDeck]);
 
   useEffect(() => {
     const onPopState = () => {
       const parsed = parseStateFromUrl();
       setActiveTab(parsed.tab);
       setFilters(parsed.filters);
+      setPendingSharedDeck(parsed.sharedDeck);
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -298,6 +509,33 @@ export default function App() {
     };
   }, []);
 
+  // Fetch official Banned & Restricted list from Wiki and apply copy limits across all loaded cards
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/wiki/banlist')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: BanListSnapshot | null) => {
+        if (cancelled || !data || !data.byCardNumber) return;
+        setBanList(data);
+        setCardsMap((prev) => {
+          const next = { ...prev };
+          for (const [id, card] of Object.entries(next)) {
+            const updatedRestriction = resolveBanRestriction(card, data);
+            if (updatedRestriction !== (card.restriction || 'Unlimited')) {
+              next[id] = { ...card, restriction: updatedRestriction };
+            }
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        // keep default restrictions gracefully if offline
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Hydrate bundled featured cards on startup so every bundled card gets real Wiki alt-art galleries & cleaned fields
   useEffect(() => {
     const toHydrate = BATTLE_SPIRITS_CARDS.filter((c) => c.wikiTitle && !c.isWikiLoaded);
@@ -312,48 +550,10 @@ export default function App() {
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap((prev) => {
-          const next = { ...prev };
-          for (const h of data.cards as BattleSpiritsCard[]) {
-            const existing = next[h.id];
-            if (!existing) {
-              next[h.id] = h;
-              continue;
-            }
-            next[h.id] = {
-              ...existing,
-              ...h,
-              id: existing.id,
-              name: h.name || existing.name,
-              jpName: h.jpName || existing.jpName,
-              type: h.type,
-              subtypeLabel: h.subtypeLabel,
-              isRevival: h.isRevival,
-              isToken: h.isToken,
-              colors: h.colors && h.colors.length > 0 ? h.colors : existing.colors,
-              families: h.families.length > 0 ? h.families : existing.families,
-              levels: h.levels,
-              braveCondition: h.braveCondition,
-              braveBonusBp: h.braveBonusBp,
-              summonCondition: h.summonCondition,
-              symbols: h.symbols,
-              reduction: Object.keys(h.reduction || {}).length > 0 ? h.reduction : existing.reduction,
-              effects: h.effects.length > 0 ? h.effects : existing.effects,
-              keywords: h.keywords.length > 0 ? h.keywords : existing.keywords,
-              flavorText: h.flavorText || existing.flavorText,
-              illustrator: h.illustrator || existing.illustrator,
-              artworkImage: h.artworkImage || existing.artworkImage,
-              galleryImages:
-                h.galleryImages && h.galleryImages.length > 0
-                  ? h.galleryImages
-                  : existing.galleryImages,
-              rulings:
-                h.rulings && h.rulings.length > 0 ? h.rulings : existing.rulings,
-              isWikiLoaded: true,
-            };
-          }
-          return next;
-        });
+        setCardsMap(
+          (prev) =>
+            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], { banList }).next
+        );
       })
       .catch(() => {
         // keep bundled fallback cleanly if offline
@@ -362,7 +562,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [banList]);
 
   // Automatically sync all official Wiki Token cards so Platinum Bug, Rig Avatar Dragon, Swordish, Fungal Bed, etc. appear in Search
   useEffect(() => {
@@ -371,25 +571,13 @@ export default function App() {
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap((prev) => {
-          const next = { ...prev };
-          const bundledByNum = new Map<string, string>();
-          for (const b of BATTLE_SPIRITS_CARDS) {
-            bundledByNum.set(b.cardNumber.toUpperCase(), b.id);
-          }
-          for (const c of data.cards as BattleSpiritsCard[]) {
-            const targetId = next[c.id]
-              ? c.id
-              : bundledByNum.get(c.cardNumber.toUpperCase()) || c.id;
-            next[targetId] = {
-              ...(next[targetId] || {}),
-              ...c,
-              id: targetId,
-              isToken: true,
-            };
-          }
-          return next;
-        });
+        setCardsMap(
+          (prev) =>
+            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], {
+              banList,
+              forceToken: true,
+            }).next
+        );
       })
       .catch(() => {
         // keep bundled tokens cleanly if offline
@@ -397,7 +585,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [banList]);
 
   // Automatically sync official Wiki Revival cards (Category:Revival Cards + Revival tabber cards) so the Revival section is richly populated
   useEffect(() => {
@@ -406,40 +594,13 @@ export default function App() {
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap((prev) => {
-          const next = { ...prev };
-          const bundledByNum = new Map<string, string>();
-          for (const b of BATTLE_SPIRITS_CARDS) {
-            bundledByNum.set(
-              `${b.cardNumber.toUpperCase()}|${b.isRevival ? 'rv' : 'orig'}`,
-              b.id
-            );
-          }
-          for (const c of data.cards as BattleSpiritsCard[]) {
-            const key = `${c.cardNumber.toUpperCase()}|${c.isRevival ? 'rv' : 'orig'}`;
-            const targetId = next[c.id] ? c.id : bundledByNum.get(key) || c.id;
-            const existing = next[targetId];
-            next[targetId] = {
-              ...(existing || {}),
-              ...c,
-              id: targetId,
-              isRevival: true,
-              type: c.type,
-              subtypeLabel: c.subtypeLabel,
-              levels: c.levels,
-              braveCondition: c.braveCondition,
-              braveBonusBp: c.braveBonusBp,
-              summonCondition: c.summonCondition,
-              symbols: c.symbols ?? existing?.symbols ?? {},
-              artworkImage: c.artworkImage || existing?.artworkImage || '',
-              galleryImages:
-                c.galleryImages && c.galleryImages.length > 0
-                  ? c.galleryImages
-                  : existing?.galleryImages,
-            };
-          }
-          return next;
-        });
+        setCardsMap(
+          (prev) =>
+            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], {
+              banList,
+              forceRevival: true,
+            }).next
+        );
       })
       .catch(() => {
         // keep bundled Revival cards cleanly if offline
@@ -447,7 +608,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [banList]);
 
   useEffect(() => {
     try {
@@ -456,6 +617,20 @@ export default function App() {
       // ignore
     }
   }, [decks]);
+
+  // Automatically strip any Token cards from saved decks once card metadata is loaded
+  useEffect(() => {
+    const hasAnyTokenEntry = decks.some((deck) =>
+      deck.entries.some((entry) => isTokenCard(cardsMap[entry.cardId]))
+    );
+    if (!hasAnyTokenEntry) return;
+    setDecks((prev) =>
+      prev.map((deck) => ({
+        ...deck,
+        entries: deck.entries.filter((entry) => !isTokenCard(cardsMap[entry.cardId])),
+      }))
+    );
+  }, [cardsMap, decks]);
 
   // Persist any non-bundled wiki cards used in saved decks so deck rosters survive reloads
   useEffect(() => {
@@ -544,63 +719,9 @@ export default function App() {
         }
 
         if (Array.isArray(data.cards) && data.cards.length > 0) {
-          setCardsMap((prev) => {
-            const next = { ...prev };
-            const bundledByNum = new Map<string, string>();
-            for (const c of BATTLE_SPIRITS_CARDS) {
-              bundledByNum.set(
-                `${c.cardNumber.toUpperCase()}|${c.isRevival ? 'rv' : 'orig'}`,
-                c.id
-              );
-            }
-
-            for (const c of data.cards!) {
-              const key = `${c.cardNumber.toUpperCase()}|${c.isRevival ? 'rv' : 'orig'}`;
-              const targetId = next[c.id]
-                ? c.id
-                : bundledByNum.get(key) || c.id;
-              const existing = next[targetId];
-              next[targetId] = {
-                ...(existing || {}),
-                ...c,
-                id: targetId,
-                name: c.name || existing?.name || c.cardNumber,
-                jpName: c.jpName || existing?.jpName || '',
-                type: c.type,
-                subtypeLabel: c.subtypeLabel,
-                isRevival: c.isRevival ?? existing?.isRevival,
-                isToken: c.isToken ?? existing?.isToken,
-                colors:
-                  c.colors && c.colors.length > 0
-                    ? c.colors
-                    : existing?.colors,
-                families: c.families.length > 0 ? c.families : existing?.families || [],
-                levels: c.levels,
-                braveCondition: c.braveCondition,
-                braveBonusBp: c.braveBonusBp,
-                summonCondition: c.summonCondition,
-                symbols: c.symbols,
-                reduction:
-                  Object.keys(c.reduction || {}).length > 0
-                    ? c.reduction
-                    : existing?.reduction || {},
-                effects: c.effects.length > 0 ? c.effects : existing?.effects || [],
-                keywords: c.keywords.length > 0 ? c.keywords : existing?.keywords || [],
-                artworkImage: c.artworkImage || existing?.artworkImage || '',
-                galleryImages:
-                  c.galleryImages && c.galleryImages.length > 0
-                    ? c.galleryImages
-                    : existing?.galleryImages,
-                rulings:
-                  c.rulings && c.rulings.length > 0
-                    ? c.rulings
-                    : existing?.rulings || [],
-                wikiTitle: c.wikiTitle || existing?.wikiTitle,
-                isWikiLoaded: c.isWikiLoaded || existing?.isWikiLoaded,
-              };
-            }
-            return next;
-          });
+          setCardsMap(
+            (prev) => mergeCardsIntoMap(prev, data.cards!, { banList }).next
+          );
         }
 
         setLoadedSetCodes((prev) => ({ ...prev, [upper]: true }));
@@ -614,7 +735,7 @@ export default function App() {
         setLoadingSetCode((prev) => (prev === upper ? null : prev));
       }
     },
-    [loadedSetCodes]
+    [loadedSetCodes, banList]
   );
 
   // Automatically fetch a set whenever filters.setCode is set to a specific set
@@ -671,47 +792,9 @@ export default function App() {
       if (!res.ok) throw new Error('Wiki search failed');
       const data = (await res.json()) as { cards?: BattleSpiritsCard[] };
       if (Array.isArray(data.cards) && data.cards.length > 0) {
-        setCardsMap((prev) => {
-          const next = { ...prev };
-          const bundledByNum = new Map<string, string>();
-          for (const b of BATTLE_SPIRITS_CARDS) {
-            bundledByNum.set(
-              `${b.cardNumber.toUpperCase()}|${b.isRevival ? 'rv' : 'orig'}`,
-              b.id
-            );
-          }
-          for (const c of data.cards!) {
-            const key = `${c.cardNumber.toUpperCase()}|${c.isRevival ? 'rv' : 'orig'}`;
-            const targetId = next[c.id]
-              ? c.id
-              : bundledByNum.get(key) || c.id;
-            const existing = next[targetId];
-            next[targetId] = {
-              ...(existing || {}),
-              ...c,
-              id: targetId,
-              type: c.type,
-              subtypeLabel: c.subtypeLabel,
-              isRevival: c.isRevival ?? existing?.isRevival,
-              isToken: c.isToken ?? existing?.isToken,
-              levels: c.levels,
-              braveCondition: c.braveCondition,
-              braveBonusBp: c.braveBonusBp,
-              summonCondition: c.summonCondition,
-              symbols: c.symbols ?? existing?.symbols ?? {},
-              rulings:
-                c.rulings && c.rulings.length > 0
-                  ? c.rulings
-                  : existing?.rulings || [],
-              galleryImages:
-                c.galleryImages && c.galleryImages.length > 0
-                  ? c.galleryImages
-                  : existing?.galleryImages,
-              artworkImage: c.artworkImage || existing?.artworkImage || '',
-            };
-          }
-          return next;
-        });
+        setCardsMap(
+          (prev) => mergeCardsIntoMap(prev, data.cards!, { banList }).next
+        );
         showToast(`Synced ${data.cards.length} matching cards from Wiki`);
       } else {
         showToast(`No additional Wiki card pages matched "${q}"`);
@@ -723,13 +806,22 @@ export default function App() {
     }
   };
 
-  const handleCardHydrated = useCallback((hydrated: BattleSpiritsCard) => {
-    setCardsMap((prev) => ({
-      ...prev,
-      [hydrated.id]: hydrated,
-    }));
-    setSelectedCard((curr) => (curr && curr.id === hydrated.id ? hydrated : curr));
-  }, []);
+  const handleCardHydrated = useCallback(
+    (hydrated: BattleSpiritsCard) => {
+      const clean = {
+        ...sanitizeCardTextTemplates(hydrated),
+        restriction: banList
+          ? resolveBanRestriction(hydrated, banList)
+          : hydrated.restriction,
+      };
+      setCardsMap((prev) => ({
+        ...prev,
+        [clean.id]: clean,
+      }));
+      setSelectedCard((curr) => (curr && curr.id === clean.id ? clean : curr));
+    },
+    [banList]
+  );
 
   const filteredCards = useMemo(() => {
     const q = filters.search.trim().toLowerCase();
@@ -775,10 +867,28 @@ export default function App() {
       return true;
     });
 
+    // Deduplicate non-Revival cards so duplicate IDs from set tables vs Wiki search never appear together
+    const seenOrigNums = new Set<string>();
+    const seenOrigNames = new Set<string>();
+    const dedupedList = list.filter((card) => {
+      if (card.isRevival) return true;
+      const numKey = normalizeCardNumber(card.cardNumber || '');
+      const nameKey = normalizeCardName(card.name || '');
+      if (numKey && numKey !== 'WIKI') {
+        if (seenOrigNums.has(numKey)) return false;
+        seenOrigNums.add(numKey);
+      }
+      if (nameKey) {
+        if (seenOrigNames.has(nameKey)) return false;
+        seenOrigNames.add(nameKey);
+      }
+      return true;
+    });
+
     const getMaxBp = (c: BattleSpiritsCard) =>
       c.levels && c.levels.length > 0 ? c.levels[c.levels.length - 1].bp : 0;
 
-    list.sort((a, b) => {
+    dedupedList.sort((a, b) => {
       if (filters.sortBy === 'cost-asc') return a.cost - b.cost || a.cardNumber.localeCompare(b.cardNumber);
       if (filters.sortBy === 'cost-desc') return b.cost - a.cost || a.cardNumber.localeCompare(b.cardNumber);
       if (filters.sortBy === 'bp-desc') return getMaxBp(b) - getMaxBp(a) || a.cardNumber.localeCompare(b.cardNumber);
@@ -786,8 +896,25 @@ export default function App() {
       return a.cardNumber.localeCompare(b.cardNumber);
     });
 
-    return list;
+    return dedupedList;
   }, [allCardsList, filters]);
+
+  const navigableCards = useMemo(() => {
+    if (activeTab === 'search') {
+      return filteredCards;
+    }
+    if (activeTab === 'decks' && activeDeck) {
+      return activeDeck.entries
+        .map((e) => cardsMap[e.cardId])
+        .filter((c): c is BattleSpiritsCard => Boolean(c));
+    }
+    if (activeTab === 'catalog') {
+      return allCardsList
+        .filter((c) => matchesFormatFilter(c.formats, filters.format))
+        .slice(0, 8);
+    }
+    return filteredCards;
+  }, [activeTab, filteredCards, activeDeck, cardsMap, allCardsList, filters.format]);
 
   const activeFilterCount = useMemo(() => {
     let count = 0;
@@ -802,12 +929,7 @@ export default function App() {
     return count;
   }, [filters]);
 
-  const getMaxCopies = (card?: BattleSpiritsCard) =>
-    card?.restriction === 'Restricted <1>'
-      ? 1
-      : card?.restriction === 'Restricted <2>'
-      ? 2
-      : 3;
+  const getMaxCopies = (card?: BattleSpiritsCard) => getMaxCardCopies(card);
 
   const handleUpdateDeckQty = (cardId: string, delta: number) => {
     if (!activeDeck) {
@@ -815,7 +937,17 @@ export default function App() {
       return;
     }
     const card = cardsMap[cardId];
+    if (delta > 0 && isTokenCard(card)) {
+      showToast(`${card?.name || 'Token'} is a Token card and is used outside the main deck`);
+      return;
+    }
+
     const maxCopies = getMaxCopies(card);
+
+    if (delta > 0 && maxCopies === 0) {
+      showToast(`${card?.name || 'Card'} is Banned (0 copies allowed)`);
+      return;
+    }
 
     setDecks((prev) =>
       prev.map((deck) => {
@@ -827,9 +959,11 @@ export default function App() {
         if (nextQty === currentQty) {
           if (delta > 0 && currentQty >= maxCopies) {
             showToast(
-              `Max ${maxCopies} ${maxCopies === 1 ? 'copy' : 'copies'} of ${
-                card?.name || 'card'
-              } allowed`
+              maxCopies === 0
+                ? `${card?.name || 'Card'} is Banned (0 copies allowed)`
+                : `Max ${maxCopies} ${maxCopies === 1 ? 'copy' : 'copies'} of ${
+                    card?.name || 'card'
+                  } allowed`
             );
           }
           return deck;
@@ -863,6 +997,15 @@ export default function App() {
 
   const handleQuickAddToDeck = (card: BattleSpiritsCard) => {
     const current = activeDeckQtyMap[card.id] || 0;
+    if (isTokenCard(card)) {
+      if (current > 0) {
+        handleUpdateDeckQty(card.id, -current);
+        showToast(`Removed Token ${card.name} from ${activeDeck?.name}`);
+      } else {
+        showToast(`${card.name} is a Token card and is used outside the main deck`);
+      }
+      return;
+    }
     const maxCopies = getMaxCopies(card);
     if (current >= maxCopies) {
       handleUpdateDeckQty(card.id, -maxCopies);
@@ -906,6 +1049,7 @@ export default function App() {
           .filter((entry) => {
             const card = cardsMap[entry.cardId];
             if (!card) return false;
+            if (isTokenCard(card)) return false;
             if (deck.format === 'Standard' && !card.formats.includes('Standard')) {
               return false;
             }
@@ -915,7 +1059,8 @@ export default function App() {
             const card = cardsMap[entry.cardId];
             const maxCopies = getMaxCopies(card);
             return entry.quantity > maxCopies ? { ...entry, quantity: maxCopies } : entry;
-          });
+          })
+          .filter((entry) => entry.quantity > 0);
         return {
           ...deck,
           updatedAt: new Date().toISOString().slice(0, 10),
@@ -923,7 +1068,7 @@ export default function App() {
         };
       })
     );
-    showToast('Removed illegal cards and enforced restrictions');
+    showToast('Removed banned/illegal cards and enforced restrictions');
   };
 
   const handleDeleteDeck = (deckId: string) => {
@@ -1029,31 +1174,134 @@ export default function App() {
       const foundCards = responses.flat();
       if (foundCards.length > 0) {
         setCardsMap((prev) => {
-          const next = { ...prev };
-          const bundledByNum = new Map<string, string>();
-          for (const b of BATTLE_SPIRITS_CARDS) {
-            bundledByNum.set(
-              `${b.cardNumber.toUpperCase()}|${b.isRevival ? 'rv' : 'orig'}`,
-              b.id
-            );
-          }
-          for (const c of foundCards) {
-            const key = `${c.cardNumber.toUpperCase()}|${c.isRevival ? 'rv' : 'orig'}`;
-            const targetId = next[c.id] ? c.id : bundledByNum.get(key) || c.id;
-            if (!next[targetId]) addedCount++;
-            const existing = next[targetId];
-            next[targetId] = {
-              ...(existing || {}),
-              ...c,
-              id: targetId,
-            };
-          }
-          return next;
+          const resMerge = mergeCardsIntoMap(prev, foundCards, { banList });
+          addedCount += resMerge.addedCount;
+          return resMerge.next;
         });
       }
     }
 
     return addedCount + setsToFetch.length;
+  };
+
+  // Auto-sync missing cards referenced by a shared deck link (?share=...)
+  useEffect(() => {
+    if (!pendingSharedDeck) return;
+    const missingSetCodes: string[] = [];
+    const missingQueries: string[] = [];
+
+    for (const item of pendingSharedDeck.entries) {
+      const normNum = normalizeCardNumber(item.cardNumber);
+      const compactNum = compactCardNumber(item.cardNumber);
+      const normName = normalizeCardName(item.name);
+      const exists =
+        Boolean(item.cardId && cardsMap[item.cardId]) ||
+        allCardsList.some(
+          (c) =>
+            (normNum &&
+              (normalizeCardNumber(c.cardNumber) === normNum ||
+                compactCardNumber(c.cardNumber) === compactNum)) ||
+            (normName && normalizeCardName(c.name) === normName)
+        );
+      if (!exists) {
+        if (item.cardNumber) {
+          const sc = extractSetCodeFromCardNumber(item.cardNumber);
+          if (sc) missingSetCodes.push(sc);
+          missingQueries.push(item.cardNumber);
+        } else if (item.name) {
+          missingQueries.push(item.name);
+        }
+      }
+    }
+
+    if (missingSetCodes.length === 0 && missingQueries.length === 0) return;
+
+    let cancelled = false;
+    setSyncingSharedCards(true);
+    handleSyncMissingImportCards({
+      setCodes: missingSetCodes,
+      queries: missingQueries,
+    }).finally(() => {
+      if (!cancelled) setSyncingSharedCards(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingSharedDeck]);
+
+  const sharedDeckResolution = useMemo(() => {
+    if (!pendingSharedDeck) return null;
+    const resolved: {
+      payload: (typeof pendingSharedDeck.entries)[number];
+      card?: BattleSpiritsCard;
+    }[] = [];
+
+    for (const item of pendingSharedDeck.entries) {
+      const direct = item.cardId ? cardsMap[item.cardId] : undefined;
+      let match = direct;
+      if (!match && item.cardNumber) {
+        const normNum = normalizeCardNumber(item.cardNumber);
+        const compNum = compactCardNumber(item.cardNumber);
+        match = allCardsList.find(
+          (c) =>
+            (normalizeCardNumber(c.cardNumber) === normNum ||
+              compactCardNumber(c.cardNumber) === compNum) &&
+            Boolean(c.isRevival) === Boolean(item.isRevival)
+        ) ||
+          allCardsList.find(
+            (c) =>
+              normalizeCardNumber(c.cardNumber) === normNum ||
+              compactCardNumber(c.cardNumber) === compNum
+          );
+      }
+      if (!match && item.name) {
+        const normName = normalizeCardName(item.name);
+        match = allCardsList.find((c) => normalizeCardName(c.name) === normName);
+      }
+      resolved.push({ payload: item, card: match });
+    }
+
+    const matchedItems = resolved.filter(
+      (r): r is { payload: (typeof pendingSharedDeck.entries)[number]; card: BattleSpiritsCard } =>
+        Boolean(r.card)
+    );
+    const unmatchedItems = resolved.filter((r) => !r.card);
+    const totalSharedCount = pendingSharedDeck.entries.reduce((s, e) => s + e.quantity, 0);
+    const totalMatchedCount = matchedItems.reduce((s, e) => s + e.payload.quantity, 0);
+
+    return { resolved, matchedItems, unmatchedItems, totalSharedCount, totalMatchedCount };
+  }, [pendingSharedDeck, cardsMap, allCardsList]);
+
+  const handleConfirmSharedImport = (mode: 'new' | 'replace' | 'merge') => {
+    if (!pendingSharedDeck || !sharedDeckResolution) return;
+    const { entries, cappedCards } = buildImportedDeckEntries(
+      sharedDeckResolution.matchedItems.map(({ card, payload }) => ({
+        card,
+        quantity: payload.quantity,
+      })),
+      activeDeck ? activeDeck.entries : [],
+      mode
+    );
+
+    handleImportDeckEntries({
+      mode,
+      entries,
+      newDeckName: pendingSharedDeck.name,
+      newDeckFormat: pendingSharedDeck.format,
+      newDeckArchetype: pendingSharedDeck.archetype || 'Shared Deck',
+    });
+
+    if (cappedCards.length > 0) {
+      showToast(
+        `Applied restriction limits to: ${cappedCards.slice(0, 3).join(', ')}${
+          cappedCards.length > 3 ? ` +${cappedCards.length - 3} more` : ''
+        }`
+      );
+    }
+
+    setActiveTab('decks');
+    setPendingSharedDeck(null);
   };
 
   const openSearchTab = () => {
@@ -1165,21 +1413,34 @@ export default function App() {
 
         {activeTab === 'search' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* Desktop Inline Filter Sidebar */}
-            <aside className="hidden lg:block lg:col-span-3 sticky top-24 bg-white border border-slate-200 rounded-2xl p-4">
-              <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
-                <h2 className="font-display text-sm font-bold text-slate-900">Filters</h2>
+            {/* Desktop Inline Filter Sidebar (Fixed to Viewport with Independent Scroll) */}
+            <aside className="hidden lg:flex lg:flex-col lg:col-span-3 sticky top-20 max-h-[calc(100vh-6rem)] bg-white border border-slate-200 rounded-2xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2 shrink-0 bg-white">
+                <div className="flex items-center gap-2">
+                  <h2 className="font-display text-sm font-bold text-slate-900">Filters</h2>
+                  {activeFilterCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setFilters(INITIAL_FILTERS)}
+                      className="text-[11px] font-semibold text-red-700 hover:underline cursor-pointer"
+                    >
+                      Reset ({activeFilterCount})
+                    </button>
+                  )}
+                </div>
                 <span className="font-mono text-xs text-slate-500 tabular-nums">
                   {filteredCards.length} / {allCardsList.length}
                 </span>
               </div>
-              <FilterControls
-                filters={filters}
-                availableSets={availableSets}
-                availableKeywords={availableKeywords}
-                onChange={updateFilters}
-                onReset={() => setFilters(INITIAL_FILTERS)}
-              />
+              <div className="p-4 overflow-y-auto flex-1">
+                <FilterControls
+                  filters={filters}
+                  availableSets={availableSets}
+                  availableKeywords={availableKeywords}
+                  onChange={updateFilters}
+                  onReset={() => setFilters(INITIAL_FILTERS)}
+                />
+              </div>
             </aside>
 
             {/* Card Search Feed */}
@@ -1500,6 +1761,157 @@ export default function App() {
         </div>
       </nav>
 
+      {/* Shared Deck Import Prompt Modal (?share=...) */}
+      {pendingSharedDeck && sharedDeckResolution && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/55 backdrop-blur-sm p-0 sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="shared-deck-import-title"
+          onClick={() => setPendingSharedDeck(null)}
+        >
+          <div
+            className="w-full sm:max-w-lg max-h-[88vh] bg-white rounded-t-3xl sm:rounded-3xl overflow-hidden flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="sm:hidden pt-3 pb-1 flex justify-center shrink-0">
+              <div className="w-10 h-1.5 bg-slate-300 rounded-full" />
+            </div>
+
+            <div className="px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
+              <div className="min-w-0">
+                <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700 mb-1">
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span>Shared Battle Spirits Deck Link</span>
+                </div>
+                <h2
+                  id="shared-deck-import-title"
+                  className="font-display text-lg font-bold text-slate-900 truncate"
+                >
+                  Import &ldquo;{pendingSharedDeck.name}&rdquo;?
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {pendingSharedDeck.format} Format · {pendingSharedDeck.archetype} ·{' '}
+                  <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                    {sharedDeckResolution.totalMatchedCount}/{sharedDeckResolution.totalSharedCount} cards ready
+                  </span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingSharedDeck(null)}
+                className="min-h-[40px] min-w-[40px] rounded-xl text-slate-500 hover:bg-slate-100 flex items-center justify-center shrink-0 cursor-pointer"
+                aria-label="Dismiss shared deck prompt"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto flex-1 px-5 py-4 space-y-3">
+              {syncingSharedCards && (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2 text-xs text-slate-600">
+                  <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
+                  <span>Fetching shared cards from Battle Spirits Wiki...</span>
+                </div>
+              )}
+
+              {sharedDeckResolution.unmatchedItems.length > 0 && !syncingSharedCards && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-2 text-xs text-amber-950">
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <span>
+                    {sharedDeckResolution.unmatchedItems.length} shared card
+                    {sharedDeckResolution.unmatchedItems.length === 1 ? '' : 's'} could not be matched automatically.
+                  </span>
+                </div>
+              )}
+
+              <div className="rounded-2xl border border-slate-200 divide-y divide-slate-100 max-h-64 overflow-y-auto">
+                {sharedDeckResolution.resolved.map(({ payload, card }, idx) => {
+                  const maxC = card ? getMaxCardCopies(card) : 3;
+                  return (
+                    <div
+                      key={`${payload.cardId}-${payload.cardNumber}-${idx}`}
+                      className="px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0 flex items-center gap-2">
+                        {card ? (
+                          <SymbolIcon color={card.color} size="xs" variant="gem" />
+                        ) : (
+                          <span className="w-3.5 h-3.5 rounded-full bg-slate-200 shrink-0" />
+                        )}
+                        <div className="min-w-0">
+                          <div className="font-semibold text-slate-900 truncate">
+                            {card?.name || payload.name}
+                          </div>
+                          <div className="font-mono text-[11px] text-slate-500">
+                            {card?.cardNumber || payload.cardNumber}
+                            {card && isTokenCard(card) ? (
+                              <span className="ml-1.5 text-slate-600 font-sans font-semibold">
+                                Token (Outside Deck)
+                              </span>
+                            ) : card && maxC === 0 ? (
+                              <span className="ml-1.5 text-red-700 font-sans font-semibold inline-flex items-center gap-0.5">
+                                <Ban className="w-3 h-3" /> Banned
+                              </span>
+                            ) : null}
+                            {card && !isTokenCard(card) && maxC > 0 && card.restriction && card.restriction !== 'Unlimited' && (
+                              <span className="ml-1.5 text-red-700 font-sans font-semibold">
+                                {card.restriction}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <span className="font-mono font-bold text-slate-900 tabular-nums shrink-0">
+                        ×{payload.quantity}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="px-5 py-3.5 pb-safe border-t border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-end gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setPendingSharedDeck(null)}
+                className="min-h-[44px] px-4 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                Dismiss
+              </button>
+              {activeDeck && (
+                <>
+                  <button
+                    type="button"
+                    disabled={sharedDeckResolution.matchedItems.length === 0}
+                    onClick={() => handleConfirmSharedImport('merge')}
+                    className="min-h-[44px] px-4 rounded-xl border border-slate-200 bg-white text-slate-800 hover:bg-slate-50 disabled:opacity-45 text-xs font-semibold cursor-pointer"
+                  >
+                    Merge Into Active
+                  </button>
+                  <button
+                    type="button"
+                    disabled={sharedDeckResolution.matchedItems.length === 0}
+                    onClick={() => handleConfirmSharedImport('replace')}
+                    className="min-h-[44px] px-4 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-45 text-xs font-semibold cursor-pointer"
+                  >
+                    Replace Active
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                disabled={sharedDeckResolution.matchedItems.length === 0}
+                onClick={() => handleConfirmSharedImport('new')}
+                className="min-h-[44px] px-5 rounded-xl bg-red-600 text-white hover:bg-red-700 disabled:opacity-45 text-xs font-semibold cursor-pointer"
+              >
+                Import as New Deck
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Mobile Filter Bottom Sheet */}
       <FilterSheet
         open={filterSheetOpen}
@@ -1516,6 +1928,7 @@ export default function App() {
       <CardDetailSheet
         card={selectedCard}
         allCards={allCardsList}
+        navigableCards={navigableCards}
         deckQty={selectedCard ? activeDeckQtyMap[selectedCard.id] || 0 : 0}
         activeDeckQtyMap={activeDeckQtyMap}
         activeDeckName={activeDeck?.name || 'Deck'}

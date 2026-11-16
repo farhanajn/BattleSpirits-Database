@@ -5,6 +5,8 @@ import {
   Minus,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   Layers,
   ExternalLink,
   Loader2,
@@ -13,6 +15,8 @@ import {
   Search,
   Globe,
   Network,
+  Maximize2,
+  Ban,
 } from 'lucide-react';
 import { BattleSpiritsCard, BattleSymbolKind, GameFormat } from '../types/card';
 import { COLOR_META } from '../data/theme';
@@ -23,10 +27,12 @@ import {
   SymbolIcon,
 } from './SymbolIcon';
 import { analyzeCardSynergies } from '../utils/cardSynergy';
+import { formatRestrictionSummary, getMaxCardCopies, isTokenCard } from '../utils/cardRules';
 
 interface CardDetailSheetProps {
   card: BattleSpiritsCard | null;
   allCards?: BattleSpiritsCard[];
+  navigableCards?: BattleSpiritsCard[];
   deckQty: number;
   activeDeckQtyMap?: Record<string, number>;
   activeDeckName: string;
@@ -100,6 +106,7 @@ async function fetchHydratedWikiCard(
 export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   card,
   allCards = [],
+  navigableCards = [],
   deckQty,
   activeDeckQtyMap = {},
   activeDeckName,
@@ -111,6 +118,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 }) => {
   const [openRulingIdx, setOpenRulingIdx] = useState<number | null>(0);
   const [selectedArtIdx, setSelectedArtIdx] = useState(0);
+  const [fullImageOpen, setFullImageOpen] = useState(false);
   const [hydrating, setHydrating] = useState(false);
 
   const [compareMode, setCompareMode] = useState(false);
@@ -127,6 +135,17 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   const [wikiCompareResults, setWikiCompareResults] = useState<BattleSpiritsCard[]>([]);
   const [hydratingCompare, setHydratingCompare] = useState(false);
 
+  const [dragOffsetX, setDragOffsetX] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [slideStage, setSlideStage] = useState<'idle' | 'pre-next' | 'pre-prev'>('idle');
+  const touchGestureRef = React.useRef<{
+    x: number;
+    y: number;
+    time: number;
+    axis: 'none' | 'horizontal' | 'vertical';
+    blocked: boolean;
+  } | null>(null);
+
   useEffect(() => {
     setSelectedArtIdx(0);
     setOpenRulingIdx(0);
@@ -139,7 +158,24 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     setPickerOpen(false);
     setCompareQuery('');
     setWikiCompareResults([]);
+    setDragOffsetX(0);
+    setIsDragging(false);
   }, [card?.id]);
+
+  useEffect(() => {
+    if (!card) {
+      setFullImageOpen(false);
+    }
+  }, [card]);
+
+  // Settle brief directional slide-in transition when swiping/sliding to adjacent card
+  useEffect(() => {
+    if (slideStage === 'idle') return;
+    const raf = requestAnimationFrame(() => {
+      setSlideStage('idle');
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [slideStage]);
 
   useEffect(() => {
     if (!card || !card.wikiTitle || card.isWikiLoaded) return;
@@ -246,7 +282,121 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     return analyzeCardSynergies(card, allCards, activeDeckFormat);
   }, [card, allCards, activeDeckFormat, synergyMode]);
 
+  const navIndex = useMemo(() => {
+    if (!card || navigableCards.length === 0) return -1;
+    return navigableCards.findIndex((c) => c.id === card.id);
+  }, [navigableCards, card?.id]);
+
+  const prevCard = navIndex > 0 ? navigableCards[navIndex - 1] : null;
+  const nextCard =
+    navIndex >= 0 && navIndex < navigableCards.length - 1
+      ? navigableCards[navIndex + 1]
+      : null;
+  const hasNavigation = navIndex >= 0 && navigableCards.length > 1 && Boolean(onSelectCard);
+
+  const navigateAdjacent = React.useCallback(
+    (direction: 'prev' | 'next') => {
+      if (!onSelectCard) return;
+      const target = direction === 'prev' ? prevCard : nextCard;
+      if (!target) return;
+      setDragOffsetX(0);
+      setIsDragging(false);
+      setSlideStage(direction === 'next' ? 'pre-next' : 'pre-prev');
+      onSelectCard(target);
+    },
+    [onSelectCard, prevCard, nextCard]
+  );
+
+  // Keyboard navigation (ArrowLeft / ArrowRight / Escape) when modal is open
+  useEffect(() => {
+    if (!card) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'ArrowLeft' && prevCard) {
+        e.preventDefault();
+        navigateAdjacent('prev');
+      } else if (e.key === 'ArrowRight' && nextCard) {
+        e.preventDefault();
+        navigateAdjacent('next');
+      } else if (e.key === 'Escape') {
+        if (fullImageOpen) {
+          setFullImageOpen(false);
+        } else {
+          onClose();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [card, prevCard, nextCard, fullImageOpen, navigateAdjacent, onClose]);
+
   if (!card) return null;
+
+  const handleSwipeTouchStart = (e: React.TouchEvent) => {
+    if (!hasNavigation || e.touches.length !== 1 || pickerOpen) return;
+    const targetEl = e.target as HTMLElement | null;
+    const blocked = Boolean(
+      targetEl?.closest('[data-no-swipe="true"], input, textarea, select')
+    );
+    touchGestureRef.current = {
+      x: e.touches[0].clientX,
+      y: e.touches[0].clientY,
+      time: Date.now(),
+      axis: 'none',
+      blocked,
+    };
+  };
+
+  const handleSwipeTouchMove = (e: React.TouchEvent) => {
+    const g = touchGestureRef.current;
+    if (!g || g.blocked || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - g.x;
+    const dy = e.touches[0].clientY - g.y;
+
+    if (g.axis === 'none') {
+      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        g.axis = 'vertical';
+        return;
+      }
+      g.axis = 'horizontal';
+      setIsDragging(true);
+    }
+
+    if (g.axis === 'horizontal') {
+      const movingIntoEdge = (dx > 0 && !prevCard) || (dx < 0 && !nextCard);
+      const damped = movingIntoEdge
+        ? dx * 0.2
+        : Math.max(-140, Math.min(140, dx * 0.85));
+      setDragOffsetX(damped);
+    }
+  };
+
+  const handleSwipeTouchEnd = () => {
+    const g = touchGestureRef.current;
+    touchGestureRef.current = null;
+    if (!g || g.axis !== 'horizontal') {
+      if (dragOffsetX !== 0) setDragOffsetX(0);
+      setIsDragging(false);
+      return;
+    }
+
+    const elapsed = Date.now() - g.time;
+    const shouldNext =
+      nextCard && (dragOffsetX <= -46 || (dragOffsetX <= -22 && elapsed < 260));
+    const shouldPrev =
+      prevCard && (dragOffsetX >= 46 || (dragOffsetX >= 22 && elapsed < 260));
+
+    setDragOffsetX(0);
+    setIsDragging(false);
+
+    if (shouldNext) {
+      navigateAdjacent('next');
+    } else if (shouldPrev) {
+      navigateAdjacent('prev');
+    }
+  };
 
   const handleToggleCompare = () => {
     if (!compareMode) {
@@ -306,12 +456,12 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
   const isStandardLegal = card.formats.includes('Standard');
   const isLegalInActiveDeck = card.formats.includes(activeDeckFormat);
-  const maxCopies =
-    card.restriction === 'Restricted <1>'
-      ? 1
-      : card.restriction === 'Restricted <2>'
-      ? 2
-      : 3;
+  const isToken = isTokenCard(card);
+  const maxCopies = getMaxCardCopies(card);
+  const isBanned = !isToken && maxCopies === 0;
+  const usesAdventSummon =
+    Boolean(card.subtypeLabel && /contract/i.test(card.subtypeLabel)) ||
+    card.effects.some((e) => /Summon\/Advent Condition|Contract Advent|\bAdvent\b/i.test(`${e.timing} ${e.text}`));
 
   const gallery =
     card.galleryImages && card.galleryImages.length > 0
@@ -394,8 +544,8 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
               key={`${label}-${c.id}`}
               className="rounded-2xl border border-slate-200 bg-slate-50/70 overflow-hidden flex flex-col"
             >
-              <div className="aspect-[4/3] w-full bg-slate-900 relative overflow-hidden">
-                <CardArtwork card={c} className="w-full h-full" />
+              <div className="aspect-[5/7] w-full max-h-[260px] bg-slate-950 relative overflow-hidden p-1">
+                <CardArtwork card={c} fit="contain" className="w-full h-full bg-slate-950" />
               </div>
               <div className="p-3 flex-1 flex flex-col justify-between gap-2">
                 <div className="min-w-0">
@@ -660,17 +810,22 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 );
               })}
 
-              {(left.braveBonusBp || right.braveBonusBp) && (
+              {(left.braveBonusBp !== undefined ||
+                left.braveCondition ||
+                right.braveBonusBp !== undefined ||
+                right.braveCondition) && (
                 <div className="px-3.5 py-2.5 grid grid-cols-12 gap-2 items-center text-xs bg-slate-50">
                   <div className="col-span-2 font-semibold text-slate-600">Brave</div>
                   <div className="col-span-5">
-                    {left.braveBonusBp ? (
+                    {left.braveBonusBp !== undefined || left.braveCondition ? (
                       <div>
-                        <span className="font-mono font-semibold text-red-700 tabular-nums">
-                          +{left.braveBonusBp.toLocaleString()} BP
-                        </span>
+                        {left.braveBonusBp !== undefined && (
+                          <span className="font-mono font-semibold text-red-700 tabular-nums">
+                            +{left.braveBonusBp.toLocaleString()} BP
+                          </span>
+                        )}
                         {left.braveCondition && (
-                          <div className="text-[11px] text-slate-500 mt-0.5">
+                          <div className="text-[11px] text-slate-600 mt-0.5">
                             <EffectTextWithSymbols text={left.braveCondition} />
                           </div>
                         )}
@@ -680,13 +835,15 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                     )}
                   </div>
                   <div className="col-span-5 border-l border-slate-200 pl-3">
-                    {right.braveBonusBp ? (
+                    {right.braveBonusBp !== undefined || right.braveCondition ? (
                       <div>
-                        <span className="font-mono font-semibold text-red-700 tabular-nums">
-                          +{right.braveBonusBp.toLocaleString()} BP
-                        </span>
+                        {right.braveBonusBp !== undefined && (
+                          <span className="font-mono font-semibold text-red-700 tabular-nums">
+                            +{right.braveBonusBp.toLocaleString()} BP
+                          </span>
+                        )}
                         {right.braveCondition && (
-                          <div className="text-[11px] text-slate-500 mt-0.5">
+                          <div className="text-[11px] text-slate-600 mt-0.5">
                             <EffectTextWithSymbols text={right.braveCondition} />
                           </div>
                         )}
@@ -919,12 +1076,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
               const cand = item.card;
               const candMeta = COLOR_META[cand.color];
               const inDeckQty = activeDeckQtyMap[cand.id] || 0;
-              const candMax =
-                cand.restriction === 'Restricted <1>'
-                  ? 1
-                  : cand.restriction === 'Restricted <2>'
-                  ? 2
-                  : 3;
+              const candMax = getMaxCardCopies(cand);
 
               return (
                 <div
@@ -997,29 +1149,35 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                     </div>
                   </button>
 
-                  <div className="flex items-center border border-slate-200 rounded-xl overflow-hidden shrink-0 bg-slate-50">
-                    <button
-                      type="button"
-                      onClick={() => onUpdateDeckQty(cand.id, -1)}
-                      disabled={inDeckQty <= 0}
-                      className="min-h-[40px] min-w-[36px] flex items-center justify-center text-slate-700 hover:bg-slate-200 disabled:opacity-35 cursor-pointer"
-                      aria-label={`Remove ${cand.name} from deck`}
-                    >
-                      <Minus className="w-3.5 h-3.5" />
-                    </button>
-                    <span className="px-2 font-mono text-xs font-bold tabular-nums min-w-[2.25rem] text-center text-slate-900">
-                      {inDeckQty}/{candMax}
+                  {isTokenCard(cand) && inDeckQty === 0 ? (
+                    <span className="px-2.5 py-2 rounded-xl bg-slate-100 border border-slate-200 text-[11px] font-semibold text-slate-500 shrink-0 whitespace-nowrap">
+                      Token · Outside Deck
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => onUpdateDeckQty(cand.id, 1)}
-                      disabled={inDeckQty >= candMax}
-                      className="min-h-[40px] min-w-[36px] flex items-center justify-center text-slate-700 hover:bg-slate-200 disabled:opacity-35 cursor-pointer"
-                      aria-label={`Add ${cand.name} to deck`}
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+                  ) : (
+                    <div className="flex items-center border border-slate-200 rounded-xl overflow-hidden shrink-0 bg-slate-50">
+                      <button
+                        type="button"
+                        onClick={() => onUpdateDeckQty(cand.id, -1)}
+                        disabled={inDeckQty <= 0}
+                        className="min-h-[40px] min-w-[36px] flex items-center justify-center text-slate-700 hover:bg-slate-200 disabled:opacity-35 cursor-pointer"
+                        aria-label={`Remove ${cand.name} from deck`}
+                      >
+                        <Minus className="w-3.5 h-3.5" />
+                      </button>
+                      <span className="px-2 font-mono text-xs font-bold tabular-nums min-w-[2.25rem] text-center text-slate-900">
+                        {inDeckQty}/{candMax}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateDeckQty(cand.id, 1)}
+                        disabled={inDeckQty >= candMax}
+                        className="min-h-[40px] min-w-[36px] flex items-center justify-center text-slate-700 hover:bg-slate-200 disabled:opacity-35 cursor-pointer"
+                        aria-label={`Add ${cand.name} to deck`}
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -1042,9 +1200,18 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           (compareMode && compareCard) || synergyMode ? 'lg:max-w-5xl' : 'lg:max-w-2xl'
         } max-h-[92vh] bg-white rounded-t-3xl lg:rounded-3xl overflow-hidden flex flex-col shadow-2xl transition-[max-width] duration-200`}
         onClick={(e) => e.stopPropagation()}
+        onTouchStart={handleSwipeTouchStart}
+        onTouchMove={handleSwipeTouchMove}
+        onTouchEnd={handleSwipeTouchEnd}
+        onTouchCancel={handleSwipeTouchEnd}
       >
-        <div className="lg:hidden pt-3 pb-1 flex justify-center shrink-0">
+        <div className="lg:hidden pt-3 pb-1 flex items-center justify-center relative shrink-0">
           <div className="w-10 h-1.5 bg-slate-300 rounded-full" />
+          {hasNavigation && (
+            <span className="absolute right-4 text-[10px] font-mono text-slate-400 tabular-nums">
+              {navIndex + 1}/{navigableCards.length}
+            </span>
+          )}
         </div>
 
         <div className="px-4 sm:px-6 py-3 border-b border-slate-100 flex items-center justify-between gap-2 shrink-0">
@@ -1071,6 +1238,34 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
+            {hasNavigation && (
+              <div className="inline-flex items-center rounded-xl border border-slate-200 bg-slate-50 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => navigateAdjacent('prev')}
+                  disabled={!prevCard}
+                  className="min-h-[40px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-200/70 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
+                  aria-label={prevCard ? `Previous card: ${prevCard.name}` : 'No previous card'}
+                  title={prevCard ? `Previous: ${prevCard.name}` : 'Start of list'}
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <span className="hidden sm:inline px-1.5 font-mono text-[11px] font-semibold text-slate-600 tabular-nums">
+                  {navIndex + 1}/{navigableCards.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => navigateAdjacent('next')}
+                  disabled={!nextCard}
+                  className="min-h-[40px] min-w-[38px] flex items-center justify-center text-slate-700 hover:bg-slate-200/70 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
+                  aria-label={nextCard ? `Next card: ${nextCard.name}` : 'No next card'}
+                  title={nextCard ? `Next: ${nextCard.name}` : 'End of list'}
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
             <button
               type="button"
               onClick={handleToggleSynergy}
@@ -1116,7 +1311,22 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           </div>
         </div>
 
-        <div className="overflow-y-auto flex-1 px-4 sm:px-6 py-4 space-y-5">
+        <div
+          className={`overflow-y-auto overflow-x-hidden flex-1 px-4 sm:px-6 py-4 space-y-5 ${
+            isDragging || slideStage !== 'idle'
+              ? ''
+              : 'transition-[transform,opacity] duration-200 ease-out'
+          }`}
+          style={{
+            transform:
+              slideStage === 'pre-next'
+                ? 'translate3d(44px, 0, 0)'
+                : slideStage === 'pre-prev'
+                ? 'translate3d(-44px, 0, 0)'
+                : `translate3d(${dragOffsetX}px, 0, 0)`,
+            opacity: slideStage !== 'idle' ? 0.55 : isDragging ? 0.92 : 1,
+          }}
+        >
           {/* Card Picker Panel for Compare Mode */}
           {compareMode && (pickerOpen || !compareCard) && (
             <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
@@ -1216,14 +1426,24 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             <>
               <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-start">
                 <div className="sm:col-span-6 space-y-2">
-                  <div className="rounded-2xl overflow-hidden border border-slate-200 bg-slate-900">
-                    <div className="aspect-[4/3] w-full">
+                  <div className="relative rounded-2xl overflow-hidden border border-slate-200 bg-slate-950 p-1.5 sm:p-2">
+                    <button
+                      type="button"
+                      onClick={() => setFullImageOpen(true)}
+                      className="block w-full aspect-[5/7] max-w-[290px] sm:max-w-full mx-auto relative cursor-zoom-in group focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600 rounded-xl overflow-hidden"
+                      aria-label={`View full size artwork for ${card.name}`}
+                    >
                       <CardArtwork
                         card={card}
                         imageUrl={activeArt?.url}
-                        className="w-full h-full"
+                        fit="contain"
+                        className="w-full h-full bg-slate-950"
                       />
-                    </div>
+                      <span className="absolute bottom-2 right-2 px-2 py-1 rounded-lg bg-slate-950/80 text-white text-[11px] font-semibold inline-flex items-center gap-1 opacity-90 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                        <Maximize2 className="w-3 h-3" />
+                        <span>Full View</span>
+                      </span>
+                    </button>
                   </div>
 
                   {gallery.length > 1 && (
@@ -1239,13 +1459,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                       <div className="text-xs font-medium text-slate-600 leading-snug">
                         {activeArt?.caption}
                       </div>
-                      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
+                      <div
+                        data-no-swipe="true"
+                        className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1"
+                      >
                         {gallery.map((art, idx) => (
                           <button
                             key={`${art.url}-${idx}`}
                             type="button"
                             onClick={() => setSelectedArtIdx(idx)}
-                            className={`relative w-16 h-12 rounded-lg overflow-hidden border-2 shrink-0 transition-all cursor-pointer ${
+                            className={`relative w-12 h-16 rounded-lg overflow-hidden border-2 shrink-0 transition-all cursor-pointer bg-slate-950 ${
                               selectedArtIdx === idx
                                 ? 'border-red-600 ring-1 ring-red-600'
                                 : 'border-slate-200 opacity-75 hover:opacity-100'
@@ -1255,7 +1478,8 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                             <CardArtwork
                               card={card}
                               imageUrl={art.url}
-                              className="w-full h-full"
+                              fit="contain"
+                              className="w-full h-full bg-slate-950"
                             />
                             <span className="absolute bottom-0.5 right-0.5 px-1 rounded bg-slate-950/75 text-white font-mono text-[10px] leading-tight tabular-nums">
                               {idx + 1}
@@ -1263,6 +1487,15 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                           </button>
                         ))}
                       </div>
+                    </div>
+                  )}
+
+                  {hasNavigation && (
+                    <div className="sm:hidden flex items-center justify-between text-[11px] text-slate-400 px-1">
+                      <span>Swipe left or right for adjacent cards</span>
+                      <span className="font-mono tabular-nums">
+                        {navIndex + 1} / {navigableCards.length}
+                      </span>
                     </div>
                   )}
                 </div>
@@ -1355,12 +1588,14 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                       <span className="text-slate-500 shrink-0">Copy Limit</span>
                       <span
                         className={`font-semibold text-right ${
-                          card.restriction && card.restriction !== 'Unlimited'
+                          isToken
+                            ? 'text-slate-700'
+                            : card.restriction && card.restriction !== 'Unlimited'
                             ? 'text-red-700'
                             : 'text-slate-900'
                         }`}
                       >
-                        {card.restriction || 'Unlimited'} (Max {maxCopies})
+                        {formatRestrictionSummary(card)}
                       </span>
                     </div>
                     {card.families.length > 0 && (
@@ -1401,10 +1636,46 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 </div>
               )}
 
+              {isToken && (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700 flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-slate-600 shrink-0" />
+                  <span>
+                    <span className="font-semibold text-slate-900">Token Card (Outside Main Deck): </span>
+                    {card.name} is placed outside your main deck and cannot be added to deck construction.
+                  </span>
+                </div>
+              )}
+
+              {isBanned && (
+                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-900 flex items-center gap-2">
+                  <Ban className="w-4 h-4 text-red-700 shrink-0" />
+                  <span>
+                    <span className="font-semibold">Banned Card: </span>
+                    {card.name} cannot be included in official tournament decks (0 copies allowed).
+                  </span>
+                </div>
+              )}
+
               {card.summonCondition && (
                 <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950">
-                  <span className="font-semibold">Summon Condition: </span>
+                  <span className="font-semibold">
+                    {usesAdventSummon ? 'Summon / Advent Condition: ' : 'Summon Condition: '}
+                  </span>
                   <EffectTextWithSymbols text={card.summonCondition} />
+                </div>
+              )}
+
+              {!card.levels?.length && (card.braveCondition || card.braveBonusBp !== undefined) && (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-2 text-xs">
+                  <span className="font-medium text-slate-700">
+                    <span className="font-semibold text-slate-900">Brave Condition: </span>
+                    <EffectTextWithSymbols text={card.braveCondition || 'None'} />
+                  </span>
+                  {card.braveBonusBp !== undefined && (
+                    <span className="font-mono font-semibold text-red-700 tabular-nums shrink-0">
+                      +{card.braveBonusBp.toLocaleString()} BP
+                    </span>
+                  )}
                 </div>
               )}
 
@@ -1432,15 +1703,17 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                         </span>
                       </div>
                     ))}
-                    {card.braveBonusBp && (
-                      <div className="px-3.5 py-2.5 flex items-center justify-between text-sm bg-slate-50">
+                    {(card.braveBonusBp !== undefined || card.braveCondition) && (
+                      <div className="px-3.5 py-2.5 flex items-center justify-between gap-2 text-sm bg-slate-50">
                         <span className="text-xs font-medium text-slate-600">
-                          Brave Condition:{' '}
-                          <EffectTextWithSymbols text={card.braveCondition || ''} />
+                          <span className="font-semibold text-slate-800">Brave Condition: </span>
+                          <EffectTextWithSymbols text={card.braveCondition || '—'} />
                         </span>
-                        <span className="font-mono font-semibold text-red-700 tabular-nums">
-                          +{card.braveBonusBp.toLocaleString()} BP
-                        </span>
+                        {card.braveBonusBp !== undefined && (
+                          <span className="font-mono font-semibold text-red-700 tabular-nums shrink-0">
+                            +{card.braveBonusBp.toLocaleString()} BP
+                          </span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1552,35 +1825,127 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             <div className="hidden sm:block" />
           )}
 
-          <div className="flex items-center bg-red-600 text-white rounded-xl overflow-hidden w-full sm:w-auto justify-between sm:justify-start">
-            <button
-              type="button"
-              onClick={() => onUpdateDeckQty(card.id, -1)}
-              disabled={deckQty <= 0}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center hover:bg-red-700 disabled:opacity-40 cursor-pointer"
-              aria-label="Remove one copy from deck"
-            >
-              <Minus className="w-4 h-4" />
-            </button>
-            <div className="px-3 flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap">
-              <Layers className="w-3.5 h-3.5" />
-              <span className="truncate max-w-[140px]">{activeDeckName}</span>
-              <span className="font-mono tabular-nums">
-                ({deckQty}/{maxCopies})
-              </span>
+          {isToken && deckQty === 0 ? (
+            <div className="min-h-[44px] px-4 rounded-xl bg-slate-100 border border-slate-200 text-slate-600 text-xs font-semibold inline-flex items-center justify-center gap-2 w-full sm:w-auto">
+              <Layers className="w-3.5 h-3.5 text-slate-500" />
+              <span>Token Card · Used Outside Main Deck</span>
             </div>
-            <button
-              type="button"
-              onClick={() => onUpdateDeckQty(card.id, 1)}
-              disabled={deckQty >= maxCopies}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center hover:bg-red-700 disabled:opacity-40 cursor-pointer"
-              aria-label="Add one copy to deck"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
-          </div>
+          ) : (
+            <div className="flex items-center bg-red-600 text-white rounded-xl overflow-hidden w-full sm:w-auto justify-between sm:justify-start">
+              <button
+                type="button"
+                onClick={() => onUpdateDeckQty(card.id, -1)}
+                disabled={deckQty <= 0}
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center hover:bg-red-700 disabled:opacity-40 cursor-pointer"
+                aria-label="Remove one copy from deck"
+              >
+                <Minus className="w-4 h-4" />
+              </button>
+              <div className="px-3 flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap">
+                <Layers className="w-3.5 h-3.5" />
+                <span className="truncate max-w-[140px]">{activeDeckName}</span>
+                <span className="font-mono tabular-nums">
+                  ({deckQty}/{maxCopies})
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onUpdateDeckQty(card.id, 1)}
+                disabled={deckQty >= maxCopies}
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center hover:bg-red-700 disabled:opacity-40 cursor-pointer"
+                aria-label="Add one copy to deck"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+            </div>
+          )}
         </div>
       </div>
+
+      {fullImageOpen && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/90 backdrop-blur-sm flex flex-col items-center justify-center p-4"
+          onClick={(e) => {
+            e.stopPropagation();
+            setFullImageOpen(false);
+          }}
+          onTouchStart={handleSwipeTouchStart}
+          onTouchMove={handleSwipeTouchMove}
+          onTouchEnd={handleSwipeTouchEnd}
+          onTouchCancel={handleSwipeTouchEnd}
+        >
+          <button
+            type="button"
+            onClick={() => setFullImageOpen(false)}
+            className="absolute top-4 right-4 min-h-[44px] min-w-[44px] rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center cursor-pointer z-10"
+            aria-label="Close full image preview"
+          >
+            <X className="w-6 h-6" />
+          </button>
+
+          <div
+            className="relative flex items-center justify-center w-full max-w-lg gap-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {hasNavigation && (
+              <button
+                type="button"
+                onClick={() => navigateAdjacent('prev')}
+                disabled={!prevCard}
+                className="min-h-[44px] min-w-[44px] rounded-full bg-white/15 hover:bg-white/25 disabled:opacity-25 text-white flex items-center justify-center cursor-pointer shrink-0"
+                aria-label={prevCard ? `Previous card: ${prevCard.name}` : 'No previous card'}
+              >
+                <ChevronLeft className="w-5 h-5" />
+              </button>
+            )}
+
+            <div
+              className="w-full max-w-md max-h-[80vh] aspect-[5/7] rounded-2xl overflow-hidden bg-slate-950 shadow-2xl transition-transform duration-150 ease-out"
+              style={{
+                transform: `translate3d(${dragOffsetX}px, 0, 0)`,
+              }}
+            >
+              <CardArtwork
+                card={card}
+                imageUrl={activeArt?.url}
+                fit="contain"
+                className="w-full h-full bg-slate-950"
+              />
+            </div>
+
+            {hasNavigation && (
+              <button
+                type="button"
+                onClick={() => navigateAdjacent('next')}
+                disabled={!nextCard}
+                className="min-h-[44px] min-w-[44px] rounded-full bg-white/15 hover:bg-white/25 disabled:opacity-25 text-white flex items-center justify-center cursor-pointer shrink-0"
+                aria-label={nextCard ? `Next card: ${nextCard.name}` : 'No next card'}
+              >
+                <ChevronRight className="w-5 h-5" />
+              </button>
+            )}
+          </div>
+
+          <div className="mt-3 text-center text-xs text-slate-200 max-w-md px-3">
+            <div className="font-semibold">
+              {card.name}
+              {hasNavigation && (
+                <span className="ml-2 font-mono text-slate-400 tabular-nums">
+                  ({navIndex + 1}/{navigableCards.length})
+                </span>
+              )}
+            </div>
+            {activeArt?.caption && (
+              <div className="text-slate-400 mt-0.5">{activeArt.caption}</div>
+            )}
+            {hasNavigation && (
+              <div className="text-[11px] text-slate-400 mt-1 sm:hidden">
+                Swipe left or right to switch cards
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

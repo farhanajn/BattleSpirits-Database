@@ -1,9 +1,10 @@
 import React from 'react';
-import { Plus, Check } from 'lucide-react';
+import { Plus, Check, Ban } from 'lucide-react';
 import { BattleSpiritsCard, BattleSymbolKind, CardColor } from '../types/card';
 import { COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
+import { getMaxCardCopies, getRestrictionBadgeLabel, isTokenCard } from '../utils/cardRules';
 
 interface CardThumbnailProps {
   card: BattleSpiritsCard;
@@ -32,12 +33,11 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       : null;
 
   const isStandardLegal = card.formats.includes('Standard');
-  const maxCopies =
-    card.restriction === 'Restricted <1>'
-      ? 1
-      : card.restriction === 'Restricted <2>'
-      ? 2
-      : 3;
+  const isToken = isTokenCard(card);
+  const maxCopies = getMaxCardCopies(card);
+  const restrictionBadge = isToken ? 'TOKEN' : getRestrictionBadgeLabel(card.restriction);
+  const isBanned = !isToken && maxCopies === 0;
+  const cannotAdd = (isToken || isBanned) && deckQty === 0;
 
   const reductionEntries = (
     Object.entries(card.reduction) as [BattleSymbolKind, number][]
@@ -177,11 +177,11 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
               </span>
             </>
           )}
-          {card.restriction && card.restriction !== 'Unlimited' && (
+          {restrictionBadge && (
             <>
               <span aria-hidden="true">·</span>
               <span className="text-red-700 font-mono font-semibold shrink-0">
-                {card.restriction === 'Restricted <1>' ? '<1>' : '<2>'}
+                {restrictionBadge}
               </span>
             </>
           )}
@@ -190,14 +190,39 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
         <button
           type="button"
           onClick={() => onAddToDeck(card)}
-          className={`min-h-[44px] min-w-[44px] px-3 inline-flex items-center justify-center gap-1 rounded-xl text-xs font-semibold transition-colors shrink-0 cursor-pointer ${
-            deckQty > 0
-              ? 'bg-red-50 text-red-700 hover:bg-red-100'
-              : 'bg-slate-100 text-slate-800 hover:bg-slate-200'
+          disabled={cannotAdd}
+          title={
+            isToken
+              ? 'Token cards are used outside the main deck'
+              : isBanned
+              ? 'Banned cards cannot be added to a deck'
+              : undefined
+          }
+          className={`min-h-[44px] min-w-[44px] px-3 inline-flex items-center justify-center gap-1 rounded-xl text-xs font-semibold transition-colors shrink-0 ${
+            isToken && deckQty === 0
+              ? 'bg-slate-100 text-slate-500 border border-slate-200 cursor-not-allowed'
+              : isBanned && deckQty === 0
+              ? 'bg-red-50 text-red-700/80 border border-red-200 cursor-not-allowed'
+              : deckQty > 0
+              ? 'bg-red-50 text-red-700 hover:bg-red-100 cursor-pointer'
+              : 'bg-slate-100 text-slate-800 hover:bg-slate-200 cursor-pointer'
           }`}
-          aria-label={`Add ${card.name} to active deck`}
+          aria-label={
+            isToken
+              ? `${card.name} is a Token card used outside the main deck`
+              : isBanned
+              ? `${card.name} is banned from deck construction`
+              : `Add ${card.name} to active deck`
+          }
         >
-          {deckQty > 0 ? (
+          {isToken && deckQty === 0 ? (
+            <span className="whitespace-nowrap">Token</span>
+          ) : isBanned && deckQty === 0 ? (
+            <>
+              <Ban className="w-3.5 h-3.5" />
+              <span className="whitespace-nowrap">Banned</span>
+            </>
+          ) : deckQty > 0 ? (
             <>
               <Check className="w-3.5 h-3.5" />
               <span className="font-mono tabular-nums whitespace-nowrap">

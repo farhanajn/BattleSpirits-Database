@@ -16,22 +16,28 @@ import {
   FileDown,
   FileJson,
   FileSpreadsheet,
+  Share2,
+  Link2,
+  Shuffle,
 } from 'lucide-react';
 import {
   BattleSpiritsCard,
   BattleSymbolKind,
-  CardColor,
   CardType,
   Deck,
   DeckEntry,
   GameFormat,
 } from '../types/card';
-import { ALL_COLORS, ALL_TYPES, COLOR_META } from '../data/theme';
+import { ALL_TYPES, COLOR_META } from '../data/theme';
 import { SymbolIcon } from './SymbolIcon';
 import { DeckCompositionChart } from './DeckCompositionChart';
 import { DeckStatsPanel } from './DeckStatsPanel';
+import { DeckD3Charts } from './DeckD3Charts';
+import { TestHandPanel } from './TestHandPanel';
 import { exportDecklistImage } from '../utils/deckImageExporter';
 import { exportDeckAsFile } from '../utils/deckDataExporter';
+import { buildShareDeckUrl } from '../utils/deckShare';
+import { getMaxCardCopies, isTokenCard } from '../utils/cardRules';
 import {
   buildImportedDeckEntries,
   extractSetCodeFromCardNumber,
@@ -94,11 +100,14 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const [copied, setCopied] = useState(false);
   const [showTextExport, setShowTextExport] = useState(false);
   const [showExportOptions, setShowExportOptions] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [shareCopied, setShareCopied] = useState(false);
   const [lastExportedFormat, setLastExportedFormat] = useState<'json' | 'csv' | null>(null);
   const [textFormatMode, setTextFormatMode] = useState<'grouped' | 'compact'>('grouped');
   const [downloading, setDownloading] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [testingHand, setTestingHand] = useState(false);
 
   const activeDeck = decks.find((d) => d.id === activeDeckId) || decks[0];
   const activeFormat: GameFormat = activeDeck?.format || 'Eternal';
@@ -127,12 +136,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
         )
     : [];
 
-  const getMaxCopies = (card: BattleSpiritsCard) =>
-    card.restriction === 'Restricted <1>'
-      ? 1
-      : card.restriction === 'Restricted <2>'
-      ? 2
-      : 3;
+  const getMaxCopies = (card: BattleSpiritsCard) => getMaxCardCopies(card);
 
   const formatIllegalEntries = resolvedEntries.filter(
     ({ card }) => activeFormat === 'Standard' && !card.formats.includes('Standard')
@@ -150,41 +154,12 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
   const [selectedCostBucket, setSelectedCostBucket] = useState<number | null>(null);
 
-  const costBuckets = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-  const costBreakdown = costBuckets.map((bucket) => {
-    const matching = resolvedEntries.filter(({ card }) =>
-      bucket === 8 ? card.cost >= 8 : card.cost === bucket
-    );
-    const total = matching.reduce((sum, item) => sum + item.quantity, 0);
-    const byColor = ALL_COLORS.map((color) => ({
-      color,
-      count: matching
-        .filter((item) => item.card.color === color)
-        .reduce((sum, item) => sum + item.quantity, 0),
-    })).filter((c) => c.count > 0);
-    return { bucket, total, byColor, cards: matching };
-  });
-  const maxCostBucket = Math.max(1, ...costBreakdown.map((b) => b.total));
-
-
   const typeCounts = ALL_TYPES.reduce((acc, type) => {
     acc[type] = resolvedEntries
       .filter((e) => e.card.type === type)
       .reduce((sum, e) => sum + e.quantity, 0);
     return acc;
   }, {} as Record<CardType, number>);
-
-  const colorCounts = ALL_COLORS.reduce((acc, color) => {
-    acc[color] = resolvedEntries
-      .filter((e) => e.card.color === color)
-      .reduce((sum, e) => sum + e.quantity, 0);
-    return acc;
-  }, {} as Record<CardColor, number>);
-
-  const activeBucketDetail =
-    selectedCostBucket !== null
-      ? costBreakdown.find((b) => b.bucket === selectedCostBucket) || null
-      : null;
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -289,6 +264,22 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     }
   };
 
+  const handleShareDeck = async () => {
+    if (!activeDeck || resolvedEntries.length === 0) return;
+    const url = buildShareDeckUrl(activeDeck, resolvedEntries);
+    setShareUrl(url);
+    setShowExportOptions(false);
+    setShowTextExport(false);
+    const ok = await copyTextToClipboard(url);
+    if (ok) {
+      setShareCopied(true);
+      onNotify?.(`Copied shareable link for "${activeDeck.name}"`);
+      setTimeout(() => setShareCopied(false), 2600);
+    } else {
+      onNotify?.('Shareable deck link generated below');
+    }
+  };
+
   const handlePasteFromClipboard = async () => {
     if (navigator.clipboard?.readText) {
       try {
@@ -390,15 +381,35 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {activeDeck && (
+            <button
+              type="button"
+              onClick={() => {
+                setTestingHand((v) => !v);
+                setImporting(false);
+                setCreating(false);
+              }}
+              aria-pressed={testingHand}
+              className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border whitespace-nowrap ${
+                testingHand
+                  ? 'bg-red-600 text-white border-red-600 hover:bg-red-700'
+                  : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Shuffle className="w-4 h-4" />
+              <span>Test Hand</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
               setImporting((v) => !v);
               setCreating(false);
+              setTestingHand(false);
               if (!activeDeck) setImportMode('new');
             }}
-            className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border ${
+            className={`min-h-[44px] px-4 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer border whitespace-nowrap ${
               importing
                 ? 'bg-red-50 text-red-700 border-red-200'
                 : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
@@ -412,8 +423,9 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
             onClick={() => {
               setCreating((v) => !v);
               setImporting(false);
+              setTestingHand(false);
             }}
-            className="min-h-[44px] px-4 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shrink-0 cursor-pointer"
+            className="min-h-[44px] px-4 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shrink-0 cursor-pointer whitespace-nowrap"
           >
             <FolderPlus className="w-4 h-4" />
             <span>New Deck</span>
@@ -633,7 +645,11 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                           <span className="font-mono text-[11px] text-slate-500 shrink-0">
                             {card.cardNumber}
                           </span>
-                          {isIllegalStd && (
+                          {isTokenCard(card) ? (
+                            <span className="text-[11px] font-semibold text-slate-600 shrink-0">
+                              (Token · Outside Deck)
+                            </span>
+                          ) : isIllegalStd && (
                             <span className="text-[11px] font-semibold text-amber-700 shrink-0">
                               (ETN Only)
                             </span>
@@ -782,6 +798,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                 onSelectDeck(deck.id);
                 setSelectedCostBucket(null);
                 setConfirmDeleteId(null);
+                setShareUrl(null);
               }}
               className={`min-h-[44px] px-4 py-2 rounded-xl text-left border shrink-0 transition-colors cursor-pointer ${
                 isSelected
@@ -817,6 +834,16 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
             <span>Create New Deck</span>
           </button>
         </div>
+      )}
+
+      {activeDeck && testingHand && (
+        <TestHandPanel
+          deckId={activeDeck.id}
+          deckName={activeDeck.name}
+          resolvedEntries={resolvedEntries}
+          onInspectCard={onInspectCard}
+          onClose={() => setTestingHand(false)}
+        />
       )}
 
       {activeDeck && (
@@ -893,7 +920,11 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                         <p>
                           <span className="font-semibold">Restriction limit exceeded:</span>{' '}
                           {restrictionViolations
-                            .map((e) => `${e.card.name} (${e.card.restriction})`)
+                            .map((e) =>
+                              isTokenCard(e.card)
+                                ? `${e.card.name} (Token — outside deck)`
+                                : `${e.card.name} (${e.card.restriction})`
+                            )
                             .join(', ')}
                           .
                         </p>
@@ -932,172 +963,14 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
               <DeckStatsPanel resolvedEntries={resolvedEntries} totalCards={totalCards} />
 
-              {/* Interactive Cost Distribution Histogram */}
-              <div className="pt-2 border-t border-slate-100">
-                <div className="flex items-center justify-between gap-2 mb-3">
-                  <span className="text-xs font-semibold text-slate-700">
-                    Cost Distribution Histogram
-                  </span>
-                  <span className="text-[11px] text-slate-400">
-                    Tap bar to inspect
-                  </span>
-                </div>
+              <DeckD3Charts
+                resolvedEntries={resolvedEntries}
+                totalCards={totalCards}
+                selectedCostBucket={selectedCostBucket}
+                onSelectCostBucket={setSelectedCostBucket}
+              />
 
-                <div className="relative">
-                  <div
-                    aria-hidden="true"
-                    className="pointer-events-none absolute inset-x-0 top-5 bottom-6 flex flex-col justify-between"
-                  >
-                    <div className="border-t border-dashed border-slate-200/80" />
-                    <div className="border-t border-dashed border-slate-200/80" />
-                    <div className="border-t border-slate-200" />
-                  </div>
-
-                  <div className="relative grid grid-cols-9 gap-1.5 items-end h-36">
-                    {costBreakdown.map(({ bucket, total, byColor }) => {
-                      const isActive = selectedCostBucket === bucket;
-                      const heightPct = total > 0 ? Math.max(12, (total / maxCostBucket) * 100) : 0;
-                      return (
-                        <button
-                          key={bucket}
-                          type="button"
-                          onClick={() =>
-                            setSelectedCostBucket((prev) => (prev === bucket ? null : bucket))
-                          }
-                          className={`group h-full flex flex-col items-center justify-end gap-1 rounded-lg px-0.5 py-1 transition-colors cursor-pointer ${
-                            isActive ? 'bg-slate-100' : 'hover:bg-slate-50'
-                          }`}
-                          aria-label={`Cost ${bucket === 8 ? '8 plus' : bucket}: ${total} cards`}
-                          aria-pressed={isActive}
-                        >
-                          <span
-                            className={`font-mono text-[11px] font-semibold tabular-nums h-4 leading-4 ${
-                              total > 0 ? 'text-slate-900' : 'text-transparent'
-                            }`}
-                          >
-                            {total}
-                          </span>
-
-                          <div className="w-full flex-1 flex items-end px-0.5">
-                            {total > 0 ? (
-                              <div
-                                className={`w-full rounded-t-md overflow-hidden flex flex-col-reverse transition-all ${
-                                  isActive ? 'ring-2 ring-slate-900 ring-offset-1' : ''
-                                }`}
-                                style={{ height: `${heightPct}%` }}
-                              >
-                                {byColor.map(({ color, count }) => (
-                                  <div
-                                    key={color}
-                                    style={{
-                                      height: `${(count / total) * 100}%`,
-                                      backgroundColor: COLOR_META[color].hex,
-                                    }}
-                                  />
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="w-full h-1 rounded-full bg-slate-200/70" />
-                            )}
-                          </div>
-
-                          <span
-                            className={`font-mono text-[11px] tabular-nums ${
-                              isActive ? 'font-bold text-slate-900' : 'text-slate-500'
-                            }`}
-                          >
-                            {bucket === 8 ? '8+' : bucket}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {activeBucketDetail && (
-                  <div className="mt-3 p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-slate-900">
-                        Cost {activeBucketDetail.bucket === 8 ? '8+' : activeBucketDetail.bucket} Cards
-                      </span>
-                      <span className="font-mono text-slate-600 tabular-nums">
-                        {activeBucketDetail.total} cards (
-                        {totalCards > 0
-                          ? Math.round((activeBucketDetail.total / totalCards) * 100)
-                          : 0}
-                        %)
-                      </span>
-                    </div>
-                    {activeBucketDetail.cards.length === 0 ? (
-                      <p className="text-xs text-slate-500">No cards at this cost in deck.</p>
-                    ) : (
-                      <ul className="space-y-1.5">
-                        {activeBucketDetail.cards.map(({ card, quantity }) => (
-                          <li
-                            key={card.id}
-                            className="flex items-center justify-between gap-2 text-xs text-slate-700"
-                          >
-                            <span className="inline-flex items-center gap-1.5 min-w-0">
-                              <SymbolIcon color={card.color} size="xs" variant="gem" />
-                              <span className="truncate">{card.name}</span>
-                            </span>
-                            <span className="font-mono font-semibold tabular-nums shrink-0">
-                              ×{quantity}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Visual Breakdown by Type & Attribute */}
-              <div className="space-y-4 pt-2 border-t border-slate-100">
-                <div>
-                  <div className="flex items-center justify-between text-xs mb-2">
-                    <span className="font-semibold text-slate-700">Attribute Mix</span>
-                    <span className="font-mono text-slate-500 tabular-nums">{totalCards} total</span>
-                  </div>
-                  {totalCards > 0 ? (
-                    <div className="h-2.5 w-full rounded-full overflow-hidden flex bg-slate-100">
-                      {ALL_COLORS.filter((c) => colorCounts[c] > 0).map((c) => (
-                        <div
-                          key={c}
-                          style={{
-                            width: `${(colorCounts[c] / totalCards) * 100}%`,
-                            backgroundColor: COLOR_META[c].hex,
-                          }}
-                          title={`${c}: ${colorCounts[c]} cards`}
-                        />
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="h-2.5 w-full rounded-full bg-slate-100" />
-                  )}
-                  <div className="mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
-                    {ALL_COLORS.filter((c) => colorCounts[c] > 0).map((c) => (
-                      <div key={c} className="flex items-center justify-between text-slate-700">
-                        <span className="inline-flex items-center gap-1.5">
-                          <SymbolIcon color={c} size="xs" variant="gem" />
-                          <span className={`font-semibold ${COLOR_META[c].text}`}>{c}</span>
-                        </span>
-                        <span className="font-mono font-semibold tabular-nums">
-                          {colorCounts[c]}{' '}
-                          <span className="text-[11px] font-normal text-slate-400">
-                            ({totalCards > 0 ? Math.round((colorCounts[c] / totalCards) * 100) : 0}%)
-                          </span>
-                        </span>
-                      </div>
-                    ))}
-                    {ALL_COLORS.every((c) => colorCounts[c] === 0) && (
-                      <div className="text-slate-400 col-span-2">No cards added yet</div>
-                    )}
-                  </div>
-                </div>
-
-                <DeckCompositionChart typeCounts={typeCounts} totalCards={totalCards} />
-              </div>
+              <DeckCompositionChart typeCounts={typeCounts} totalCards={totalCards} />
 
               <div className="space-y-2.5 pt-2 border-t border-slate-100">
                 <div className="flex flex-wrap items-center gap-2">
@@ -1133,9 +1006,24 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                   </button>
                   <button
                     type="button"
+                    onClick={handleShareDeck}
+                    disabled={resolvedEntries.length === 0}
+                    className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0 disabled:opacity-45 ${
+                      shareUrl
+                        ? 'border-sky-700 bg-sky-700 text-white'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                    aria-label="Generate shareable link for this deck"
+                  >
+                    {shareCopied ? <Check className="w-4 h-4" /> : <Share2 className="w-4 h-4" />}
+                    <span>{shareCopied ? 'Link Copied' : 'Share Deck'}</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => {
                       setShowExportOptions((v) => !v);
                       setShowTextExport(false);
+                      setShareUrl(null);
                     }}
                     disabled={resolvedEntries.length === 0}
                     className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0 disabled:opacity-45 ${
@@ -1154,6 +1042,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                     onClick={() => {
                       setShowTextExport((v) => !v);
                       setShowExportOptions(false);
+                      setShareUrl(null);
                     }}
                     disabled={resolvedEntries.length === 0}
                     className="min-h-[44px] px-3 rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-45 text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
@@ -1164,6 +1053,46 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                     <span>{showTextExport ? 'Hide Text' : 'Text Format'}</span>
                   </button>
                 </div>
+
+                {shareUrl && resolvedEntries.length > 0 && (
+                  <div className="p-3 rounded-xl bg-sky-50 border border-sky-200 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-950">
+                        <Link2 className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+                        <span>Shareable Deck Link Ready</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShareUrl(null)}
+                        className="min-h-[28px] min-w-[28px] rounded-lg text-sky-700 hover:bg-sky-100 flex items-center justify-center cursor-pointer"
+                        aria-label="Close share deck link"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-sky-900/80">
+                      Anyone who opens this link will be prompted to import &ldquo;{activeDeck.name}&rdquo; automatically.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        value={shareUrl}
+                        onFocus={(e) => e.target.select()}
+                        aria-label="Shareable deck URL"
+                        className="flex-1 min-w-0 min-h-[38px] px-2.5 rounded-lg bg-white border border-sky-200 font-mono text-[11px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleShareDeck}
+                        className="min-h-[38px] px-3 rounded-lg bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                      >
+                        {shareCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                        <span>{shareCopied ? 'Copied' : 'Copy Link'}</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 {showExportOptions && resolvedEntries.length > 0 && (
                   <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">

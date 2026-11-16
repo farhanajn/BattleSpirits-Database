@@ -26,16 +26,236 @@ const cardWikitextCache = new Map<string, CacheEntry<string>>();
 const imageUrlCache = new Map<string, CacheEntry<string | null>>();
 
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+const BANLIST_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
 const ALL_COLORS: CardColor[] = ['Red', 'Purple', 'White', 'Yellow', 'Green', 'Blue'];
 
-const RESTRICTED_1_NAMES = new Set([
+export type WikiCardRestriction =
+  | 'Unlimited'
+  | 'Banned'
+  | 'Restricted <1>'
+  | 'Restricted <2>'
+  | 'Restricted <20>';
+
+export interface WikiBanListSnapshot {
+  effectiveDate: string;
+  byCardNumber: Record<string, WikiCardRestriction>;
+  byName: Record<string, WikiCardRestriction>;
+}
+
+const SEED_RESTRICTED_1_NAMES = [
   'The SevenShogunDemon Beelzebub',
   'The SevenShogun Demon Belzeebub',
   'Fruit of Life',
   'Dark Knight Mordred',
   'The CrimsonDragonLord Kaiser-Atlas',
-]);
+];
+
+function normalizeBanKey(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\u2018\u2019`´]/g, "'")
+    .replace(/\s*\(revival\)\s*/gi, '')
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeCardCodeKey(raw: string): string {
+  return raw.trim().toUpperCase().replace(/\s+/g, '');
+}
+
+let banListCache: CacheEntry<WikiBanListSnapshot> | null = null;
+let banListInflight: Promise<WikiBanListSnapshot> | null = null;
+
+function buildSeedBanListSnapshot(): WikiBanListSnapshot {
+  const byName: Record<string, WikiCardRestriction> = {};
+  for (const name of SEED_RESTRICTED_1_NAMES) {
+    byName[normalizeBanKey(name)] = 'Restricted <1>';
+  }
+  return {
+    effectiveDate: 'Official Ban/Limit Seed',
+    byCardNumber: {
+      'P16-26': 'Restricted <20>',
+    },
+    byName,
+  };
+}
+
+function parseBanListWikitext(wikitext: string): WikiBanListSnapshot {
+  const snapshot = buildSeedBanListSnapshot();
+
+  const dateMatch = wikitext.match(/effective from\s+'''([^']+)'''/i);
+  if (dateMatch) {
+    snapshot.effectiveDate = dateMatch[1].trim();
+  }
+
+  let currentRestriction: WikiCardRestriction | null = null;
+  const headingRegex = /^(={2,3})\s*([^=\n]+?)\s*\1/gm;
+  const sections: { title: string; start: number; end: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = headingRegex.exec(wikitext)) !== null) {
+    if (sections.length > 0) {
+      sections[sections.length - 1].end = m.index;
+    }
+    sections.push({
+      title: m[2].trim(),
+      start: m.index + m[0].length,
+      end: wikitext.length,
+    });
+  }
+
+  const applyEntry = (
+    restriction: WikiCardRestriction,
+    namesRaw: string,
+    numbersRaw: string,
+    isRevival: boolean
+  ) => {
+    const cleanedNames = namesRaw
+      .replace(/\[\[([^|\]]+)\|([^\]]+)\]\]/g, '$2')
+      .replace(/\[\[([^\]]+)\]\]/g, '$1')
+      .split('/')
+      .map((n) => n.trim())
+      .filter(Boolean);
+
+    for (const nm of cleanedNames) {
+      const baseKey = normalizeBanKey(nm);
+      if (!baseKey) continue;
+      if (isRevival) {
+        snapshot.byName[`${baseKey}|rv`] = restriction;
+      } else {
+        snapshot.byName[`${baseKey}|orig`] = restriction;
+        if (!snapshot.byName[baseKey]) {
+          snapshot.byName[baseKey] = restriction;
+        }
+      }
+    }
+
+    const codeTokens = numbersRaw
+      .split(/[/,\s]+/)
+      .map((c) => normalizeCardCodeKey(c))
+      .filter((c) => /^[A-Z0-9-]+$/.test(c) && /\d/.test(c));
+
+    for (const code of codeTokens) {
+      snapshot.byCardNumber[code] = restriction;
+      // Handle BS/SD codes with missing leading zero in wiki captions (e.g. SD57-06 -> SD57-006)
+      const padMatch = code.match(/^([A-Z0-9]+)-(\d{2})$/);
+      if (padMatch) {
+        snapshot.byCardNumber[`${padMatch[1]}-0${padMatch[2]}`] = restriction;
+      }
+      const trimMatch = code.match(/^([A-Z0-9]+)-0(\d{2})$/);
+      if (trimMatch) {
+        snapshot.byCardNumber[`${trimMatch[1]}-${trimMatch[2]}`] = restriction;
+      }
+    }
+  };
+
+  for (const sec of sections) {
+    const t = sec.title.toLowerCase();
+    if (t.includes('banning pair') || t.includes('update record')) {
+      currentRestriction = null;
+      continue;
+    }
+    if (/banned\s+cards/i.test(t)) {
+      currentRestriction = 'Banned';
+    } else if (/limited\s+cards.*<\s*20\s*>/i.test(t)) {
+      currentRestriction = 'Restricted <20>';
+    } else if (/limited\s+cards.*<\s*2\s*>/i.test(t)) {
+      currentRestriction = 'Restricted <2>';
+    } else if (/limited\s+cards.*<\s*1\s*>/i.test(t)) {
+      currentRestriction = 'Restricted <1>';
+    } else {
+      currentRestriction = null;
+    }
+    if (!currentRestriction) continue;
+
+    const body = wikitext.slice(sec.start, sec.end);
+    // Gallery entries look like: File.jpg|[[Name]] (Revival) (CODE)
+    const entryRegex =
+      /\|((?:\[\[[^\]]+\]\](?:\s*\/\s*\[\[[^\]]+\]\])*))\s*(?:\((Revival)\)\s*)?\(([^)\n]+)\)/gi;
+    let em: RegExpExecArray | null;
+    while ((em = entryRegex.exec(body)) !== null) {
+      const namesRaw = em[1] || '';
+      const isRev = Boolean(em[2]);
+      const numbersRaw = em[3] || '';
+      applyEntry(currentRestriction, namesRaw, numbersRaw, isRev);
+    }
+  }
+
+  return snapshot;
+}
+
+async function ensureBanListLoaded(): Promise<WikiBanListSnapshot> {
+  const now = Date.now();
+  if (banListCache && banListCache.expiresAt > now) {
+    return banListCache.value;
+  }
+  if (banListInflight) {
+    return banListInflight;
+  }
+
+  banListInflight = (async () => {
+    try {
+      const json = (await fetchWikiJson({
+        action: 'query',
+        titles: 'Banned_and_Restricted_Cards',
+        prop: 'revisions',
+        rvprop: 'content',
+        rvslots: 'main',
+        redirects: '1',
+      })) as {
+        query?: {
+          pages?: Record<
+            string,
+            { revisions?: { slots?: { main?: { '*'?: string } } }[] }
+          >;
+        };
+      };
+      const page = Object.values(json.query?.pages || {})[0];
+      const wt = page?.revisions?.[0]?.slots?.main?.['*'] || '';
+      const parsed = wt ? parseBanListWikitext(wt) : buildSeedBanListSnapshot();
+      banListCache = {
+        value: parsed,
+        expiresAt: Date.now() + BANLIST_TTL_MS,
+      };
+      return parsed;
+    } catch {
+      const fallback = banListCache?.value || buildSeedBanListSnapshot();
+      banListCache = {
+        value: fallback,
+        expiresAt: Date.now() + 1000 * 60 * 5,
+      };
+      return fallback;
+    } finally {
+      banListInflight = null;
+    }
+  })();
+
+  return banListInflight;
+}
+
+export async function getWikiBanList(): Promise<WikiBanListSnapshot> {
+  return ensureBanListLoaded();
+}
+
+function resolveCardRestriction(
+  cardNumber: string,
+  cardName: string,
+  isRevival?: boolean,
+  fallback?: WikiCardRestriction
+): WikiCardRestriction {
+  const snap = banListCache?.value || buildSeedBanListSnapshot();
+  const codeKey = normalizeCardCodeKey(cardNumber || '');
+  if (codeKey && snap.byCardNumber[codeKey]) {
+    return snap.byCardNumber[codeKey];
+  }
+  const baseNameKey = normalizeBanKey(cardName || '');
+  if (baseNameKey) {
+    const versionKey = `${baseNameKey}|${isRevival ? 'rv' : 'orig'}`;
+    if (snap.byName[versionKey]) return snap.byName[versionKey];
+    if (snap.byName[baseNameKey]) return snap.byName[baseNameKey];
+  }
+  return fallback || 'Unlimited';
+}
 
 // Curated titles for well-known sets so the directory is immediately informative before hydration
 const KNOWN_SET_META: Record<
@@ -727,17 +947,25 @@ function cleanWikitextInline(raw: string): string {
     )
     .replace(/\[\[(?:File|Image):[^\]]+\]\]/gi, '')
     .replace(/\{\{gp\|([^}]+)\}\}/gi, '[Grandphosis: $1]')
-    .replace(/\{\{Sumcon\|([^}]+)\}\}/gi, '[Summon Condition: $1]')
+    .replace(/\{\{SuAdcon\|([^}]+)\}\}/gi, (_m, p1: string) => `[Summon/Advent Condition: ${p1.trim()}]`)
+    .replace(/\{\{Sumcon\|([^}]+)\}\}/gi, (_m, p1: string) => `[Summon Condition: ${p1.trim()}]`)
+    .replace(/\{\{Adcon\|([^}]+)\}\}/gi, (_m, p1: string) => `[Advent Condition: ${p1.trim()}]`)
+    .replace(/\{\{(?:Brcon|Bravecon)\|([^}]+)\}\}/gi, (_m, p1: string) => `[Brave Condition: ${p1.trim()}]`)
     .replace(/\{\{Mirage\|([^}]+)\}\}/gi, '[Mirage: $1]')
     .replace(/\{\{Seal\|([^}]+)\}\}/gi, '[$1]')
     .replace(/\{\{Unleash\|([^|}]+)(?:\|([^}]+))?\}\}/gi, (_m, p1: string, p2?: string) =>
       p2 ? `[${p2.trim()} Unleash: ${p1.trim()}]` : `[Unleash: ${p1.trim()}]`
     )
+    .replace(
+      /\{\{Advent2\|([^|}]+)\|([^|}]+)(?:\|([^}]+))?\}\}/gi,
+      (_m, kind: string, p1: string, p2?: string) =>
+        p2 ? `[${kind.trim()}: ${p1.trim()} (${p2.trim()})]` : `[${kind.trim()}: ${p1.trim()}]`
+    )
     .replace(/\{\{Advent\|([^|}]+)(?:\|([^}]+))?\}\}/gi, (_m, p1: string, p2?: string) =>
       p2 ? `[Advent: ${p1.trim()} ${p2.trim()}]` : `[Advent: ${p1.trim()}]`
     )
     .replace(
-      /\{\{(Grand Advent|Ultra Advent|Flag Contract Advent|Contract Advent|Seal Flag Contract Advent|Ultra Contract Advent)\|([^|}]+)(?:\|([^}]+))?\}\}/gi,
+      /\{\{(Grand Advent|Ultra Advent|Flag Contract Advent|Contract Advent|Seal Flag Contract Advent|Ultra Contract Advent|Final Contract Advent|DK Grand Advent|Reverse Contract Advent|SF Advent|Transcendent Advent|Contract)\|([^|}]+)(?:\|([^}]+))?\}\}/gi,
       (_m, kind: string, p1: string, p2?: string) =>
         p2 ? `[${kind}: ${p1.trim()} (${p2.trim()})]` : `[${kind}: ${p1.trim()}]`
     )
@@ -1444,7 +1672,8 @@ export function hydrateCardFromWikitext(
       ? base.symbols
       : { [color]: 1 };
 
-  const levels = parseLevels(extractTabberSegment(fields.level || '', isRevival));
+  const rawLevelStr = extractTabberSegment(fields.level || '', isRevival);
+  const levels = parseLevels(rawLevelStr);
   const rawEffect = extractTabberSegment(fields.effect || '', isRevival);
   const effects = parseEffects(rawEffect);
 
@@ -1455,16 +1684,71 @@ export function hydrateCardFromWikitext(
     cleanWikitextInline(fields.keyword4 || ''),
   ].filter(Boolean);
 
-  const summonCond =
-    cleanWikitextInline(extractTabberSegment(fields.summoncondition || fields.summon || '', isRevival)) ||
-    undefined;
-  const rawBraveCond = cleanWikitextInline(
-    extractTabberSegment(fields.bravecondition || fields.brave || '', isRevival)
+  let summonCond =
+    cleanWikitextInline(
+      extractTabberSegment(
+        fields.summoncondition || fields.summon || fields.sumcon || fields.suadcon || '',
+        isRevival
+      )
+    ) || undefined;
+
+  if (!summonCond && rawEffect) {
+    const suAdMatch = rawEffect.match(/\{\{(SuAdcon|Sumcon|Adcon)\|([^}]+)\}\}/i);
+    if (suAdMatch) {
+      const cleanedCond = cleanWikitextInline(suAdMatch[2]);
+      if (cleanedCond) summonCond = cleanedCond;
+    } else {
+      const cleanedEff = cleanWikitextInline(rawEffect);
+      const textCondMatch = cleanedEff.match(
+        /\[(?:Summon(?:\/Advent)?|Advent)\s+Condition:\s*([^\]]+)\]/i
+      );
+      if (textCondMatch) {
+        summonCond = textCondMatch[1].trim();
+      }
+    }
+  }
+
+  let rawBraveCond = cleanWikitextInline(
+    extractTabberSegment(
+      fields.bravecondition ||
+        fields.brave ||
+        fields['brave condition'] ||
+        fields.brave_condition ||
+        '',
+      isRevival
+    )
   );
-  const braveCond = type === 'Brave' && rawBraveCond ? rawBraveCond : undefined;
-  const braveBpRaw = extractTabberSegment(fields.bravebp || '', isRevival).replace(/[^\d]/g, '');
+  if (!rawBraveCond && rawEffect && (type === 'Brave' || /\bbrave\b/i.test(subtypeLabel || ''))) {
+    const brMatch = rawEffect.match(/\{\{(?:Brcon|Bravecon)\|([^}]+)\}\}/i);
+    if (brMatch) {
+      rawBraveCond = cleanWikitextInline(brMatch[1]);
+    } else {
+      const cleanedEff = cleanWikitextInline(rawEffect);
+      const txtBrMatch = cleanedEff.match(/\[Brave\s+Condition:\s*([^\]]+)\]/i);
+      if (txtBrMatch) {
+        rawBraveCond = txtBrMatch[1].trim();
+      }
+    }
+  }
+
+  const braveCond =
+    (type === 'Brave' || /\bbrave\b/i.test(subtypeLabel || '')) && rawBraveCond
+      ? rawBraveCond
+      : undefined;
+
+  let braveBpRaw = extractTabberSegment(fields.bravebp || '', isRevival).replace(/[^\d]/g, '');
+  if (!braveBpRaw && rawLevelStr) {
+    const bravedLvlMatch = cleanWikitextInline(rawLevelStr).match(
+      /Braved:\s*(?:[^\n,+]*,\s*)?\+?([\d,]+)\s*BP/i
+    );
+    if (bravedLvlMatch) {
+      braveBpRaw = bravedLvlMatch[1].replace(/[^\d]/g, '');
+    }
+  }
   const braveBonusBp =
-    type === 'Brave' && braveBpRaw ? Number(braveBpRaw) : undefined;
+    (type === 'Brave' || /\bbrave\b/i.test(subtypeLabel || '')) && braveBpRaw
+      ? Number(braveBpRaw)
+      : undefined;
 
   const flavorText =
     cleanWikitextInline(fields.enflavor1 || '') ||
@@ -1591,9 +1875,12 @@ export function hydrateCardFromWikitext(
     galleryImages[0]?.url ||
     `/api/wiki/image?file=${encodeURIComponent(`${base.cardNumber}.png`)}&fallback=${encodeURIComponent(base.cardNumber)}`;
 
-  const restriction = RESTRICTED_1_NAMES.has(base.name.replace(/\s*\(Revival\)\s*$/i, ''))
-    ? 'Restricted <1>'
-    : base.restriction || 'Unlimited';
+  const restriction = resolveCardRestriction(
+    base.cardNumber,
+    base.name,
+    isRevival,
+    base.restriction
+  );
 
   const resolvedName =
     isRevival && !/\(revival\)/i.test(base.name)
@@ -1829,7 +2116,7 @@ function parseSetTableRows(
         setName: setMeta.name,
         formats: setMeta.formats,
         blockIcon: setMeta.blockLabel,
-        restriction: RESTRICTED_1_NAMES.has(baseDisplayName) ? 'Restricted <1>' : 'Unlimited',
+        restriction: resolveCardRestriction(fullNumber, displayName, isRevival),
         isRevival,
         isToken,
         cost: 0,
@@ -2162,9 +2449,7 @@ async function getWikiRevivalSet(
       setName,
       formats: knownSet?.formats || ['Eternal'],
       blockIcon: knownSet?.blockLabel || 'Revival',
-      restriction: RESTRICTED_1_NAMES.has(baseName)
-        ? 'Restricted <1>'
-        : 'Unlimited',
+      restriction: resolveCardRestriction(cardNumber, baseName, true),
       isRevival: true,
       cost: 0,
       reduction: {},
@@ -2223,6 +2508,8 @@ export async function getWikiSet(
       totalInSet: cached.value.cards.length,
     };
   }
+
+  await ensureBanListLoaded();
 
   if (codeKey === 'TOKENS') {
     return getWikiTokenSet(baseMeta);
@@ -2292,7 +2579,10 @@ export async function getWikiCardDetail(
   wikiTitle: string,
   fallbackBase?: Partial<BattleSpiritsCard>
 ): Promise<BattleSpiritsCard> {
-  const contents = await batchFetchWikiPages([wikiTitle]);
+  const [, contents] = await Promise.all([
+    ensureBanListLoaded(),
+    batchFetchWikiPages([wikiTitle]),
+  ]);
   const bundle = contents.get(wikiTitle);
   const wikitext = bundle?.wikitext || '';
 
@@ -2336,7 +2626,10 @@ export async function hydrateWikiCardsBatch(
   cards: BattleSpiritsCard[]
 ): Promise<BattleSpiritsCard[]> {
   const titles = cards.map((c) => c.wikiTitle).filter((t): t is string => Boolean(t));
-  const contents = await batchFetchWikiPages(titles);
+  const [, contents] = await Promise.all([
+    ensureBanListLoaded(),
+    batchFetchWikiPages(titles),
+  ]);
   return cards.map((card) => {
     const bundle = card.wikiTitle ? contents.get(card.wikiTitle) : undefined;
     return bundle
@@ -2352,14 +2645,17 @@ export async function searchWikiCards(
   const trimmed = query.trim();
   if (!trimmed) return [];
 
-  const json = (await fetchWikiJson({
-    action: 'query',
-    list: 'search',
-    srsearch: trimmed,
-    srlimit: '20',
-  })) as {
-    query?: { search?: { title: string }[] };
-  };
+  const [, json] = await Promise.all([
+    ensureBanListLoaded(),
+    fetchWikiJson({
+      action: 'query',
+      list: 'search',
+      srsearch: trimmed,
+      srlimit: '20',
+    }) as Promise<{
+      query?: { search?: { title: string }[] };
+    }>,
+  ]);
 
   const titles = (json.query?.search || [])
     .map((s) => s.title)
@@ -2369,6 +2665,7 @@ export async function searchWikiCards(
 
   const contents = await batchFetchWikiPages(titles);
   const results: BattleSpiritsCard[] = [];
+  const seenKeys = new Set<string>();
 
   for (const title of titles) {
     const bundle = contents.get(title);
@@ -2419,7 +2716,7 @@ export async function searchWikiCards(
         setName,
         formats: knownSet?.formats || ['Eternal'],
         blockIcon: knownSet?.blockLabel || 'Wiki',
-        restriction: RESTRICTED_1_NAMES.has(baseName) ? 'Restricted <1>' : 'Unlimited',
+        restriction: resolveCardRestriction(cardNumber, displayName, vBlock.isRevival),
         isRevival: vBlock.isRevival,
         cost: 0,
         reduction: {},
@@ -2443,6 +2740,15 @@ export async function searchWikiCards(
         bundle?.pageImages || [],
         vBlock
       );
+      const dedupeKey = `${hydrated.cardNumber.toUpperCase()}|${hydrated.isRevival ? 'rv' : 'orig'}`;
+      const altNameKey = !hydrated.isRevival
+        ? `orig-name:${hydrated.name.trim().toLowerCase()}`
+        : `rv-name:${hydrated.name.trim().toLowerCase()}`;
+
+      if (seenKeys.has(dedupeKey) || seenKeys.has(altNameKey)) continue;
+      seenKeys.add(dedupeKey);
+      seenKeys.add(altNameKey);
+
       if (formatFilter === 'All' || hydrated.formats.includes(formatFilter)) {
         results.push(hydrated);
       }

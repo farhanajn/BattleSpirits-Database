@@ -25,9 +25,9 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
   onReset,
 }) => {
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 lg:space-y-3.5">
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Game Format</div>
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Game Format</div>
         <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl">
           {(['All', 'Standard', 'Eternal'] as FormatFilter[]).map((fmt) => {
             const active = filters.format === fmt;
@@ -36,7 +36,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
                 key={fmt}
                 type="button"
                 onClick={() => onChange({ ...filters, format: fmt })}
-                className={`min-h-[44px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                className={`min-h-[44px] lg:min-h-[36px] px-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
                   active
                     ? fmt === 'Standard'
                       ? 'bg-sky-700 text-white shadow-sm'
@@ -54,7 +54,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Card Version</div>
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Card Version</div>
         <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl">
           {(
             [
@@ -69,7 +69,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
                 key={ver.id}
                 type="button"
                 onClick={() => onChange({ ...filters, version: ver.id })}
-                className={`min-h-[44px] px-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                className={`min-h-[44px] lg:min-h-[36px] px-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
                   active
                     ? ver.id === 'Revival'
                       ? 'bg-emerald-700 text-white shadow-sm'
@@ -85,12 +85,12 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Attribute Color</div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-2 gap-2">
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Attribute Color</div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-2 gap-1.5">
           <button
             type="button"
             onClick={() => onChange({ ...filters, color: 'All' })}
-            className={`min-h-[44px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+            className={`min-h-[44px] lg:min-h-[36px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
               filters.color === 'All'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
@@ -106,7 +106,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
                 color: filters.color === 'Multicolor' ? 'All' : 'Multicolor',
               })
             }
-            className={`min-h-[44px] px-2.5 rounded-xl text-xs font-semibold border flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+            className={`min-h-[44px] lg:min-h-[36px] px-2.5 rounded-xl text-xs font-semibold border flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
               filters.color === 'Multicolor'
                 ? 'bg-slate-900 text-white border-slate-900'
                 : 'bg-white text-slate-800 border-slate-200 hover:border-slate-300'
@@ -126,7 +126,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
                 key={color}
                 type="button"
                 onClick={() => onChange({ ...filters, color: active ? 'All' : color })}
-                className={`min-h-[44px] px-2.5 rounded-xl text-xs font-semibold border flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                className={`min-h-[44px] lg:min-h-[36px] px-2.5 rounded-xl text-xs font-semibold border flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
                   active
                     ? 'bg-slate-900 text-white border-slate-900'
                     : 'bg-white border-slate-200 hover:border-slate-300'
@@ -141,14 +141,14 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Card Type</div>
-        <div className="flex flex-wrap gap-2">
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Card Type</div>
+        <div className="flex flex-wrap gap-1.5">
           {(['All', ...ALL_TYPES] as const).map((t) => (
             <button
               key={t}
               type="button"
               onClick={() => onChange({ ...filters, type: t })}
-              className={`min-h-[44px] px-3.5 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+              className={`min-h-[44px] lg:min-h-[34px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
                 filters.type === t
                   ? 'bg-red-600 text-white border-red-600'
                   : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
@@ -161,14 +161,14 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Cost Bracket</div>
-        <div className="grid grid-cols-5 lg:grid-cols-3 gap-2">
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Cost Bracket</div>
+        <div className="grid grid-cols-5 lg:grid-cols-3 gap-1.5">
           {(['All', '0-2', '3-4', '5-6', '7+'] as const).map((bracket) => (
             <button
               key={bracket}
               type="button"
               onClick={() => onChange({ ...filters, costBracket: bracket })}
-              className={`min-h-[44px] px-2.5 rounded-xl text-xs font-semibold font-mono tabular-nums border transition-colors cursor-pointer ${
+              className={`min-h-[44px] lg:min-h-[34px] px-2 rounded-xl text-xs font-semibold font-mono tabular-nums border transition-colors cursor-pointer ${
                 filters.costBracket === bracket
                   ? 'bg-slate-900 text-white border-slate-900'
                   : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
@@ -181,14 +181,14 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-2">Rarity</div>
-        <div className="flex flex-wrap gap-2">
+        <div className="text-xs font-semibold text-slate-500 mb-1.5">Rarity</div>
+        <div className="flex flex-wrap gap-1.5">
           {(['All', ...ALL_RARITIES] as const).map((r) => (
             <button
               key={r}
               type="button"
               onClick={() => onChange({ ...filters, rarity: r })}
-              className={`min-h-[44px] min-w-[44px] px-3 rounded-xl text-xs font-semibold font-mono border transition-colors cursor-pointer ${
+              className={`min-h-[44px] min-w-[44px] lg:min-h-[32px] lg:min-w-[36px] px-2.5 rounded-xl text-xs font-semibold font-mono border transition-colors cursor-pointer ${
                 filters.rarity === r
                   ? 'bg-slate-900 text-white border-slate-900'
                   : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
@@ -200,16 +200,16 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-2.5">
         <div>
-          <label htmlFor="filter-set" className="block text-xs font-semibold text-slate-500 mb-1.5">
+          <label htmlFor="filter-set" className="block text-xs font-semibold text-slate-500 mb-1">
             Expansion Set
           </label>
           <select
             id="filter-set"
             value={filters.setCode}
             onChange={(e) => onChange({ ...filters, setCode: e.target.value })}
-            className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 bg-white text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
+            className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
             <option value="All">All Sets</option>
             {availableSets.map((s) => (
@@ -221,14 +221,14 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
         </div>
 
         <div>
-          <label htmlFor="filter-keyword" className="block text-xs font-semibold text-slate-500 mb-1.5">
+          <label htmlFor="filter-keyword" className="block text-xs font-semibold text-slate-500 mb-1">
             Keyword / Mechanic
           </label>
           <select
             id="filter-keyword"
             value={filters.keyword}
             onChange={(e) => onChange({ ...filters, keyword: e.target.value })}
-            className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 bg-white text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
+            className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
             <option value="All">All Mechanics</option>
             {availableKeywords.map((kw) => (
@@ -240,7 +240,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
         </div>
 
         <div>
-          <label htmlFor="filter-sort" className="block text-xs font-semibold text-slate-500 mb-1.5">
+          <label htmlFor="filter-sort" className="block text-xs font-semibold text-slate-500 mb-1">
             Sort By
           </label>
           <select
@@ -249,7 +249,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
             onChange={(e) =>
               onChange({ ...filters, sortBy: e.target.value as FilterState['sortBy'] })
             }
-            className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 bg-white text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
+            className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
             <option value="number">Set &amp; Card Number</option>
             <option value="cost-asc">Cost: Low to High</option>
@@ -263,7 +263,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       <button
         type="button"
         onClick={onReset}
-        className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+        className="w-full min-h-[44px] lg:min-h-[38px] px-4 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
       >
         <RotateCcw className="w-3.5 h-3.5" />
         <span>Reset All Filters</span>

@@ -6,12 +6,14 @@ interface CardArtworkProps {
   card: BattleSpiritsCard;
   imageUrl?: string;
   className?: string;
+  fit?: 'cover' | 'contain';
 }
 
 export const CardArtwork: React.FC<CardArtworkProps> = ({
   card,
   imageUrl,
   className = '',
+  fit = 'cover',
 }) => {
   const activeSrc = imageUrl || card.artworkImage;
   const [imgError, setImgError] = useState(false);
@@ -30,9 +32,15 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
           referrerPolicy="no-referrer"
           loading="lazy"
           onError={() => setImgError(true)}
-          className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+          className={
+            fit === 'contain'
+              ? 'w-full h-full object-contain'
+              : 'w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]'
+          }
         />
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
+        {fit === 'cover' && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
+        )}
       </div>
     );
   }
@@ -44,8 +52,8 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
     >
       <svg
         viewBox="0 0 320 240"
-        className="w-full h-full object-cover"
-        preserveAspectRatio="xMidYMid slice"
+        className={`w-full h-full ${fit === 'contain' ? 'object-contain' : 'object-cover'}`}
+        preserveAspectRatio={fit === 'contain' ? 'xMidYMid meet' : 'xMidYMid slice'}
         aria-hidden="true"
       >
         <defs>
@@ -96,7 +104,9 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
           </g>
         )}
       </svg>
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
+      {fit === 'cover' && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
+      )}
     </div>
   );
 };

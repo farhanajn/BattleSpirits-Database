@@ -68,7 +68,7 @@ export interface BattleSpiritsCard {
   setName: string;
   formats: GameFormat[];
   blockIcon: string;
-  restriction?: 'Unlimited' | 'Restricted <1>' | 'Restricted <2>';
+  restriction?: 'Unlimited' | 'Banned' | 'Restricted <1>' | 'Restricted <2>' | 'Restricted <20>';
   isRevival?: boolean;
   isToken?: boolean;
   cost: number;
