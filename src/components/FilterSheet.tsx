@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, RotateCcw } from 'lucide-react';
-import { FilterState, FormatFilter } from '../types/card';
+import { CardRarity, CardType, FilterState, FormatFilter } from '../types/card';
 import { ALL_COLORS, ALL_RARITIES, ALL_TYPES, COLOR_META } from '../data/theme';
 import { SymbolIcon } from './SymbolIcon';
 
@@ -24,6 +24,22 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
   onChange,
   onReset,
 }) => {
+  const toggleType = (target: CardType) => {
+    const exists = filters.type.includes(target);
+    const nextTypes = exists
+      ? filters.type.filter((item) => item !== target)
+      : [...filters.type, target];
+    onChange({ ...filters, type: nextTypes });
+  };
+
+  const toggleRarity = (target: CardRarity) => {
+    const exists = filters.rarity.includes(target);
+    const nextRarities = exists
+      ? filters.rarity.filter((item) => item !== target)
+      : [...filters.rarity, target];
+    onChange({ ...filters, rarity: nextRarities });
+  };
+
   return (
     <div className="space-y-4 lg:space-y-3.5">
       <div>
@@ -141,22 +157,49 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-1.5">Card Type</div>
-        <div className="flex flex-wrap gap-1.5">
-          {(['All', ...ALL_TYPES] as const).map((t) => (
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-xs font-semibold text-slate-500">Card Type</span>
+          {filters.type.length > 0 && (
             <button
-              key={t}
               type="button"
-              onClick={() => onChange({ ...filters, type: t })}
-              className={`min-h-[44px] lg:min-h-[34px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
-                filters.type === t
-                  ? 'bg-red-600 text-white border-red-600'
-                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
-              }`}
+              onClick={() => onChange({ ...filters, type: [] })}
+              className="text-[11px] font-semibold text-red-700 hover:underline cursor-pointer"
             >
-              {t}
+              Clear ({filters.type.length})
             </button>
-          ))}
+          )}
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={() => onChange({ ...filters, type: [] })}
+            aria-pressed={filters.type.length === 0}
+            className={`min-h-[44px] lg:min-h-[34px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+              filters.type.length === 0
+                ? 'bg-red-600 text-white border-red-600'
+                : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+            }`}
+          >
+            All
+          </button>
+          {ALL_TYPES.map((t) => {
+            const selected = filters.type.includes(t);
+            return (
+              <button
+                key={t}
+                type="button"
+                onClick={() => toggleType(t)}
+                aria-pressed={selected}
+                className={`min-h-[44px] lg:min-h-[34px] px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+                  selected
+                    ? 'bg-red-600 text-white border-red-600'
+                    : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+                }`}
+              >
+                {t}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -181,22 +224,49 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 mb-1.5">Rarity</div>
-        <div className="flex flex-wrap gap-1.5">
-          {(['All', ...ALL_RARITIES] as const).map((r) => (
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-xs font-semibold text-slate-500">Rarity</span>
+          {filters.rarity.length > 0 && (
             <button
-              key={r}
               type="button"
-              onClick={() => onChange({ ...filters, rarity: r })}
-              className={`min-h-[44px] min-w-[44px] lg:min-h-[32px] lg:min-w-[36px] px-2.5 rounded-xl text-xs font-semibold font-mono border transition-colors cursor-pointer ${
-                filters.rarity === r
-                  ? 'bg-slate-900 text-white border-slate-900'
-                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
-              }`}
+              onClick={() => onChange({ ...filters, rarity: [] })}
+              className="text-[11px] font-semibold text-red-700 hover:underline cursor-pointer"
             >
-              {r}
+              Clear ({filters.rarity.length})
             </button>
-          ))}
+          )}
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={() => onChange({ ...filters, rarity: [] })}
+            aria-pressed={filters.rarity.length === 0}
+            className={`min-h-[44px] min-w-[44px] lg:min-h-[32px] lg:min-w-[36px] px-2.5 rounded-xl text-xs font-semibold font-mono border transition-colors cursor-pointer ${
+              filters.rarity.length === 0
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+            }`}
+          >
+            All
+          </button>
+          {ALL_RARITIES.map((r) => {
+            const selected = filters.rarity.includes(r);
+            return (
+              <button
+                key={r}
+                type="button"
+                onClick={() => toggleRarity(r)}
+                aria-pressed={selected}
+                className={`min-h-[44px] min-w-[44px] lg:min-h-[32px] lg:min-w-[36px] px-2.5 rounded-xl text-xs font-semibold font-mono border transition-colors cursor-pointer ${
+                  selected
+                    ? 'bg-slate-900 text-white border-slate-900'
+                    : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+                }`}
+              >
+                {r}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -252,6 +322,9 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
             className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
             <option value="number">Set &amp; Card Number</option>
+            <option value="newest">Newest Release</option>
+            <option value="rarity-desc">Highest Rarity</option>
+            <option value="color">Color</option>
             <option value="cost-asc">Cost: Low to High</option>
             <option value="cost-desc">Cost: High to Low</option>
             <option value="bp-desc">Highest Max BP</option>

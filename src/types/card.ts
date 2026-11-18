@@ -127,17 +127,28 @@ export interface Deck {
   entries: DeckEntry[];
 }
 
+export type SortOption =
+  | 'number'
+  | 'newest'
+  | 'rarity-desc'
+  | 'color'
+  | 'cost-asc'
+  | 'cost-desc'
+  | 'bp-desc'
+  | 'name';
+
 export interface FilterState {
   search: string;
+  setQuery: string;
   format: FormatFilter;
   version: 'All' | 'Original' | 'Revival';
   color: ColorFilter;
-  type: CardType | 'All';
-  rarity: CardRarity | 'All';
+  type: CardType[];
+  rarity: CardRarity[];
   setCode: string | 'All';
   costBracket: 'All' | '0-2' | '3-4' | '5-6' | '7+';
   keyword: string | 'All';
-  sortBy: 'number' | 'cost-asc' | 'cost-desc' | 'bp-desc' | 'name';
+  sortBy: SortOption;
 }
 
 export interface KeywordGlossaryItem {

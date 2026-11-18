@@ -1,0 +1,428 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Pillar 3: Reusable Hardened Global Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidColor(c) {
+      return c is string && c.size() <= 20 && c in ['Red', 'Purple', 'White', 'Yellow', 'Green', 'Blue'];
+    }
+
+    function isValidOptionalColor(c) {
+      return c is string && c.size() <= 20 && c in ['', 'Red', 'Purple', 'White', 'Yellow', 'Green', 'Blue'];
+    }
+
+    function isValidFormat(fmt) {
+      return fmt is string && fmt.size() <= 16 && fmt in ['Standard', 'Eternal'];
+    }
+
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.photoURL is string && data.photoURL.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFolder(data, userId, folderId) {
+      return data.keys().hasAll(['id', 'ownerUid', 'name', 'color', 'clientCreatedAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUid', 'name', 'color', 'clientCreatedAt', 'createdAt', 'updatedAt'])
+        && data.id is string && data.id == folderId && isValidId(data.id)
+        && data.ownerUid is string && data.ownerUid == userId && isValidId(data.ownerUid)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && isValidOptionalColor(data.color)
+        && data.clientCreatedAt is string && data.clientCreatedAt.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDeck(data, userId, deckId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'name', 'format', 'archetype',
+          'folderId', 'category', 'clientUpdatedAt', 'entries', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'name', 'format', 'archetype',
+          'folderId', 'category', 'clientUpdatedAt', 'entries', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == deckId && isValidId(data.id)
+        && data.ownerUid is string && data.ownerUid == userId && isValidId(data.ownerUid)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && isValidFormat(data.format)
+        && data.archetype is string && data.archetype.size() <= 100
+        && data.folderId is string && data.folderId.size() <= 128
+        && data.category is string && data.category.size() <= 80
+        && data.clientUpdatedAt is string && data.clientUpdatedAt.size() <= 40
+        && data.entries is list && data.entries.size() <= 100
+        && (
+          data.entries.size() == 0
+          || (
+            data.entries[0] is map
+            && data.entries[0].cardId is string
+            && data.entries[0].cardId.size() >= 1
+            && data.entries[0].cardId.size() <= 128
+            && data.entries[0].quantity is int
+            && data.entries[0].quantity >= 1
+            && data.entries[0].quantity <= 20
+          )
+        )
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBookmark(data, userId, postId) {
+      return data.keys().hasAll(['postId', 'ownerUid', 'createdAt'])
+        && data.keys().hasOnly(['postId', 'ownerUid', 'createdAt'])
+        && data.postId is string && data.postId == postId && isValidId(data.postId)
+        && data.ownerUid is string && data.ownerUid == userId && isValidId(data.ownerUid)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPublicProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'photoURL', 'bio', 'favoriteColor', 'followersCount', 'isPublic', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'bio', 'favoriteColor', 'followersCount', 'isPublic', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 60
+        && data.photoURL is string && data.photoURL.size() <= 500
+        && data.bio is string && data.bio.size() <= 240
+        && isValidColor(data.favoriteColor)
+        && data.followersCount is int && data.followersCount >= 0
+        && data.isPublic is bool && data.isPublic == true
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFollowerDoc(data, targetUid, followerId) {
+      return data.keys().hasAll(['followerUid', 'targetUid', 'createdAt'])
+        && data.keys().hasOnly(['followerUid', 'targetUid', 'createdAt'])
+        && data.followerUid is string && data.followerUid == followerId && isValidId(data.followerUid)
+        && data.targetUid is string && data.targetUid == targetUid && isValidId(data.targetUid)
+        && data.followerUid != data.targetUid
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPost(data, postId) {
+      return data.keys().hasAll([
+          'id', 'authorUid', 'authorName', 'authorPhoto', 'postType', 'title', 'summary',
+          'deckName', 'format', 'archetype', 'primaryColor', 'colors', 'cardCount',
+          'featuredCardId', 'entries', 'eventName', 'eventTier', 'placement', 'record',
+          'mvpCardId', 'mvpCardName', 'tags', 'likesCount', 'commentsCount', 'lastCommentId',
+          'importsCount', 'isPublic', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'authorUid', 'authorName', 'authorPhoto', 'postType', 'title', 'summary',
+          'deckName', 'format', 'archetype', 'primaryColor', 'colors', 'cardCount',
+          'featuredCardId', 'entries', 'eventName', 'eventTier', 'placement', 'record',
+          'mvpCardId', 'mvpCardName', 'tags', 'likesCount', 'commentsCount', 'lastCommentId',
+          'importsCount', 'isPublic', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == postId && isValidId(data.id)
+        && data.authorUid is string && isValidId(data.authorUid)
+        && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 60
+        && data.authorPhoto is string && data.authorPhoto.size() <= 500
+        && data.postType is string && data.postType.size() <= 16 && data.postType in ['deck', 'tournament']
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.summary is string && data.summary.size() <= 2000
+        && data.deckName is string && data.deckName.size() >= 1 && data.deckName.size() <= 100
+        && isValidFormat(data.format)
+        && data.archetype is string && data.archetype.size() <= 100
+        && isValidColor(data.primaryColor)
+        && data.colors is list && data.colors.size() >= 1 && data.colors.size() <= 6
+        && data.colors[0] is string && data.colors[0].size() <= 20
+        && data.cardCount is int && data.cardCount >= 1 && data.cardCount <= 120
+        && data.featuredCardId is string && data.featuredCardId.size() <= 128
+        && data.entries is list && data.entries.size() >= 1 && data.entries.size() <= 100
+        && data.entries[0] is map
+        && data.entries[0].cardId is string
+        && data.entries[0].cardId.size() >= 1
+        && data.entries[0].cardId.size() <= 128
+        && data.entries[0].quantity is int
+        && data.entries[0].quantity >= 1
+        && data.entries[0].quantity <= 20
+        && data.eventName is string && data.eventName.size() <= 120
+        && data.eventTier is string && data.eventTier.size() <= 32 && data.eventTier in ['', 'Local Store', 'SB (Shop Battle)', 'CS (Championship)', 'Area Qualifier', 'National']
+        && data.placement is string && data.placement.size() <= 24 && data.placement in ['', '1st Place', '2nd Place', 'Top 4', 'Top 8', 'Top 16', 'Participant']
+        && data.record is string && data.record.size() <= 24
+        && data.mvpCardId is string && data.mvpCardId.size() <= 128
+        && data.mvpCardName is string && data.mvpCardName.size() <= 120
+        && data.tags is list && data.tags.size() <= 6
+        && (data.tags.size() == 0 || (data.tags[0] is string && data.tags[0].size() <= 32))
+        && data.likesCount is int && data.likesCount >= 0
+        && data.commentsCount is int && data.commentsCount >= 0
+        && data.lastCommentId is string && data.lastCommentId.size() <= 128
+        && data.importsCount is int && data.importsCount >= 0
+        && data.isPublic is bool && data.isPublic == true
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLike(data, postId, userId) {
+      return data.keys().hasAll(['userId', 'postId', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'postId', 'createdAt'])
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.postId is string && data.postId == postId && isValidId(data.postId)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidComment(data, postId, commentId) {
+      return data.keys().hasAll(['id', 'postId', 'authorUid', 'authorName', 'authorPhoto', 'text', 'createdAt'])
+        && data.keys().hasOnly(['id', 'postId', 'authorUid', 'authorName', 'authorPhoto', 'text', 'createdAt'])
+        && data.id is string && data.id == commentId && isValidId(data.id)
+        && data.postId is string && data.postId == postId && isValidId(data.postId)
+        && data.authorUid is string && isValidId(data.authorUid)
+        && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 60
+        && data.authorPhoto is string && data.authorPhoto.size() <= 500
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 500
+        && data.createdAt is timestamp;
+    }
+
+    // --- 1. Private User Account (PII Isolated) & Cloud Decks/Folders/Bookmarks ---
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isVerified() && isOwner(userId) && isValidId(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isOwner(userId) && isValidId(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'email', 'updatedAt']);
+      allow delete: if false;
+
+      match /folders/{folderId} {
+        allow get: if isValidId(userId) && isValidId(folderId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(folderId)
+          && isValidFolder(incoming(), userId, folderId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(folderId)
+          && isValidFolder(incoming(), userId, folderId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'color', 'updatedAt']);
+        allow delete: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(folderId);
+      }
+
+      match /decks/{deckId} {
+        allow get: if isValidId(userId) && isValidId(deckId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(deckId)
+          && isValidDeck(incoming(), userId, deckId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(deckId)
+          && isValidDeck(incoming(), userId, deckId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'format', 'archetype', 'folderId', 'category', 'clientUpdatedAt', 'entries', 'updatedAt'
+          ]);
+        allow delete: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(deckId);
+      }
+
+      match /bookmarks/{postId} {
+        allow get: if isValidId(userId) && isValidId(postId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(postId)
+          && isValidBookmark(incoming(), userId, postId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/posts/$(postId));
+        allow update: if false;
+        allow delete: if isVerified() && isOwner(userId) && isValidId(userId) && isValidId(postId);
+      }
+    }
+
+    // --- 2. Public Builder Profiles & Followers (Zero PII) ---
+    match /publicProfiles/{userId} {
+      allow get: if isValidId(userId) && existing().isPublic == true;
+      allow list: if existing().isPublic == true;
+      allow create: if isVerified() && isOwner(userId) && isValidId(userId)
+        && isValidPublicProfile(incoming(), userId)
+        && incoming().followersCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(userId) && isValidPublicProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Tier 1: Profile owner edits bio/display info
+          (
+            isOwner(userId)
+            && incoming().followersCount == existing().followersCount
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'favoriteColor', 'updatedAt'])
+          )
+          ||
+          // Tier 2a: Atomic Follow increment (+1 backed by followers/{uid} create)
+          (
+            request.auth.uid != userId
+            && incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'updatedAt'])
+            && incoming().followersCount == existing().followersCount + 1
+            && !exists(/databases/$(database)/documents/publicProfiles/$(userId)/followers/$(request.auth.uid))
+            && existsAfter(/databases/$(database)/documents/publicProfiles/$(userId)/followers/$(request.auth.uid))
+          )
+          ||
+          // Tier 2b: Atomic Unfollow decrement (-1 backed by followers/{uid} delete)
+          (
+            request.auth.uid != userId
+            && incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'updatedAt'])
+            && incoming().followersCount == existing().followersCount - 1
+            && existing().followersCount >= 1
+            && exists(/databases/$(database)/documents/publicProfiles/$(userId)/followers/$(request.auth.uid))
+            && !existsAfter(/databases/$(database)/documents/publicProfiles/$(userId)/followers/$(request.auth.uid))
+          )
+        );
+      allow delete: if false;
+
+      match /followers/{followerId} {
+        allow get: if isValidId(userId) && isValidId(followerId) && isSignedIn();
+        allow list: if existing().targetUid == userId;
+        allow create: if isVerified() && isOwner(followerId) && isValidId(userId) && isValidId(followerId)
+          && isValidFollowerDoc(incoming(), userId, followerId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/publicProfiles/$(userId))
+          && getAfter(/databases/$(database)/documents/publicProfiles/$(userId)).data.followersCount
+             == get(/databases/$(database)/documents/publicProfiles/$(userId)).data.followersCount + 1;
+        allow update: if false;
+        allow delete: if isVerified() && isOwner(followerId) && isValidId(userId) && isValidId(followerId)
+          && getAfter(/databases/$(database)/documents/publicProfiles/$(userId)).data.followersCount
+             == get(/databases/$(database)/documents/publicProfiles/$(userId)).data.followersCount - 1;
+      }
+    }
+
+    // --- 3. Public Community Deck & Tournament Feed ---
+    match /posts/{postId} {
+      allow get: if isValidId(postId) && existing().isPublic == true;
+      allow list: if existing().isPublic == true;
+      allow create: if isVerified() && isValidId(postId)
+        && isValidPost(incoming(), postId)
+        && incoming().authorUid == request.auth.uid
+        && incoming().likesCount == 0
+        && incoming().commentsCount == 0
+        && incoming().lastCommentId == ''
+        && incoming().importsCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(postId) && isValidPost(incoming(), postId)
+        && incoming().id == existing().id
+        && incoming().authorUid == existing().authorUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Tier 1: Post author edits details
+          (
+            existing().authorUid == request.auth.uid
+            && incoming().likesCount == existing().likesCount
+            && incoming().commentsCount == existing().commentsCount
+            && incoming().lastCommentId == existing().lastCommentId
+            && incoming().importsCount == existing().importsCount
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'summary', 'eventName', 'eventTier', 'placement', 'record',
+              'mvpCardId', 'mvpCardName', 'tags', 'updatedAt'
+            ])
+          )
+          ||
+          // Tier 2a: Atomic Like (+1)
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'updatedAt'])
+            && incoming().likesCount == existing().likesCount + 1
+            && !exists(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
+            && existsAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
+          )
+          ||
+          // Tier 2b: Atomic Unlike (-1)
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'updatedAt'])
+            && incoming().likesCount == existing().likesCount - 1
+            && existing().likesCount >= 1
+            && exists(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
+            && !existsAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
+          )
+          ||
+          // Tier 2c: Atomic Comment increment (+1 backed by comments/{lastCommentId} create)
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['commentsCount', 'lastCommentId', 'updatedAt'])
+            && incoming().commentsCount == existing().commentsCount + 1
+            && isValidId(incoming().lastCommentId)
+            && !exists(/databases/$(database)/documents/posts/$(postId)/comments/$(incoming().lastCommentId))
+            && existsAfter(/databases/$(database)/documents/posts/$(postId)/comments/$(incoming().lastCommentId))
+          )
+          ||
+          // Tier 2d: Increment importsCount (+1)
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['importsCount', 'updatedAt'])
+            && incoming().importsCount == existing().importsCount + 1
+          )
+        );
+      allow delete: if isVerified() && isValidId(postId) && existing().authorUid == request.auth.uid;
+
+      match /likes/{userId} {
+        allow get: if isValidId(postId) && isValidId(userId) && isSignedIn();
+        allow list: if existing().postId == postId;
+        allow create: if isVerified() && isOwner(userId) && isValidId(postId) && isValidId(userId)
+          && isValidLike(incoming(), postId, userId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/posts/$(postId))
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.likesCount
+             == get(/databases/$(database)/documents/posts/$(postId)).data.likesCount + 1;
+        allow update: if false;
+        allow delete: if isVerified() && isOwner(userId) && isValidId(postId) && isValidId(userId)
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.likesCount
+             == get(/databases/$(database)/documents/posts/$(postId)).data.likesCount - 1;
+      }
+
+      match /comments/{commentId} {
+        allow get: if isValidId(postId) && isValidId(commentId) && exists(/databases/$(database)/documents/posts/$(postId));
+        allow list: if existing().postId == postId;
+        allow create: if isVerified() && isValidId(postId) && isValidId(commentId)
+          && isValidComment(incoming(), postId, commentId)
+          && incoming().authorUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/posts/$(postId))
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.commentsCount
+             == get(/databases/$(database)/documents/posts/$(postId)).data.commentsCount + 1
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.lastCommentId == commentId;
+        allow update: if false;
+        allow delete: if isVerified() && isValidId(postId) && isValidId(commentId)
+          && existing().authorUid == request.auth.uid;
+      }
+    }
+  }
+}

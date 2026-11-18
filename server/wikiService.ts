@@ -2638,6 +2638,68 @@ export async function hydrateWikiCardsBatch(
   });
 }
 
+function toWikiTitleCase(raw: string): string {
+  return raw
+    .trim()
+    .split(/\s+/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ''))
+    .join(' ');
+}
+
+function findMatchingSetCodesForQuery(rawQuery: string): string[] {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return [];
+  const compactUpper = trimmed.toUpperCase().replace(/[\s-]+/g, '');
+  const matches: string[] = [];
+  const pushIfValid = (code: string) => {
+    const upper = code.toUpperCase();
+    if (DIRECTORY_MAP.has(upper) && !matches.includes(upper)) {
+      matches.push(upper);
+    }
+  };
+
+  // Direct set code match (e.g. "bs 70" -> "BS70", "sd43" -> "SD43", "26rbs01" -> "26RBS01")
+  pushIfValid(compactUpper);
+
+  // Set code stripped of optional prefix like "SET BS70" -> "BS70"
+  const setTokenMatch = trimmed.match(/\b([A-Za-z0-9]{2,4}[\s-]*\d{2})\b/);
+  if (setTokenMatch) {
+    pushIfValid(setTokenMatch[1].replace(/[\s-]+/g, ''));
+  }
+
+  // Pure numeric query like "70", "43", "12" (or "set 43") -> match BS/SD/CB/BSC/PB/PC sets
+  const numOnly = trimmed.match(/^(?:set\s*)?(\d{1,2})$/i);
+  if (numOnly) {
+    const num = numOnly[1].padStart(2, '0');
+    const candidatePrefixes = ['BS', 'SD', 'CB', 'BSC', 'PB', 'PC', '26RBS', '26RSD'];
+    for (const prefix of candidatePrefixes) {
+      pushIfValid(`${prefix}${num}`);
+      if (matches.length >= 3) break;
+    }
+  }
+
+  return matches.slice(0, 3);
+}
+
+async function fetchCategoryMemberTitles(categoryName: string): Promise<string[]> {
+  try {
+    const json = (await fetchWikiJson({
+      action: 'query',
+      list: 'categorymembers',
+      cmtitle: `Category:${categoryName}`,
+      cmlimit: '120',
+      cmnamespace: '0',
+    })) as {
+      query?: { categorymembers?: { title: string }[] };
+    };
+    return (json.query?.categorymembers || [])
+      .map((m) => m.title)
+      .filter((t) => Boolean(t && !t.includes('/')));
+  } catch {
+    return [];
+  }
+}
+
 export async function searchWikiCards(
   query: string,
   formatFilter: 'All' | 'Standard' | 'Eternal' = 'All'
@@ -2645,27 +2707,88 @@ export async function searchWikiCards(
   const trimmed = query.trim();
   if (!trimmed) return [];
 
-  const [, json] = await Promise.all([
-    ensureBanListLoaded(),
+  await ensureBanListLoaded();
+
+  const results: BattleSpiritsCard[] = [];
+  const seenKeys = new Set<string>();
+  const pushCard = (card: BattleSpiritsCard) => {
+    const dedupeKey = `${card.cardNumber.toUpperCase()}|${card.isRevival ? 'rv' : 'orig'}`;
+    const altNameKey = !card.isRevival
+      ? `orig-name:${card.name.trim().toLowerCase()}`
+      : `rv-name:${card.name.trim().toLowerCase()}`;
+
+    if (seenKeys.has(dedupeKey) || seenKeys.has(altNameKey)) return;
+    seenKeys.add(dedupeKey);
+    seenKeys.add(altNameKey);
+
+    if (formatFilter === 'All' || card.formats.includes(formatFilter)) {
+      results.push(card);
+    }
+  };
+
+  // 1. If query corresponds to one or more expansion set codes (e.g. "bs 70", "43", "12"), load full set rosters
+  const matchedSets = findMatchingSetCodesForQuery(trimmed);
+  if (matchedSets.length > 0) {
+    const setBundles = await Promise.all(
+      matchedSets.map((code) => getWikiSet(code, 500).catch(() => null))
+    );
+    for (const bundle of setBundles) {
+      if (!bundle) continue;
+      for (const c of bundle.cards) {
+        pushCard(c);
+      }
+    }
+    if (results.length > 0 && (/^[A-Za-z0-9\s-]{2,10}$/.test(trimmed) && /\d/.test(trimmed))) {
+      return results;
+    }
+  }
+
+  // 2. General / Family / Keyword Wiki search: combine multi-page full-text search + exact Wiki Category lookup
+  const titleQuery = toWikiTitleCase(trimmed);
+  const categoryCandidates = Array.from(
+    new Set([
+      titleQuery,
+      `${titleQuery} Cards`,
+      `Cards with ${titleQuery}`,
+    ])
+  );
+
+  const [searchPage1, searchPage2, ...categoryLists] = await Promise.all([
     fetchWikiJson({
       action: 'query',
       list: 'search',
       srsearch: trimmed,
-      srlimit: '20',
-    }) as Promise<{
-      query?: { search?: { title: string }[] };
-    }>,
+      srlimit: '50',
+    }).catch(() => ({})) as Promise<{ query?: { search?: { title: string }[] } }>,
+    trimmed.length >= 3
+      ? (fetchWikiJson({
+          action: 'query',
+          list: 'search',
+          srsearch: trimmed,
+          srlimit: '50',
+          sroffset: '50',
+        }).catch(() => ({})) as Promise<{ query?: { search?: { title: string }[] } }>)
+      : Promise.resolve({} as { query?: { search?: { title: string }[] } }),
+    ...categoryCandidates.map((cat) => fetchCategoryMemberTitles(cat)),
   ]);
 
-  const titles = (json.query?.search || [])
-    .map((s) => s.title)
-    .filter((t) => !t.includes('/'));
+  const titleSet = new Set<string>();
+  for (const list of categoryLists) {
+    for (const t of list) {
+      if (t && !t.includes('/')) titleSet.add(t);
+    }
+  }
+  for (const item of searchPage1.query?.search || []) {
+    if (item.title && !item.title.includes('/')) titleSet.add(item.title);
+  }
+  for (const item of searchPage2.query?.search || []) {
+    if (item.title && !item.title.includes('/')) titleSet.add(item.title);
+  }
 
-  if (titles.length === 0) return [];
+  const titles = Array.from(titleSet).slice(0, 120);
+  if (titles.length === 0) return results;
 
   const contents = await batchFetchWikiPages(titles);
-  const results: BattleSpiritsCard[] = [];
-  const seenKeys = new Set<string>();
 
   for (const title of titles) {
     const bundle = contents.get(title);
@@ -2740,18 +2863,7 @@ export async function searchWikiCards(
         bundle?.pageImages || [],
         vBlock
       );
-      const dedupeKey = `${hydrated.cardNumber.toUpperCase()}|${hydrated.isRevival ? 'rv' : 'orig'}`;
-      const altNameKey = !hydrated.isRevival
-        ? `orig-name:${hydrated.name.trim().toLowerCase()}`
-        : `rv-name:${hydrated.name.trim().toLowerCase()}`;
-
-      if (seenKeys.has(dedupeKey) || seenKeys.has(altNameKey)) continue;
-      seenKeys.add(dedupeKey);
-      seenKeys.add(altNameKey);
-
-      if (formatFilter === 'All' || hydrated.formats.includes(formatFilter)) {
-        results.push(hydrated);
-      }
+      pushCard(hydrated);
     }
   }
 

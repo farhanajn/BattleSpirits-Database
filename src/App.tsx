@@ -2,16 +2,16 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Search,
   SlidersHorizontal,
-  BookOpen,
   Layers,
   Grid,
   X,
   Loader2,
-  Globe,
   Share2,
   AlertTriangle,
   Ban,
+  Settings,
 } from 'lucide-react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   BATTLE_SPIRITS_CARDS,
   PRESET_DECKS,
@@ -32,22 +32,33 @@ import {
   FormatFilter,
   GameFormat,
   ProductSet,
+  SortOption,
 } from './types/card';
 import { SymbolIcon } from './components/SymbolIcon';
 import { CardThumbnail } from './components/CardThumbnail';
 import { CardDetailSheet } from './components/CardDetailSheet';
 import { FilterControls, FilterSheet } from './components/FilterSheet';
 import { DeckBuilderView } from './components/DeckBuilderView';
-import { RulingsView } from './components/RulingsView';
+import { SettingsView } from './components/SettingsView';
 import { CatalogMenuView } from './components/CatalogMenuView';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { OfflineIndicator, PWAInstallButton } from './components/PWAControls';
+import { OfflineIndicator } from './components/PWAControls';
+import { auth, signInWithGoogle, signOutGoogle } from './firebase';
+import type { PublicBuilderProfile } from './types/social';
+import {
+  deleteCloudDeck,
+  deleteCloudFolder,
+  fetchPublicProfiles,
+  fetchUserCloudLibrary,
+  syncAllDecksAndFoldersToCloud,
+  syncUserAccountsOnSignIn,
+  updatePublicProfileBio,
+} from './utils/cloudSync';
 import { getMaxCardCopies, isTokenCard } from './utils/cardRules';
 import { decodeSharedDeck, SharedDeckPayload } from './utils/deckShare';
 import {
   buildImportedDeckEntries,
   compactCardNumber,
-  extractSetCodeFromCardNumber,
   normalizeCardName,
   normalizeCardNumber,
 } from './utils/decklistImport';
@@ -57,7 +68,7 @@ import {
   saveOfflineMeta,
 } from './utils/offlineCardStore';
 
-type AppTab = 'catalog' | 'search' | 'decks' | 'rules';
+type AppTab = 'catalog' | 'search' | 'decks' | 'settings';
 
 type CardRestrictionValue = NonNullable<BattleSpiritsCard['restriction']>;
 
@@ -69,18 +80,19 @@ interface BanListSnapshot {
 
 const INITIAL_FILTERS: FilterState = {
   search: '',
+  setQuery: '',
   format: 'All',
   version: 'All',
   color: 'All',
-  type: 'All',
-  rarity: 'All',
+  type: [],
+  rarity: [],
   setCode: 'All',
   costBracket: 'All',
   keyword: 'All',
   sortBy: 'number',
 };
 
-const VALID_TABS: AppTab[] = ['catalog', 'search', 'decks', 'rules'];
+const VALID_TABS: AppTab[] = ['catalog', 'search', 'decks', 'settings'];
 const VALID_FORMATS: FormatFilter[] = ['All', 'Standard', 'Eternal'];
 const VALID_VERSIONS: FilterState['version'][] = ['All', 'Original', 'Revival'];
 const VALID_COLORS: ColorFilter[] = [
@@ -93,16 +105,14 @@ const VALID_COLORS: ColorFilter[] = [
   'Yellow',
   'Blue',
 ];
-const VALID_TYPES: (CardType | 'All')[] = [
-  'All',
+const VALID_TYPES: CardType[] = [
   'Spirit',
   'Ultimate',
   'Brave',
   'Nexus',
   'Magic',
 ];
-const VALID_RARITIES: (CardRarity | 'All')[] = [
-  'All',
+const VALID_RARITIES: CardRarity[] = [
   'C',
   'U',
   'R',
@@ -117,13 +127,135 @@ const VALID_RARITIES: (CardRarity | 'All')[] = [
   'P',
 ];
 const VALID_COSTS: FilterState['costBracket'][] = ['All', '0-2', '3-4', '5-6', '7+'];
-const VALID_SORTS: FilterState['sortBy'][] = [
+const VALID_SORTS: SortOption[] = [
   'number',
+  'newest',
+  'rarity-desc',
+  'color',
   'cost-asc',
   'cost-desc',
   'bp-desc',
   'name',
 ];
+
+const RARITY_RANK: Record<string, number> = {
+  XX: 12,
+  XV: 11,
+  CX: 10,
+  AX: 9,
+  NX: 8,
+  TX: 7,
+  X: 6,
+  M: 5,
+  R: 4,
+  P: 3,
+  U: 2,
+  C: 1,
+};
+
+const COLOR_SORT_ORDER: Record<string, number> = {
+  Red: 1,
+  Purple: 2,
+  Green: 3,
+  White: 4,
+  Yellow: 5,
+  Blue: 6,
+};
+
+const MONTH_INDEX: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+function computeSetReleaseRank(s: ProductSet, idx: number, total: number): number {
+  const rd = (s.releaseDate || '').trim();
+  const ym = rd.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})\b/i);
+  if (ym) {
+    const year = Number(ym[2]);
+    const mon = MONTH_INDEX[ym[1].slice(0, 3).toLowerCase()] || 6;
+    return year * 10000 + mon * 100 + Math.max(0, total - idx);
+  }
+  const iso = rd.match(/\b(\d{4})-(\d{2})(?:-(\d{2}))?\b/);
+  if (iso) {
+    return Number(iso[1]) * 10000 + Number(iso[2]) * 100 + Math.max(0, total - idx);
+  }
+  const yOnly = rd.match(/\b(20\d{2})\b/);
+  if (yOnly) {
+    return Number(yOnly[1]) * 10000 + 600 + Math.max(0, total - idx);
+  }
+
+  // Estimate chronological era from setCode when explicit releaseDate lacks year
+  const code = s.setCode.toUpperCase();
+  if (/^26R/.test(code)) return 20260400 + Math.max(0, total - idx);
+  const bsM = code.match(/^BS(\d{2})$/);
+  if (bsM) {
+    const num = Number(bsM[1]);
+    return (200800 + Math.round((num / 77) * 1800)) * 100 + Math.max(0, total - idx);
+  }
+  const sdM = code.match(/^SD(\d{2})$/);
+  if (sdM) {
+    const num = Number(sdM[1]);
+    return (200800 + Math.round((num / 70) * 1800)) * 100 + Math.max(0, total - idx);
+  }
+  const cbM = code.match(/^CB(\d{2})$/);
+  if (cbM) {
+    const num = Number(cbM[1]);
+    return (201700 + Math.round((num / 35) * 900)) * 100 + Math.max(0, total - idx);
+  }
+  const bscM = code.match(/^BSC(\d{2})$/);
+  if (bscM) {
+    const num = Number(bscM[1]);
+    return (200900 + Math.round((num / 51) * 1700)) * 100 + Math.max(0, total - idx);
+  }
+  return 20150000 + Math.max(0, total - idx);
+}
+
+interface SearchSetIntent {
+  exactSetCode?: string;
+  paddedSetNum?: string;
+}
+
+function resolveSearchSetIntent(
+  rawQuery: string,
+  knownSetCodes: Set<string>
+): SearchSetIntent | null {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return null;
+
+  const numOnly = q.match(/^(?:set\s*)?(\d{1,2})$/i);
+  if (numOnly) {
+    return { paddedSetNum: numOnly[1].padStart(2, '0') };
+  }
+
+  const stripped = q.replace(/^set\s+/i, '').trim();
+  const compact = stripped.replace(/[\s-]+/g, '').toUpperCase();
+
+  // Normalize single-digit prefixes like "BS 1" -> "BS01", "SD 1" -> "SD01"
+  const shortCodeMatch = compact.match(/^(BS|SD|CB|BSC|PB|PC|RP|PX)(\d{1})$/);
+  const candidate = shortCodeMatch
+    ? `${shortCodeMatch[1]}0${shortCodeMatch[2]}`
+    : compact;
+
+  if (knownSetCodes.has(candidate)) {
+    return { exactSetCode: candidate };
+  }
+  return null;
+}
+
+function getCardNumberPrefix(cardNumber: string): string {
+  const m = (cardNumber || '').trim().match(/^([A-Z0-9]+)-/i);
+  return m ? m[1].toUpperCase() : '';
+}
 
 function parseStateFromUrl(): {
   tab: AppTab;
@@ -137,10 +269,11 @@ function parseStateFromUrl(): {
   const rawShare = params.get('share');
   const sharedDeck = rawShare ? decodeSharedDeck(rawShare) : null;
 
-  const rawTab = params.get('tab') as AppTab | null;
+  const rawTabParam = params.get('tab');
+  const mappedTab = rawTabParam === 'rules' ? 'settings' : (rawTabParam as AppTab | null);
   const tab: AppTab =
-    rawTab && VALID_TABS.includes(rawTab)
-      ? rawTab
+    mappedTab && VALID_TABS.includes(mappedTab)
+      ? mappedTab
       : sharedDeck
       ? 'decks'
       : 'catalog';
@@ -148,21 +281,35 @@ function parseStateFromUrl(): {
   const rawFmt = params.get('fmt') as FormatFilter | null;
   const rawVer = params.get('ver') as FilterState['version'] | null;
   const rawColor = params.get('color') as ColorFilter | null;
-  const rawType = params.get('type') as (CardType | 'All') | null;
-  const rawRarity = params.get('rarity') as (CardRarity | 'All') | null;
+  const rawType = params.get('type');
+  const rawRarity = params.get('rarity');
   const rawCost = params.get('cost') as FilterState['costBracket'] | null;
-  const rawSort = params.get('sort') as FilterState['sortBy'] | null;
+  const rawSort = params.get('sort') as SortOption | null;
+
+  const parsedTypes = rawType
+    ? rawType
+        .split(',')
+        .map((t) => t.trim())
+        .filter((t): t is CardType => VALID_TYPES.includes(t as CardType))
+    : [];
+  const parsedRarities = rawRarity
+    ? rawRarity
+        .split(',')
+        .map((r) => r.trim())
+        .filter((r): r is CardRarity => VALID_RARITIES.includes(r as CardRarity))
+    : [];
 
   return {
     tab,
     sharedDeck,
     filters: {
       search: params.get('q') || '',
+      setQuery: params.get('setq') || '',
       format: rawFmt && VALID_FORMATS.includes(rawFmt) ? rawFmt : 'All',
       version: rawVer && VALID_VERSIONS.includes(rawVer) ? rawVer : 'All',
       color: rawColor && VALID_COLORS.includes(rawColor) ? rawColor : 'All',
-      type: rawType && VALID_TYPES.includes(rawType) ? rawType : 'All',
-      rarity: rawRarity && VALID_RARITIES.includes(rawRarity) ? rawRarity : 'All',
+      type: parsedTypes,
+      rarity: parsedRarities,
       setCode: params.get('set') || 'All',
       costBracket: rawCost && VALID_COSTS.includes(rawCost) ? rawCost : 'All',
       keyword: params.get('kw') || 'All',
@@ -177,12 +324,13 @@ function buildUrlSearch(tab: AppTab, filters: FilterState): string {
   if (filters.format !== 'All') params.set('fmt', filters.format);
   if (filters.version !== 'All') params.set('ver', filters.version);
   if (filters.color !== 'All') params.set('color', filters.color);
-  if (filters.type !== 'All') params.set('type', filters.type);
-  if (filters.rarity !== 'All') params.set('rarity', filters.rarity);
+  if (filters.type.length > 0) params.set('type', filters.type.join(','));
+  if (filters.rarity.length > 0) params.set('rarity', filters.rarity.join(','));
   if (filters.setCode !== 'All') params.set('set', filters.setCode);
   if (filters.costBracket !== 'All') params.set('cost', filters.costBracket);
   if (filters.keyword !== 'All') params.set('kw', filters.keyword);
   if (filters.sortBy !== 'number') params.set('sort', filters.sortBy);
+  if (filters.setQuery) params.set('setq', filters.setQuery);
   if (filters.search) params.set('q', filters.search);
   const str = params.toString();
   return str ? `?${str}` : '';
@@ -277,10 +425,12 @@ function mergeCardsIntoMap(
     banList?: BanListSnapshot | null;
     forceRevival?: boolean;
     forceToken?: boolean;
+    preferExisting?: boolean;
   }
 ): { next: Record<string, BattleSpiritsCard>; addedCount: number } {
   const next = { ...prev };
   const keyToId = new Map<string, string>();
+  const productSetByCode = new Map(PRODUCT_SETS.map((s) => [s.setCode.toUpperCase(), s]));
 
   const indexCard = (c: BattleSpiritsCard) => {
     const ver = c.isRevival ? 'rv' : 'orig';
@@ -306,11 +456,33 @@ function mergeCardsIntoMap(
   let addedCount = 0;
 
   for (const rawCard of incomingCards) {
-    const c = sanitizeCardTextTemplates(rawCard);
+    let c = sanitizeCardTextTemplates(rawCard);
     const isRev = options?.forceRevival ?? Boolean(c.isRevival);
     const ver = isRev ? 'rv' : 'orig';
     const normNum = normalizeCardNumber(c.cardNumber || '');
     const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
+
+    // Self-heal cross-set Booster reprint attribution if incoming cache had misattributed setCode
+    const prefix = getCardNumberPrefix(c.cardNumber || '');
+    if (prefix && prefix !== (c.setCode || '').toUpperCase() && !isRev) {
+      const curSet = productSetByCode.get((c.setCode || '').toUpperCase());
+      const prefixSet = productSetByCode.get(prefix);
+      if (
+        prefixSet &&
+        curSet?.category === 'Booster' &&
+        (prefixSet.category === 'Booster' ||
+          prefixSet.category === 'Standard Booster' ||
+          prefixSet.category === 'Standard Starter')
+      ) {
+        c = {
+          ...c,
+          setCode: prefixSet.setCode,
+          setName: prefixSet.name,
+          blockIcon: prefixSet.blockLabel || c.blockIcon,
+          formats: prefixSet.formats.length > 0 ? prefixSet.formats : c.formats,
+        };
+      }
+    }
 
     let targetId = next[c.id] ? c.id : undefined;
     if (!targetId && normNum && normNum !== 'WIKI') {
@@ -327,54 +499,57 @@ function mergeCardsIntoMap(
     const existing = next[targetId];
     if (!existing) addedCount++;
 
+    const primary = options?.preferExisting && existing ? existing : c;
+    const secondary = options?.preferExisting && existing ? c : existing;
+
     const merged: BattleSpiritsCard = {
-      ...(existing || {}),
-      ...c,
+      ...(secondary || {}),
+      ...primary,
       id: targetId,
-      name: c.name || existing?.name || c.cardNumber || targetId,
-      jpName: c.jpName || existing?.jpName || '',
-      cardNumber: c.cardNumber || existing?.cardNumber || 'WIKI',
-      setCode: c.setCode || existing?.setCode || 'BS01',
-      setName: c.setName || existing?.setName || 'Battle Spirits',
-      color: c.color && COLOR_META[c.color] ? c.color : existing?.color || 'Red',
-      cost: Number.isFinite(Number(c.cost)) ? Number(c.cost) : existing?.cost ?? 0,
-      rarity: c.rarity || existing?.rarity || 'C',
+      name: primary.name || secondary?.name || c.cardNumber || targetId,
+      jpName: primary.jpName || secondary?.jpName || '',
+      cardNumber: primary.cardNumber || secondary?.cardNumber || 'WIKI',
+      setCode: primary.setCode || secondary?.setCode || 'BS01',
+      setName: primary.setName || secondary?.setName || 'Battle Spirits',
+      color: primary.color && COLOR_META[primary.color] ? primary.color : secondary?.color || 'Red',
+      cost: Number.isFinite(Number(primary.cost)) ? Number(primary.cost) : secondary?.cost ?? 0,
+      rarity: primary.rarity || secondary?.rarity || 'C',
       formats:
-        Array.isArray(c.formats) && c.formats.length > 0
-          ? c.formats
-          : Array.isArray(existing?.formats) && existing.formats.length > 0
-          ? existing.formats
+        Array.isArray(primary.formats) && primary.formats.length > 0
+          ? primary.formats
+          : Array.isArray(secondary?.formats) && secondary.formats.length > 0
+          ? secondary.formats
           : ['Eternal'],
-      type: c.type || existing?.type || 'Spirit',
-      subtypeLabel: c.subtypeLabel ?? existing?.subtypeLabel,
+      type: primary.type || secondary?.type || 'Spirit',
+      subtypeLabel: primary.subtypeLabel ?? secondary?.subtypeLabel,
       isRevival: isRev,
-      isToken: options?.forceToken ?? c.isToken ?? existing?.isToken,
-      colors: c.colors && c.colors.length > 0 ? c.colors : existing?.colors,
-      families: c.families && c.families.length > 0 ? c.families : existing?.families || [],
-      levels: c.levels && c.levels.length > 0 ? c.levels : existing?.levels,
-      braveCondition: c.braveCondition ?? existing?.braveCondition,
-      braveBonusBp: c.braveBonusBp ?? existing?.braveBonusBp,
-      summonCondition: c.summonCondition ?? existing?.summonCondition,
+      isToken: options?.forceToken ?? primary.isToken ?? secondary?.isToken,
+      colors: primary.colors && primary.colors.length > 0 ? primary.colors : secondary?.colors,
+      families: primary.families && primary.families.length > 0 ? primary.families : secondary?.families || [],
+      levels: primary.levels && primary.levels.length > 0 ? primary.levels : secondary?.levels,
+      braveCondition: primary.braveCondition ?? secondary?.braveCondition,
+      braveBonusBp: primary.braveBonusBp ?? secondary?.braveBonusBp,
+      summonCondition: primary.summonCondition ?? secondary?.summonCondition,
       symbols:
-        c.symbols && Object.keys(c.symbols).length > 0
-          ? c.symbols
-          : existing?.symbols || {},
+        primary.symbols && Object.keys(primary.symbols).length > 0
+          ? primary.symbols
+          : secondary?.symbols || {},
       reduction:
-        c.reduction && Object.keys(c.reduction).length > 0
-          ? c.reduction
-          : existing?.reduction || {},
-      effects: c.effects && c.effects.length > 0 ? c.effects : existing?.effects || [],
-      keywords: c.keywords && c.keywords.length > 0 ? c.keywords : existing?.keywords || [],
-      flavorText: c.flavorText || existing?.flavorText || '',
-      illustrator: c.illustrator || existing?.illustrator || '',
-      artworkImage: c.artworkImage || existing?.artworkImage || '',
+        primary.reduction && Object.keys(primary.reduction).length > 0
+          ? primary.reduction
+          : secondary?.reduction || {},
+      effects: primary.effects && primary.effects.length > 0 ? primary.effects : secondary?.effects || [],
+      keywords: primary.keywords && primary.keywords.length > 0 ? primary.keywords : secondary?.keywords || [],
+      flavorText: primary.flavorText || secondary?.flavorText || '',
+      illustrator: primary.illustrator || secondary?.illustrator || '',
+      artworkImage: primary.artworkImage || secondary?.artworkImage || '',
       galleryImages:
-        c.galleryImages && c.galleryImages.length > 0
-          ? c.galleryImages
-          : existing?.galleryImages,
-      rulings: c.rulings && c.rulings.length > 0 ? c.rulings : existing?.rulings || [],
-      wikiTitle: c.wikiTitle || existing?.wikiTitle,
-      isWikiLoaded: Boolean(c.isWikiLoaded || existing?.isWikiLoaded),
+        primary.galleryImages && primary.galleryImages.length > 0
+          ? primary.galleryImages
+          : secondary?.galleryImages,
+      rulings: primary.rulings && primary.rulings.length > 0 ? primary.rulings : secondary?.rulings || [],
+      wikiTitle: primary.wikiTitle || secondary?.wikiTitle,
+      isWikiLoaded: Boolean(primary.isWikiLoaded || secondary?.isWikiLoaded),
     };
 
     if (options?.banList) {
@@ -395,7 +570,6 @@ export default function App() {
   const [pendingSharedDeck, setPendingSharedDeck] = useState<SharedDeckPayload | null>(
     initialFromUrl.sharedDeck
   );
-  const [syncingSharedCards, setSyncingSharedCards] = useState(false);
   const [banList, setBanList] = useState<BanListSnapshot | null>(null);
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [selectedCard, setSelectedCard] = useState<BattleSpiritsCard | null>(null);
@@ -403,10 +577,17 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const [productSets, setProductSets] = useState<ProductSet[]>(PRODUCT_SETS);
-  const [loadedSetCodes, setLoadedSetCodes] = useState<Record<string, boolean>>({});
-  const [loadingSetCode, setLoadingSetCode] = useState<string | null>(null);
-  const [searchingWiki, setSearchingWiki] = useState(false);
-  const [setErrorMsg, setSetErrorMsg] = useState<string | null>(null);
+  const [loadingCardsJson, setLoadingCardsJson] = useState(true);
+
+  // Google Firebase Auth & Cloud Sync State
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [liveProfilesByUid, setLiveProfilesByUid] = useState<Record<string, PublicBuilderProfile>>({});
+  const cloudHydratedUidRef = useRef<string | null>(null);
+  const decksRef = useRef<Deck[]>([]);
+  const foldersRef = useRef<DeckFolder[]>([]);
 
   const [cardsMap, setCardsMap] = useState<Record<string, BattleSpiritsCard>>(() => {
     const initial: Record<string, BattleSpiritsCard> = {};
@@ -537,151 +718,95 @@ export default function App() {
     }
   }, [activeDeckId]);
 
-  // Fetch full wiki directory (BS01-BS77, SD01-SD70, 26R Standard, Promos) on mount
+  // Load 100% offline local /cards.json database (cached by Service Worker for instant offline access)
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/wiki/directory')
+    setLoadingCardsJson(true);
+
+    fetch('/cards.json')
       .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (cancelled || !Array.isArray(data?.sets)) return;
-        const curatedByCode = new Map(PRODUCT_SETS.map((s) => [s.setCode.toUpperCase(), s]));
-        const merged = (data.sets as ProductSet[]).map((wikiSet) => {
-          const curated = curatedByCode.get(wikiSet.setCode.toUpperCase());
-          if (!curated) return wikiSet;
-          const isWikiGeneric = /^(?:Booster Set |Starter \/ Mega Deck |Standard (?:Booster|Entry) )/i.test(
-            wikiSet.name
-          );
-          return {
-            ...wikiSet,
-            name: !isWikiGeneric && wikiSet.name ? wikiSet.name : curated.name,
-            jpName: curated.jpName || wikiSet.jpName,
-            releaseDate: curated.releaseDate || wikiSet.releaseDate,
-            tagline: curated.tagline || wikiSet.tagline,
-            featuredCardId: curated.featuredCardId || wikiSet.featuredCardId,
-            colors: curated.colors.length > 0 ? curated.colors : wikiSet.colors,
-            totalCardsInSet: curated.totalCardsInSet || wikiSet.totalCardsInSet,
-          };
-        });
-        const seenCodes = new Set(merged.map((s) => s.setCode.toUpperCase()));
-        for (const c of PRODUCT_SETS) {
-          if (!seenCodes.has(c.setCode.toUpperCase())) {
-            merged.push(c);
+      .then(
+        (
+          data: {
+            generatedAt?: string;
+            sets?: ProductSet[];
+            banList?: BanListSnapshot;
+            cards?: BattleSpiritsCard[];
+          } | null
+        ) => {
+          if (cancelled || !data) return;
+
+          const nextBanList =
+            data.banList && data.banList.byCardNumber ? data.banList : null;
+          if (nextBanList) {
+            setBanList(nextBanList);
+            void saveOfflineMeta({ banList: nextBanList });
+          }
+
+          if (Array.isArray(data.sets) && data.sets.length > 0) {
+            const curatedByCode = new Map(
+              PRODUCT_SETS.map((s) => [s.setCode.toUpperCase(), s])
+            );
+            const mergedSets = data.sets.map((localSet) => {
+              const curated = curatedByCode.get(localSet.setCode.toUpperCase());
+              if (!curated) return localSet;
+              const isGeneric =
+                /^(?:Booster Set |Starter \/ Mega Deck |Standard (?:Booster|Entry) )/i.test(
+                  localSet.name
+                );
+              return {
+                ...localSet,
+                name: !isGeneric && localSet.name ? localSet.name : curated.name,
+                jpName: curated.jpName || localSet.jpName,
+                releaseDate: curated.releaseDate || localSet.releaseDate,
+                tagline: curated.tagline || localSet.tagline,
+                featuredCardId: curated.featuredCardId || localSet.featuredCardId,
+                colors: curated.colors.length > 0 ? curated.colors : localSet.colors,
+                totalCardsInSet: curated.totalCardsInSet || localSet.totalCardsInSet,
+              };
+            });
+            const seenCodes = new Set(mergedSets.map((s) => s.setCode.toUpperCase()));
+            for (const c of PRODUCT_SETS) {
+              if (!seenCodes.has(c.setCode.toUpperCase())) {
+                mergedSets.push(c);
+              }
+            }
+            setProductSets(mergedSets);
+            void saveOfflineMeta({ productSets: mergedSets });
+          }
+
+          if (Array.isArray(data.cards) && data.cards.length > 0) {
+            setCardsMap((prev) => {
+              const { next } = mergeCardsIntoMap(prev, data.cards!, {
+                banList: nextBanList,
+              });
+              if (nextBanList) {
+                for (const [id, card] of Object.entries(next)) {
+                  const updatedRestriction = resolveBanRestriction(card, nextBanList);
+                  if (updatedRestriction !== (card.restriction || 'Unlimited')) {
+                    next[id] = { ...card, restriction: updatedRestriction };
+                  }
+                }
+              }
+              return next;
+            });
           }
         }
-        setProductSets(merged);
-        void saveOfflineMeta({ productSets: merged });
-      })
+      )
       .catch(() => {
-        // fallback cleanly to cached or initial PRODUCT_SETS
+        // IndexedDB + bundled fallback handles missing/corrupt response cleanly
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingCardsJson(false);
       });
+
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Fetch official Banned & Restricted list from Wiki and apply copy limits across all loaded cards
   useEffect(() => {
-    let cancelled = false;
-    fetch('/api/wiki/banlist')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: BanListSnapshot | null) => {
-        if (cancelled || !data || !data.byCardNumber) return;
-        setBanList(data);
-        void saveOfflineMeta({ banList: data });
-        setCardsMap((prev) => {
-          const next = { ...prev };
-          for (const [id, card] of Object.entries(next)) {
-            const updatedRestriction = resolveBanRestriction(card, data);
-            if (updatedRestriction !== (card.restriction || 'Unlimited')) {
-              next[id] = { ...card, restriction: updatedRestriction };
-            }
-          }
-          return next;
-        });
-      })
-      .catch(() => {
-        // keep cached or default restrictions gracefully if offline
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Hydrate bundled featured cards on startup so every bundled card gets real Wiki alt-art galleries & cleaned fields
-  useEffect(() => {
-    const toHydrate = BATTLE_SPIRITS_CARDS.filter((c) => c.wikiTitle && !c.isWikiLoaded);
-    if (toHydrate.length === 0) return;
-
-    let cancelled = false;
-    fetch('/api/wiki/hydrate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cards: toHydrate }),
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap(
-          (prev) =>
-            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], { banList }).next
-        );
-      })
-      .catch(() => {
-        // keep bundled fallback cleanly if offline
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [banList]);
-
-  // Automatically sync all official Wiki Token cards so Platinum Bug, Rig Avatar Dragon, Swordish, Fungal Bed, etc. appear in Search
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/wiki/sets/TOKENS?hydrate=100')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap(
-          (prev) =>
-            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], {
-              banList,
-              forceToken: true,
-            }).next
-        );
-      })
-      .catch(() => {
-        // keep bundled tokens cleanly if offline
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [banList]);
-
-  // Automatically sync official Wiki Revival cards (Category:Revival Cards + Revival tabber cards) so the Revival section is richly populated
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/wiki/sets/REVIVAL?hydrate=800')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (cancelled || !Array.isArray(data?.cards)) return;
-        setCardsMap(
-          (prev) =>
-            mergeCardsIntoMap(prev, data.cards as BattleSpiritsCard[], {
-              banList,
-              forceRevival: true,
-            }).next
-        );
-      })
-      .catch(() => {
-        // keep bundled Revival cards cleanly if offline
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [banList]);
-
-  useEffect(() => {
+    decksRef.current = decks;
     try {
       localStorage.setItem(STORAGE_DECKS_KEY, JSON.stringify(decks));
     } catch {
@@ -690,12 +815,82 @@ export default function App() {
   }, [decks]);
 
   useEffect(() => {
+    foldersRef.current = deckFolders;
     try {
       localStorage.setItem(STORAGE_DECK_FOLDERS_KEY, JSON.stringify(deckFolders));
     } catch {
       // ignore
     }
   }, [deckFolders]);
+
+  // Listen for Firebase Auth state & sync cloud decks/folders on Google sign-in
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      setAuthReady(true);
+
+      if (!user) {
+        cloudHydratedUidRef.current = null;
+        return;
+      }
+
+      setCloudSyncing(true);
+      try {
+        await syncUserAccountsOnSignIn(user);
+        const cloudLib = await fetchUserCloudLibrary(user.uid);
+        const presetIds = new Set(PRESET_DECKS.map((d) => d.id));
+        const cloudDeckIds = new Set(cloudLib.decks.map((d) => d.id));
+        const localUnsavedDecks = decksRef.current.filter(
+          (d) => !cloudDeckIds.has(d.id) && (cloudLib.decks.length === 0 || !presetIds.has(d.id))
+        );
+        const mergedDecks = [...cloudLib.decks, ...localUnsavedDecks];
+
+        const cloudFolderIds = new Set(cloudLib.folders.map((f) => f.id));
+        const localUnsavedFolders = foldersRef.current.filter((f) => !cloudFolderIds.has(f.id));
+        const mergedFolders = [...cloudLib.folders, ...localUnsavedFolders];
+
+        if (mergedFolders.length > 0) {
+          setDeckFolders(mergedFolders);
+        }
+        if (mergedDecks.length > 0) {
+          setDecks(mergedDecks);
+          if (!mergedDecks.some((d) => d.id === activeDeckId)) {
+            setActiveDeckId(mergedDecks[0].id);
+          }
+        }
+
+        if (localUnsavedDecks.length > 0 || localUnsavedFolders.length > 0) {
+          await syncAllDecksAndFoldersToCloud(user.uid, mergedFolders, mergedDecks);
+        }
+
+        cloudHydratedUidRef.current = user.uid;
+
+        const profs = await fetchPublicProfiles().catch(() => ({}));
+        if (Object.keys(profs).length > 0) {
+          setLiveProfilesByUid((prev) => ({ ...prev, ...profs }));
+        }
+      } catch (err) {
+        console.warn('Cloud library sync warning:', err);
+      } finally {
+        setCloudSyncing(false);
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Debounced auto-save decks & folders to Firestore whenever signed-in user edits
+  useEffect(() => {
+    if (!currentUser || cloudHydratedUidRef.current !== currentUser.uid) return;
+    const uid = currentUser.uid;
+    const timer = window.setTimeout(() => {
+      setCloudSyncing(true);
+      syncAllDecksAndFoldersToCloud(uid, deckFolders, decks)
+        .catch((err) => console.warn('Cloud auto-save error:', err))
+        .finally(() => setCloudSyncing(false));
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [currentUser, decks, deckFolders]);
 
   // Automatically strip any Token cards from saved decks once card metadata is loaded
   useEffect(() => {
@@ -729,6 +924,7 @@ export default function App() {
           (prev) =>
             mergeCardsIntoMap(prev, snapshot.cards, {
               banList: snapshot.banList || null,
+              preferExisting: true,
             }).next
         );
       }
@@ -828,72 +1024,6 @@ export default function App() {
     return activeDeck.entries.reduce((sum, e) => sum + e.quantity, 0);
   }, [activeDeck]);
 
-  const loadWikiSet = useCallback(
-    async (setCode: string) => {
-      if (!setCode || setCode === 'All') return;
-      const upper = setCode.toUpperCase();
-      if (loadedSetCodes[upper]) return;
-
-      setLoadingSetCode(upper);
-      setSetErrorMsg(null);
-      try {
-        const res = await fetch(`/api/wiki/sets/${encodeURIComponent(upper)}?hydrate=450`);
-        if (!res.ok) {
-          throw new Error(`Could not fetch ${upper} from Battle Spirits Wiki`);
-        }
-        const data = (await res.json()) as {
-          set?: ProductSet;
-          cards?: BattleSpiritsCard[];
-        };
-
-        if (data.set) {
-          setProductSets((prev) =>
-            prev.map((s) =>
-              s.setCode.toUpperCase() === upper ? { ...s, ...data.set } : s
-            )
-          );
-        }
-
-        if (Array.isArray(data.cards) && data.cards.length > 0) {
-          setCardsMap(
-            (prev) => mergeCardsIntoMap(prev, data.cards!, { banList }).next
-          );
-        }
-
-        setLoadedSetCodes((prev) => ({ ...prev, [upper]: true }));
-      } catch (err) {
-        const hasCachedSetCards = Object.values(cardsMap).some((c) =>
-          upper === 'TOKENS'
-            ? Boolean(c.isToken)
-            : upper === 'REVIVAL'
-            ? Boolean(c.isRevival)
-            : c.setCode.toUpperCase() === upper
-        );
-        if (hasCachedSetCards && typeof navigator !== 'undefined' && !navigator.onLine) {
-          setSetErrorMsg(null);
-        } else {
-          setSetErrorMsg(
-            typeof navigator !== 'undefined' && !navigator.onLine
-              ? `Offline Mode — connect to the internet once to sync ${upper} cards.`
-              : err instanceof Error
-              ? err.message
-              : `Failed to fetch ${upper} from Battle Spirits Wiki`
-          );
-        }
-      } finally {
-        setLoadingSetCode((prev) => (prev === upper ? null : prev));
-      }
-    },
-    [loadedSetCodes, banList, cardsMap]
-  );
-
-  // Automatically fetch a set whenever filters.setCode is set to a specific set
-  useEffect(() => {
-    if (filters.setCode !== 'All') {
-      loadWikiSet(filters.setCode);
-    }
-  }, [filters.setCode, loadWikiSet]);
-
   const updateFilters = useCallback(
     (next: FilterState) => {
       if (next.format !== filters.format) {
@@ -907,16 +1037,10 @@ export default function App() {
           }
         }
         next = { ...next, setCode: resolvedSetCode };
-
-        if (next.format === 'Standard') {
-          loadWikiSet('26RBS01');
-        } else if (next.format === 'Eternal') {
-          loadWikiSet('BS77');
-        }
       }
       setFilters(next);
     },
-    [filters.format, productSets, loadWikiSet]
+    [filters.format, productSets]
   );
 
   const handleFormatSwitch = useCallback(
@@ -926,58 +1050,54 @@ export default function App() {
     [filters, updateFilters]
   );
 
-  const handleWikiSearch = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const q = filters.search.trim();
-    if (!q) return;
+  const releaseRankBySetCode = useMemo(() => {
+    const map = new Map<string, number>();
+    const total = productSets.length;
+    productSets.forEach((s, idx) => {
+      map.set(s.setCode.toUpperCase(), computeSetReleaseRank(s, idx, total));
+    });
+    return map;
+  }, [productSets]);
 
-    setSearchingWiki(true);
-    try {
-      const params = new URLSearchParams({
-        q,
-        format: filters.format,
-      });
-      const res = await fetch(`/api/wiki/search?${params.toString()}`);
-      if (!res.ok) throw new Error('Wiki search failed');
-      const data = (await res.json()) as { cards?: BattleSpiritsCard[] };
-      if (Array.isArray(data.cards) && data.cards.length > 0) {
-        setCardsMap(
-          (prev) => mergeCardsIntoMap(prev, data.cards!, { banList }).next
-        );
-        showToast(`Synced ${data.cards.length} matching cards from Wiki`);
-      } else {
-        showToast(`No additional Wiki card pages matched "${q}"`);
-      }
-    } catch {
-      showToast(
-        typeof navigator !== 'undefined' && !navigator.onLine
-          ? 'Offline Mode — showing matching cards from local cache'
-          : 'Unable to reach Battle Spirits Wiki search right now'
-      );
-    } finally {
-      setSearchingWiki(false);
-    }
-  };
+  const knownSetCodes = useMemo(() => {
+    const codes = new Set<string>(['TOKENS', 'REVIVAL']);
+    productSets.forEach((s) => codes.add(s.setCode.toUpperCase()));
+    allCardsList.forEach((c) => {
+      if (c.setCode) codes.add(c.setCode.toUpperCase());
+    });
+    return codes;
+  }, [productSets, allCardsList]);
 
-  const handleCardHydrated = useCallback(
-    (hydrated: BattleSpiritsCard) => {
-      const clean = {
-        ...sanitizeCardTextTemplates(hydrated),
-        restriction: banList
-          ? resolveBanRestriction(hydrated, banList)
-          : hydrated.restriction,
-      };
-      setCardsMap((prev) => ({
-        ...prev,
-        [clean.id]: clean,
-      }));
-      setSelectedCard((curr) => (curr && curr.id === clean.id ? clean : curr));
-    },
-    [banList]
-  );
+  const setLookupByCode = useMemo(() => {
+    const map = new Map<string, ProductSet>();
+    productSets.forEach((s) => map.set(s.setCode.toUpperCase(), s));
+    return map;
+  }, [productSets]);
 
   const filteredCards = useMemo(() => {
     const q = filters.search.trim().toLowerCase();
+    const qCompact = q.replace(/[\s-]+/g, '');
+    const qTokens = q ? q.split(/\s+/).filter(Boolean) : [];
+    const searchSetIntent = resolveSearchSetIntent(q, knownSetCodes);
+
+    const setQ = filters.setQuery.trim().toLowerCase();
+    const setQCompact = setQ.replace(/[\s-]+/g, '');
+    const setQIntent = resolveSearchSetIntent(setQ, knownSetCodes);
+
+    const matchesSetIntent = (card: BattleSpiritsCard, intent: SearchSetIntent) => {
+      const cardSetUpper = card.setCode.toUpperCase();
+      const cardPrefix = getCardNumberPrefix(card.cardNumber);
+      if (intent.exactSetCode) {
+        if (intent.exactSetCode === 'TOKENS') return Boolean(card.isToken);
+        if (intent.exactSetCode === 'REVIVAL') return Boolean(card.isRevival);
+        return cardSetUpper === intent.exactSetCode || cardPrefix === intent.exactSetCode;
+      }
+      if (intent.paddedSetNum) {
+        const endRegex = new RegExp(`(?:^|[^0-9])${intent.paddedSetNum}$`, 'i');
+        return endRegex.test(cardSetUpper) || endRegex.test(cardPrefix);
+      }
+      return false;
+    };
 
     const list = allCardsList.filter((card) => {
       if (card.setCode.toUpperCase() === 'BSS01') return false;
@@ -995,9 +1115,33 @@ export default function App() {
         }
       }
 
+      // Dedicated Set Code / Set Name input filter
+      if (setQ) {
+        if (setQIntent) {
+          if (!matchesSetIntent(card, setQIntent)) return false;
+        } else {
+          const matchedSet = setLookupByCode.get(card.setCode.toUpperCase());
+          const setHay = `${card.setCode} ${card.setName} ${matchedSet?.jpName || ''} ${matchedSet?.tagline || ''}`.toLowerCase();
+          const setHayCompact = setHay.replace(/[\s-]+/g, '');
+          if (!setHay.includes(setQ) && !(setQCompact.length >= 2 && setHayCompact.includes(setQCompact))) {
+            return false;
+          }
+        }
+      }
+
+      // General Search Input
       if (q) {
-        const hay = `${card.name} ${card.jpName} ${card.cardNumber} ${card.subtypeLabel || ''} ${card.isToken ? 'token' : ''} ${card.isRevival ? 'revival' : ''} ${card.families.join(' ')} ${card.effects.map((e) => e.text).join(' ')}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+        if (searchSetIntent) {
+          if (!matchesSetIntent(card, searchSetIntent)) return false;
+        } else {
+          const hay = `${card.name} ${card.jpName} ${card.cardNumber} ${card.setCode} ${card.setName} ${card.subtypeLabel || ''} ${card.isToken ? 'token' : ''} ${card.isRevival ? 'revival' : ''} ${card.families.join(' ')} ${card.keywords.join(' ')} ${card.braveCondition || ''} ${card.summonCondition || ''} ${card.effects.map((e) => `${e.timing} ${e.text}`).join(' ')}`.toLowerCase();
+          const compactHay = hay.replace(/[\s-]+/g, '');
+          const matchesDirect = hay.includes(q) || (qCompact.length >= 2 && compactHay.includes(qCompact));
+          const matchesTokens =
+            qTokens.length > 1 &&
+            qTokens.every((tok) => hay.includes(tok) || compactHay.includes(tok.replace(/-/g, '')));
+          if (!matchesDirect && !matchesTokens) return false;
+        }
       }
 
       const cardColors = getCardColors(card);
@@ -1008,8 +1152,8 @@ export default function App() {
         if (cardColors.length !== 1 || cardColors[0] !== filters.color) return false;
       }
 
-      if (filters.type !== 'All' && card.type !== filters.type) return false;
-      if (filters.rarity !== 'All' && card.rarity !== filters.rarity) return false;
+      if (filters.type.length > 0 && !filters.type.includes(card.type)) return false;
+      if (filters.rarity.length > 0 && !filters.rarity.includes(card.rarity)) return false;
       if (filters.keyword !== 'All' && !card.keywords.includes(filters.keyword)) return false;
 
       if (filters.costBracket === '0-2' && card.cost > 2) return false;
@@ -1020,37 +1164,76 @@ export default function App() {
       return true;
     });
 
-    // Deduplicate non-Revival cards so duplicate IDs from set tables vs Wiki search never appear together
-    const seenOrigNums = new Set<string>();
-    const seenOrigNames = new Set<string>();
+    // Deduplicate by normalized cardNumber + version so duplicate IDs never appear twice
+    // while keeping distinct card numbers even if they share a card name (e.g. reprints)
+    const seenKeys = new Set<string>();
     const dedupedList = list.filter((card) => {
-      if (card.isRevival) return true;
       const numKey = normalizeCardNumber(card.cardNumber || '');
-      const nameKey = normalizeCardName(card.name || '');
-      if (numKey && numKey !== 'WIKI') {
-        if (seenOrigNums.has(numKey)) return false;
-        seenOrigNums.add(numKey);
-      }
-      if (nameKey) {
-        if (seenOrigNames.has(nameKey)) return false;
-        seenOrigNames.add(nameKey);
-      }
+      if (!numKey || numKey === 'WIKI') return true;
+      const key = `${numKey}|${card.isRevival ? 'rv' : 'orig'}`;
+      if (seenKeys.has(key)) return false;
+      seenKeys.add(key);
       return true;
     });
 
     const getMaxBp = (c: BattleSpiritsCard) =>
       c.levels && c.levels.length > 0 ? c.levels[c.levels.length - 1].bp : 0;
 
+    // Determine target set code priority for natural number ordering
+    const targetExactSet =
+      filters.setCode !== 'All'
+        ? filters.setCode.toUpperCase()
+        : setQIntent?.exactSetCode || searchSetIntent?.exactSetCode || '';
+    const targetPaddedNum = setQIntent?.paddedSetNum || searchSetIntent?.paddedSetNum || '';
+
+    const getNativePriority = (c: BattleSpiritsCard): number => {
+      const prefix = getCardNumberPrefix(c.cardNumber);
+      if (targetExactSet) {
+        if (prefix === targetExactSet) return 0;
+        if (c.setCode.toUpperCase() === targetExactSet) return 1;
+        return 2;
+      }
+      if (targetPaddedNum) {
+        if (prefix === `BS${targetPaddedNum}`) return 0;
+        if (new RegExp(`(?:^|[^0-9])${targetPaddedNum}$`, 'i').test(prefix)) return 1;
+        return 2;
+      }
+      return prefix === c.setCode.toUpperCase() ? 0 : 1;
+    };
+
     dedupedList.sort((a, b) => {
+      if (filters.sortBy === 'newest') {
+        const ra = releaseRankBySetCode.get(a.setCode.toUpperCase()) || 0;
+        const rb = releaseRankBySetCode.get(b.setCode.toUpperCase()) || 0;
+        return rb - ra || getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
+      }
+      if (filters.sortBy === 'rarity-desc') {
+        return (
+          (RARITY_RANK[b.rarity] || 0) - (RARITY_RANK[a.rarity] || 0) ||
+          a.cardNumber.localeCompare(b.cardNumber)
+        );
+      }
+      if (filters.sortBy === 'color') {
+        const ca = COLOR_SORT_ORDER[a.color] || 99;
+        const cb = COLOR_SORT_ORDER[b.color] || 99;
+        const multiA = getCardColors(a).length;
+        const multiB = getCardColors(b).length;
+        return (
+          ca - cb ||
+          multiA - multiB ||
+          a.cost - b.cost ||
+          a.cardNumber.localeCompare(b.cardNumber)
+        );
+      }
       if (filters.sortBy === 'cost-asc') return a.cost - b.cost || a.cardNumber.localeCompare(b.cardNumber);
       if (filters.sortBy === 'cost-desc') return b.cost - a.cost || a.cardNumber.localeCompare(b.cardNumber);
       if (filters.sortBy === 'bp-desc') return getMaxBp(b) - getMaxBp(a) || a.cardNumber.localeCompare(b.cardNumber);
       if (filters.sortBy === 'name') return a.name.localeCompare(b.name);
-      return a.cardNumber.localeCompare(b.cardNumber);
+      return getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
     });
 
     return dedupedList;
-  }, [allCardsList, filters]);
+  }, [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode]);
 
   const navigableCards = useMemo(() => {
     if (activeTab === 'search') {
@@ -1074,9 +1257,10 @@ export default function App() {
     if (filters.format !== 'All') count++;
     if (filters.version !== 'All') count++;
     if (filters.color !== 'All') count++;
-    if (filters.type !== 'All') count++;
-    if (filters.rarity !== 'All') count++;
+    if (filters.type.length > 0) count++;
+    if (filters.rarity.length > 0) count++;
     if (filters.setCode !== 'All') count++;
+    if (filters.setQuery.trim()) count++;
     if (filters.costBracket !== 'All') count++;
     if (filters.keyword !== 'All') count++;
     return count;
@@ -1241,6 +1425,9 @@ export default function App() {
     if (target) {
       showToast(`Removed folder "${target.name}" (decks moved to Uncategorized)`);
     }
+    if (currentUser) {
+      void deleteCloudFolder(currentUser.uid, folderId).catch(() => {});
+    }
   };
 
   const handleMoveDeckToFolder = (deckId: string, folderId?: string) => {
@@ -1320,6 +1507,9 @@ export default function App() {
     if (target) {
       showToast(`Deleted "${target.name}"`);
     }
+    if (currentUser) {
+      void deleteCloudDeck(currentUser.uid, deckId).catch(() => {});
+    }
   };
 
   const handleImportDeckEntries = ({
@@ -1378,100 +1568,6 @@ export default function App() {
         : `Merged list into "${activeDeck.name}" (${total} cards total)`
     );
   };
-
-  const handleSyncMissingImportCards = async ({
-    setCodes,
-    queries,
-  }: {
-    setCodes: string[];
-    queries: string[];
-  }): Promise<number> => {
-    let addedCount = 0;
-    const knownSetCodes = new Set(productSets.map((s) => s.setCode.toUpperCase()));
-    const setsToFetch = Array.from(
-      new Set(setCodes.map((s) => s.toUpperCase()).filter((s) => knownSetCodes.has(s)))
-    ).slice(0, 5);
-
-    if (setsToFetch.length > 0) {
-      await Promise.all(setsToFetch.map((code) => loadWikiSet(code)));
-    }
-
-    const uniqueQueries = Array.from(new Set(queries.map((q) => q.trim()).filter(Boolean))).slice(
-      0,
-      6
-    );
-    if (uniqueQueries.length > 0) {
-      const responses = await Promise.all(
-        uniqueQueries.map(async (q) => {
-          try {
-            const res = await fetch(`/api/wiki/search?q=${encodeURIComponent(q)}&format=All`);
-            if (!res.ok) return [];
-            const data = (await res.json()) as { cards?: BattleSpiritsCard[] };
-            return Array.isArray(data.cards) ? data.cards : [];
-          } catch {
-            return [];
-          }
-        })
-      );
-
-      const foundCards = responses.flat();
-      if (foundCards.length > 0) {
-        setCardsMap((prev) => {
-          const resMerge = mergeCardsIntoMap(prev, foundCards, { banList });
-          addedCount += resMerge.addedCount;
-          return resMerge.next;
-        });
-      }
-    }
-
-    return addedCount + setsToFetch.length;
-  };
-
-  // Auto-sync missing cards referenced by a shared deck link (?share=...)
-  useEffect(() => {
-    if (!pendingSharedDeck) return;
-    const missingSetCodes: string[] = [];
-    const missingQueries: string[] = [];
-
-    for (const item of pendingSharedDeck.entries) {
-      const normNum = normalizeCardNumber(item.cardNumber);
-      const compactNum = compactCardNumber(item.cardNumber);
-      const normName = normalizeCardName(item.name);
-      const exists =
-        Boolean(item.cardId && cardsMap[item.cardId]) ||
-        allCardsList.some(
-          (c) =>
-            (normNum &&
-              (normalizeCardNumber(c.cardNumber) === normNum ||
-                compactCardNumber(c.cardNumber) === compactNum)) ||
-            (normName && normalizeCardName(c.name) === normName)
-        );
-      if (!exists) {
-        if (item.cardNumber) {
-          const sc = extractSetCodeFromCardNumber(item.cardNumber);
-          if (sc) missingSetCodes.push(sc);
-          missingQueries.push(item.cardNumber);
-        } else if (item.name) {
-          missingQueries.push(item.name);
-        }
-      }
-    }
-
-    if (missingSetCodes.length === 0 && missingQueries.length === 0) return;
-
-    let cancelled = false;
-    setSyncingSharedCards(true);
-    handleSyncMissingImportCards({
-      setCodes: missingSetCodes,
-      queries: missingQueries,
-    }).finally(() => {
-      if (!cancelled) setSyncingSharedCards(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [pendingSharedDeck]);
 
   const sharedDeckResolution = useMemo(() => {
     if (!pendingSharedDeck) return null;
@@ -1562,22 +1658,104 @@ export default function App() {
     }
     setFilters({ ...INITIAL_FILTERS, format: nextFormat, setCode });
     setActiveTab('search');
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
   };
 
   const openColorInSearch = (color: ColorFilter) => {
-    if (filters.format === 'Standard') {
-      loadWikiSet('26RBS01');
-    } else if (filters.format === 'Eternal') {
-      loadWikiSet('BS77');
-    }
     setFilters((prev) => ({ ...INITIAL_FILTERS, format: prev.format, color }));
     setActiveTab('search');
   };
 
-  const activeSetMeta =
-    filters.setCode !== 'All'
-      ? productSets.find((s) => s.setCode.toUpperCase() === filters.setCode.toUpperCase())
-      : undefined;
+  const activeSetMeta = useMemo(() => {
+    if (filters.setCode !== 'All') {
+      return productSets.find((s) => s.setCode.toUpperCase() === filters.setCode.toUpperCase());
+    }
+    if (filters.setQuery.trim()) {
+      const intent = resolveSearchSetIntent(filters.setQuery, knownSetCodes);
+      if (intent?.exactSetCode) {
+        return setLookupByCode.get(intent.exactSetCode);
+      }
+    }
+    return undefined;
+  }, [filters.setCode, filters.setQuery, productSets, knownSetCodes, setLookupByCode]);
+
+  const handleGoogleSignIn = async () => {
+    if (signingIn) return;
+    setSigningIn(true);
+    try {
+      const user = await signInWithGoogle();
+      if (user) {
+        showToast(`Signed in as ${user.displayName || user.email || 'Player'} — Cloud Sync active`);
+      }
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        showToast('Google sign-in cancelled');
+      } else {
+        showToast('Could not complete Google sign-in — check popup permissions');
+      }
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    try {
+      await signOutGoogle();
+      showToast('Signed out from Google Cloud');
+    } catch {
+      showToast('Unable to sign out right now');
+    }
+  };
+
+  const handleManualCloudSync = async () => {
+    if (!currentUser || cloudSyncing) return;
+    setCloudSyncing(true);
+    try {
+      await syncAllDecksAndFoldersToCloud(currentUser.uid, deckFolders, decks);
+      showToast(`Saved ${decks.length} decks to Google Cloud`);
+    } catch {
+      showToast('Cloud sync failed — please retry');
+    } finally {
+      setCloudSyncing(false);
+    }
+  };
+
+  const handleUpdateOwnProfile = async (
+    bio: string,
+    favoriteColor: CardColor
+  ): Promise<boolean> => {
+    if (!currentUser) return false;
+    try {
+      await updatePublicProfileBio(currentUser.uid, bio, favoriteColor);
+      setLiveProfilesByUid((prev) => {
+        const curr = prev[currentUser.uid] || {
+          uid: currentUser.uid,
+          displayName: currentUser.displayName || 'Player',
+          photoURL: currentUser.photoURL || '',
+          bio: '',
+          favoriteColor: 'Red' as CardColor,
+          followersCount: 0,
+          isPublic: true,
+        };
+        return {
+          ...prev,
+          [currentUser.uid]: {
+            ...curr,
+            bio: bio.trim(),
+            favoriteColor,
+          },
+        };
+      });
+      showToast('Updated player profile');
+      return true;
+    } catch {
+      showToast('Could not update profile');
+      return false;
+    }
+  };
 
   const navItems: {
     id: AppTab;
@@ -1587,14 +1765,17 @@ export default function App() {
     { id: 'catalog', label: 'Catalog', icon: Grid },
     { id: 'search', label: 'Search', icon: Search },
     { id: 'decks', label: 'Decks', icon: Layers },
-    { id: 'rules', label: 'Rules', icon: BookOpen },
+    { id: 'settings', label: 'Settings', icon: Settings },
   ];
+
+  const centerNavItems = navItems.filter((item) => item.id !== 'settings');
+  const ownProfile = currentUser ? liveProfilesByUid[currentUser.uid] : undefined;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F7F8FA] text-[#111318]">
       {/* Compact Sticky Top Bar: 48px on mobile, 64px on desktop */}
       <header className="sticky top-0 z-30 h-12 lg:h-16 bg-white/95 backdrop-blur-md border-b border-slate-200">
-        <div className="max-w-7xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-8">
+        <div className="max-w-7xl mx-auto h-full px-3 sm:px-6 flex items-center justify-between gap-3 sm:gap-6">
           <button
             type="button"
             onClick={() => setActiveTab('catalog')}
@@ -1603,8 +1784,8 @@ export default function App() {
             BattleSpirits
           </button>
 
-          <nav className="hidden lg:flex items-center gap-7" aria-label="Primary Navigation">
-            {navItems.map((item) => {
+          <nav className="hidden lg:flex items-center gap-6" aria-label="Primary Navigation">
+            {centerNavItems.map((item) => {
               const active = activeTab === item.id;
               return (
                 <button
@@ -1619,19 +1800,41 @@ export default function App() {
                 >
                   {item.id === 'search' && <Search className="w-3.5 h-3.5" />}
                   <span>{item.label}</span>
+                  {item.id === 'decks' && (
+                    <span className="font-mono text-xs text-slate-500 tabular-nums">
+                      ({decks.length})
+                    </span>
+                  )}
                 </button>
               );
             })}
           </nav>
 
-          <div className="flex items-center gap-2 shrink-0">
-            <PWAInstallButton />
+          {/* Most-Right Header Button: Settings (contains profile, Google sign-in/out, sync, offline DB, rules) */}
+          <div className="flex items-center justify-end shrink-0">
             <button
               type="button"
-              onClick={() => setActiveTab('decks')}
-              className="min-h-[36px] lg:min-h-[40px] px-3.5 rounded-xl bg-slate-900 text-white text-xs font-semibold whitespace-nowrap shrink-0 hover:bg-slate-800 transition-colors cursor-pointer"
+              onClick={() => setActiveTab('settings')}
+              aria-current={activeTab === 'settings' ? 'page' : undefined}
+              aria-label="Settings, Profile, Account and Official Rules"
+              className={`min-h-[36px] lg:min-h-[40px] px-3 sm:px-3.5 rounded-xl border text-xs font-semibold whitespace-nowrap shrink-0 inline-flex items-center gap-2 transition-colors cursor-pointer ${
+                activeTab === 'settings'
+                  ? 'bg-slate-900 border-slate-900 text-white'
+                  : 'bg-white border-slate-200 text-slate-800 hover:bg-slate-50'
+              }`}
             >
-              Deck <span className="font-mono tabular-nums">({activeDeckTotal})</span>
+              {currentUser?.photoURL ? (
+                <img
+                  src={currentUser.photoURL}
+                  alt={currentUser.displayName || 'Account'}
+                  referrerPolicy="no-referrer"
+                  className="w-5 h-5 rounded-full object-cover"
+                />
+              ) : currentUser ? (
+                <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+              ) : null}
+              <Settings className="w-4 h-4 shrink-0" />
+              <span>Settings</span>
             </button>
           </div>
         </div>
@@ -1703,7 +1906,7 @@ export default function App() {
                       ? 'Standard Format: 26RBS, 26RSD, RP26, PX26 & Standard Tokens.'
                       : filters.format === 'Eternal'
                       ? 'Eternal Era: BS01–BS77, SD01–SD70, CB01–CB34, CBX01, BSC01–BSC51, PB01–PB50, PC01–PC12 & Promos.'
-                      : 'Search across BS01–BS77, Collab, Supplementary, PB, PC, SD, 26R Standard, Tokens, and Promos.'}
+                      : 'Search offline English cards across BS01–BS77, Collab, Supplementary, PB, PC, SD, 26R Standard, Tokens, and Promos.'}
                   </p>
                 </div>
 
@@ -1761,22 +1964,48 @@ export default function App() {
                       </button>
                     ))}
                   </div>
-                  <div className="text-xs font-mono tabular-nums text-slate-500 shrink-0">
-                    {filteredCards.length} cards
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="search-header-sort" className="sr-only">
+                      Sort cards
+                    </label>
+                    <select
+                      id="search-header-sort"
+                      aria-label="Sort cards"
+                      value={filters.sortBy}
+                      onChange={(e) =>
+                        updateFilters({
+                          ...filters,
+                          sortBy: e.target.value as SortOption,
+                        })
+                      }
+                      className="min-h-[38px] px-2.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-600 cursor-pointer"
+                    >
+                      <option value="number">Sort: Set &amp; Number</option>
+                      <option value="newest">Sort: Newest Release</option>
+                      <option value="rarity-desc">Sort: Highest Rarity</option>
+                      <option value="color">Sort: Color</option>
+                      <option value="cost-asc">Sort: Cost (Low–High)</option>
+                      <option value="cost-desc">Sort: Cost (High–Low)</option>
+                      <option value="bp-desc">Sort: Highest BP</option>
+                      <option value="name">Sort: Name (A–Z)</option>
+                    </select>
+                    <div className="text-xs font-mono tabular-nums text-slate-500 shrink-0">
+                      {filteredCards.length} cards
+                    </div>
                   </div>
                 </div>
               </div>
 
-              {/* Search Input + Live Wiki Query + Mobile Filter Trigger */}
-              <form onSubmit={handleWikiSearch} className="flex items-center gap-2">
-                <div className="relative flex-1">
+              {/* Offline Search Inputs (Card Search + Focused Set Code / Name Input) + Mobile Filter Trigger */}
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <div className="relative flex-1 min-w-0">
                   <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     ref={searchInputRef}
                     type="search"
                     value={filters.search}
                     onChange={(e) => setFilters({ ...filters, search: e.target.value })}
-                    placeholder="Search card name, number, family, or English effect..."
+                    placeholder="Search card name, family, keyword, or English effect..."
                     className="w-full min-h-[44px] pl-10 pr-9 rounded-xl bg-white border border-slate-200 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
                   />
                   {filters.search && (
@@ -1791,35 +2020,44 @@ export default function App() {
                   )}
                 </div>
 
-                {filters.search.trim().length >= 2 && (
-                  <button
-                    type="submit"
-                    disabled={searchingWiki}
-                    className="min-h-[44px] px-3.5 rounded-xl bg-red-600 text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 hover:bg-red-700 disabled:opacity-60 cursor-pointer whitespace-nowrap"
-                  >
-                    {searchingWiki ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Globe className="w-4 h-4" />
+                <div className="flex items-center gap-2 sm:w-64 lg:w-72 shrink-0">
+                  <div className="relative flex-1 min-w-0">
+                    <Layers className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={filters.setQuery}
+                      onChange={(e) => setFilters({ ...filters, setQuery: e.target.value })}
+                      placeholder="Set code or name (BS75, 43)..."
+                      aria-label="Filter by set code or set name"
+                      className="w-full min-h-[44px] pl-9 pr-9 rounded-xl bg-white border border-slate-200 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
+                    />
+                    {filters.setQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setFilters({ ...filters, setQuery: '' })}
+                        className="min-h-[44px] min-w-[44px] flex items-center justify-center absolute right-0 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                        aria-label="Clear set filter"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
                     )}
-                    <span className="hidden sm:inline">Search Wiki</span>
-                  </button>
-                )}
+                  </div>
 
-                <button
-                  type="button"
-                  onClick={() => setFilterSheetOpen(true)}
-                  className="lg:hidden min-h-[44px] px-3.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-800 inline-flex items-center gap-2 shrink-0 hover:bg-slate-50 cursor-pointer"
-                >
-                  <SlidersHorizontal className="w-4 h-4" />
-                  <span>Filter</span>
-                  {activeFilterCount > 0 && (
-                    <span className="font-mono text-red-700 tabular-nums">
-                      ({activeFilterCount})
-                    </span>
-                  )}
-                </button>
-              </form>
+                  <button
+                    type="button"
+                    onClick={() => setFilterSheetOpen(true)}
+                    className="lg:hidden min-h-[44px] px-3.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-800 inline-flex items-center gap-2 shrink-0 hover:bg-slate-50 cursor-pointer"
+                  >
+                    <SlidersHorizontal className="w-4 h-4" />
+                    <span>Filter</span>
+                    {activeFilterCount > 0 && (
+                      <span className="font-mono text-red-700 tabular-nums">
+                        ({activeFilterCount})
+                      </span>
+                    )}
+                  </button>
+                </div>
+              </div>
 
               {/* Thumb-Friendly Horizontal Attribute Bar */}
               <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
@@ -1877,49 +2115,20 @@ export default function App() {
                 })}
               </div>
 
-              {/* Loading / Error State for Live Wiki Set Sync */}
-              {loadingSetCode && (
+              {/* Local Database Loading / Responsive Card Grid */}
+              {loadingCardsJson && allCardsList.length <= BATTLE_SPIRITS_CARDS.length ? (
                 <div className="bg-white border border-slate-200 rounded-2xl p-6 flex items-center justify-center gap-3 text-sm text-slate-600">
                   <Loader2 className="w-5 h-5 animate-spin text-red-600" />
-                  <span>
-                    Syncing {loadingSetCode} card list, English effects, and card art from Battle Spirits Wiki...
-                  </span>
+                  <span>Loading local offline English card database (/cards.json)...</span>
                 </div>
-              )}
-
-              {setErrorMsg && (
-                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs text-amber-950 flex items-center justify-between gap-3">
-                  <span>{setErrorMsg}</span>
-                  <button
-                    type="button"
-                    onClick={() => filters.setCode !== 'All' && loadWikiSet(filters.setCode)}
-                    className="min-h-[36px] px-3 rounded-lg bg-amber-700 text-white font-semibold shrink-0 cursor-pointer"
-                  >
-                    Retry
-                  </button>
-                </div>
-              )}
-
-              {/* Responsive Card Grid */}
-              {!loadingSetCode && filteredCards.length === 0 ? (
+              ) : filteredCards.length === 0 ? (
                 <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-3">
                   <p className="text-sm text-slate-600">
-                    {filters.search.trim()
-                      ? `No loaded cards matched "${filters.search}". Search the live Battle Spirits Wiki to pull matching cards.`
+                    {filters.search.trim() || filters.setQuery.trim()
+                      ? `No cards in the offline database matched "${[filters.search.trim(), filters.setQuery.trim()].filter(Boolean).join(' · ')}".`
                       : 'No Battle Spirits cards match your current filters.'}
                   </p>
                   <div className="flex flex-wrap items-center justify-center gap-2.5">
-                    {filters.search.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleWikiSearch()}
-                        disabled={searchingWiki}
-                        className="min-h-[44px] px-5 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 inline-flex items-center gap-2 cursor-pointer"
-                      >
-                        <Globe className="w-4 h-4" />
-                        <span>Search Entire Wiki for &ldquo;{filters.search}&rdquo;</span>
-                      </button>
-                    )}
                     <button
                       type="button"
                       onClick={() => setFilters(INITIAL_FILTERS)}
@@ -1968,15 +2177,39 @@ export default function App() {
               onDeleteDeck={handleDeleteDeck}
               onUpdateCardQty={handleUpdateDeckQty}
               onImportDeckEntries={handleImportDeckEntries}
-              onSyncMissingImportCards={handleSyncMissingImportCards}
               onInspectCard={setSelectedCard}
               onBrowseCatalog={openSearchTab}
+              cloudUserEmail={currentUser?.email || null}
+              cloudSyncing={cloudSyncing}
+              onSignInGoogle={() => void handleGoogleSignIn()}
+              onSyncNow={() => void handleManualCloudSync()}
               onNotify={showToast}
             />
           </ErrorBoundary>
         )}
 
-        {activeTab === 'rules' && <RulingsView />}
+        {activeTab === 'settings' && (
+          <ErrorBoundary
+            fallbackTitle="Unable to render Settings"
+            resetLabel="Return to Catalog"
+            onReset={() => setActiveTab('catalog')}
+          >
+            <SettingsView
+              currentUser={currentUser}
+              authReady={authReady}
+              signingIn={signingIn}
+              cloudSyncing={cloudSyncing}
+              deckCount={decks.length}
+              folderCount={deckFolders.length}
+              initialBio={ownProfile?.bio || ''}
+              initialFavoriteColor={ownProfile?.favoriteColor || 'Red'}
+              onSignInGoogle={() => void handleGoogleSignIn()}
+              onSignOutGoogle={() => void handleGoogleSignOut()}
+              onSyncNow={() => void handleManualCloudSync()}
+              onSaveProfile={handleUpdateOwnProfile}
+            />
+          </ErrorBoundary>
+        )}
       </main>
 
       {/* Offline Status Banner */}
@@ -2066,14 +2299,7 @@ export default function App() {
             </div>
 
             <div className="overflow-y-auto flex-1 px-5 py-4 space-y-3">
-              {syncingSharedCards && (
-                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2 text-xs text-slate-600">
-                  <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
-                  <span>Fetching shared cards from Battle Spirits Wiki...</span>
-                </div>
-              )}
-
-              {sharedDeckResolution.unmatchedItems.length > 0 && !syncingSharedCards && (
+              {sharedDeckResolution.unmatchedItems.length > 0 && (
                 <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-2 text-xs text-amber-950">
                   <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                   <span>
@@ -2194,7 +2420,6 @@ export default function App() {
         onClose={() => setSelectedCard(null)}
         onSelectCard={setSelectedCard}
         onUpdateDeckQty={handleUpdateDeckQty}
-        onCardHydrated={handleCardHydrated}
       />
     </div>
   );

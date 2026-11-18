@@ -1,11 +1,52 @@
 import React, { useState } from 'react';
-import { Search, Plus, Minus } from 'lucide-react';
-import { KEYWORD_GLOSSARY } from '../data/cards';
-import { ALL_COLORS, ALL_SYMBOLS, COLOR_META, SYMBOL_META } from '../data/theme';
-import { BattleSymbolKind } from '../types/card';
+import { Plus, Minus } from 'lucide-react';
+import { ALL_SYMBOLS, SYMBOL_META } from '../data/theme';
+import { BattleSymbolKind, GameFormat } from '../types/card';
 import { SymbolIcon } from './SymbolIcon';
 
-const TURN_STEPS = [
+interface TurnStepItem {
+  step: string;
+  detail: string;
+  badge?: string;
+}
+
+const STANDARD_TURN_STEPS: TurnStepItem[] = [
+  {
+    step: '01. Start Step',
+    detail: 'Resolve effects that trigger "At the start of your turn."',
+  },
+  {
+    step: '02. Core Step',
+    detail: 'Place 1 core from the Void into your Reserve (skipped on Turn 1 going first).',
+  },
+  {
+    step: '03. Draw Step',
+    detail: 'Draw 1 card from your deck.',
+  },
+  {
+    step: '04. Refresh Step',
+    detail: 'Return all cores from Trash to Reserve and refresh all exhausted Spirits & Ultimates.',
+  },
+  {
+    step: '05. Main Step 1',
+    detail: 'Summon Spirits/Braves, deploy Nexuses, cast Main Magic, Set Burst, and freely move cores.',
+  },
+  {
+    step: '06. Attack Step',
+    detail: 'Declare attacks one Spirit at a time. Flash Timing opens for defender first, then attacker, before block & BP comparison.',
+  },
+  {
+    step: '07. Main Step 2',
+    badge: 'Standard Only',
+    detail: 'Occurs right after the Attack Step. Summon Spirits/Braves, deploy Nexuses, cast Main Magic, Set Burst, and move cores before ending your turn.',
+  },
+  {
+    step: '08. End Step',
+    detail: 'Resolve end-of-turn triggers and pass turn to opponent.',
+  },
+];
+
+const ETERNAL_TURN_STEPS: TurnStepItem[] = [
   {
     step: '01. Start Step',
     detail: 'Resolve effects that trigger "At the start of your turn."',
@@ -28,16 +69,17 @@ const TURN_STEPS = [
   },
   {
     step: '06. Attack Step',
-    detail: 'Declare attacks one Spirit at a time. Flash Timing opens for defender first, then attacker, before block & BP comparison.',
+    detail: 'Declare attacks one Spirit/Ultimate at a time. Flash Timing opens for defender first, then attacker, before block & BP comparison.',
   },
   {
     step: '07. End Step',
-    detail: 'Resolve end-of-turn triggers and pass turn to opponent.',
+    badge: 'No Main Step 2',
+    detail: 'Eternal Format proceeds directly from Attack Step to End Step. Resolve end-of-turn triggers and pass turn to opponent.',
   },
 ];
 
 export const RulingsView: React.FC = () => {
-  const [kwQuery, setKwQuery] = useState('');
+  const [turnFormat, setTurnFormat] = useState<GameFormat>('Standard');
   const [calcColor, setCalcColor] = useState<BattleSymbolKind>('Red');
   const [cardCost, setCardCost] = useState(6);
   const [cardReductionPips, setCardReductionPips] = useState(3);
@@ -45,21 +87,16 @@ export const RulingsView: React.FC = () => {
 
   const effectiveReduction = Math.min(cardReductionPips, boardSymbols);
   const finalCostToPay = Math.max(0, cardCost - effectiveReduction);
-
-  const filteredKeywords = KEYWORD_GLOSSARY.filter(
-    (k) =>
-      k.name.toLowerCase().includes(kwQuery.toLowerCase()) ||
-      k.summary.toLowerCase().includes(kwQuery.toLowerCase())
-  );
+  const activeTurnSteps = turnFormat === 'Standard' ? STANDARD_TURN_STEPS : ETERNAL_TURN_STEPS;
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="font-display text-2xl font-bold text-slate-900">
-          Formats, Rules &amp; Keyword Reference
+          Formats, Turn Sequence &amp; Rules
         </h1>
         <p className="text-sm text-slate-500">
-          Compare official Standard and Eternal formats, calculate reduction costs, and look up Battle Spirits keywords.
+          Compare official Standard and Eternal formats, check turn phases, and calculate reduction costs.
         </p>
       </div>
 
@@ -277,66 +314,63 @@ export const RulingsView: React.FC = () => {
               </div>
             </div>
           </section>
+        </div>
 
-          <section className="p-4 rounded-2xl bg-white border border-slate-200 space-y-3">
-            <h2 className="font-display text-base font-bold text-slate-900">Turn Sequence</h2>
+        <div className="lg:col-span-7">
+          <section className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div>
+                <h2 className="font-display text-base font-bold text-slate-900">Turn Sequence</h2>
+                <p className="text-xs text-slate-500">
+                  Standard includes Main Step 2 after Attack Step; Eternal goes straight to End Step.
+                </p>
+              </div>
+              <div
+                role="group"
+                aria-label="Turn sequence format"
+                className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl shrink-0 self-start sm:self-auto"
+              >
+                {(['Standard', 'Eternal'] as const).map((fmt) => (
+                  <button
+                    key={fmt}
+                    type="button"
+                    onClick={() => setTurnFormat(fmt)}
+                    className={`min-h-[34px] px-3 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                      turnFormat === fmt
+                        ? fmt === 'Standard'
+                          ? 'bg-sky-700 text-white shadow-sm'
+                          : 'bg-amber-700 text-white shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {fmt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <ol className="divide-y divide-slate-100">
-              {TURN_STEPS.map((item) => (
+              {activeTurnSteps.map((item) => (
                 <li key={item.step} className="py-2.5 first:pt-0 last:pb-0">
-                  <div className="text-xs font-bold text-slate-900">{item.step}</div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-slate-900">{item.step}</span>
+                    {item.badge && (
+                      <span
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-semibold ${
+                          turnFormat === 'Standard'
+                            ? 'bg-sky-50 text-sky-700 border border-sky-200'
+                            : 'bg-amber-50 text-amber-800 border border-amber-200'
+                        }`}
+                      >
+                        {item.badge}
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">{item.detail}</p>
                 </li>
               ))}
             </ol>
           </section>
-        </div>
-
-        <div className="lg:col-span-7 space-y-3">
-          <div className="relative">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              type="search"
-              value={kwQuery}
-              onChange={(e) => setKwQuery(e.target.value)}
-              placeholder="Search keywords (e.g., Contract Nexus, Awaken, Armor, Crush)..."
-              className="w-full min-h-[44px] pl-10 pr-4 rounded-xl bg-white border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-red-600"
-            />
-          </div>
-
-          <div className="bg-white border border-slate-200 rounded-2xl divide-y divide-slate-100 overflow-hidden">
-            {filteredKeywords.length === 0 ? (
-              <div className="p-8 text-center text-sm text-slate-500">
-                No matching Battle Spirits keywords found.
-              </div>
-            ) : (
-              filteredKeywords.map((kw) => (
-                <div key={kw.name} className="p-4 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-display text-base font-bold text-slate-900">
-                        {kw.name}
-                      </h3>
-                      <span className="text-xs text-slate-400">{kw.jpName}</span>
-                    </div>
-                    <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                      {kw.colors.map((c) => (
-                        <span key={c} className="inline-flex items-center gap-1">
-                          <SymbolIcon color={c} size="xs" variant="gem" />
-                          {kw.colors.length <= 2 && (
-                            <span className={`text-[11px] font-semibold ${COLOR_META[c].text}`}>
-                              {c}
-                            </span>
-                          )}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="text-xs font-medium text-red-700">{kw.timing}</div>
-                  <p className="text-sm text-slate-600 leading-relaxed">{kw.summary}</p>
-                </div>
-              ))
-            )}
-          </div>
         </div>
       </div>
     </div>

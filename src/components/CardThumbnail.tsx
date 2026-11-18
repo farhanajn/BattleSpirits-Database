@@ -1,6 +1,6 @@
 import React from 'react';
 import { Plus, Check, Ban } from 'lucide-react';
-import { BattleSpiritsCard, BattleSymbolKind, CardColor } from '../types/card';
+import { BattleSpiritsCard, CardColor } from '../types/card';
 import { COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
@@ -27,10 +27,6 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       : [card.color];
 
   const meta = COLOR_META[cardColors[0] || card.color];
-  const topBp =
-    card.levels && card.levels.length > 0
-      ? card.levels[card.levels.length - 1].bp
-      : null;
 
   const isStandardLegal = card.formats.includes('Standard');
   const isToken = isTokenCard(card);
@@ -38,14 +34,6 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
   const restrictionBadge = isToken ? 'TOKEN' : getRestrictionBadgeLabel(card.restriction);
   const isBanned = !isToken && maxCopies === 0;
   const cannotAdd = (isToken || isBanned) && deckQty === 0;
-
-  const reductionEntries = (
-    Object.entries(card.reduction) as [BattleSymbolKind, number][]
-  ).filter(([, n]) => n > 0);
-
-  const symbolEntries = (
-    Object.entries(card.symbols) as [BattleSymbolKind, number][]
-  ).filter(([, n]) => n > 0);
 
   const accentBackground =
     cardColors.length > 1
@@ -70,59 +58,6 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       >
         <div className="relative aspect-[4/3] w-full">
           <CardArtwork card={card} className="w-full h-full" />
-
-          {/* Top-Left: Summon Cost */}
-          <div className="absolute top-2.5 left-2.5 flex items-center bg-slate-950/85 backdrop-blur-sm text-white px-2 py-1 rounded-lg shadow-xs">
-            <span className="font-mono text-xs font-bold tabular-nums leading-none">
-              {card.cost}
-            </span>
-          </div>
-
-          {/* Bottom-Left: Reduction Symbols & Card Symbols */}
-          {(reductionEntries.length > 0 || symbolEntries.length > 0) && (
-            <div className="absolute bottom-2 left-2.5 flex items-center gap-1.5 bg-slate-950/80 backdrop-blur-sm px-1.5 py-1 rounded-lg max-w-[65%] overflow-hidden">
-              {reductionEntries.length > 0 && (
-                <span className="flex items-center gap-0.5 shrink-0">
-                  {reductionEntries.map(([rSym, count]) =>
-                    Array.from({ length: Math.min(count, 4) }).map((_, i) => (
-                      <SymbolIcon
-                        key={`red-${rSym}-${i}`}
-                        color={rSym}
-                        size="xs"
-                        variant="reduction"
-                      />
-                    ))
-                  )}
-                </span>
-              )}
-
-              {symbolEntries.length > 0 && (
-                <span
-                  className={`flex items-center gap-0.5 shrink-0 ${
-                    reductionEntries.length > 0 ? 'pl-1.5 border-l border-white/25' : ''
-                  }`}
-                >
-                  {symbolEntries.map(([sSym, count]) =>
-                    Array.from({ length: Math.min(count, 3) }).map((_, i) => (
-                      <SymbolIcon
-                        key={`sym-${sSym}-${i}`}
-                        color={sSym}
-                        size="xs"
-                        variant="gem"
-                      />
-                    ))
-                  )}
-                </span>
-              )}
-            </div>
-          )}
-
-          {/* Bottom-Right: Top BP */}
-          {topBp !== null && topBp > 0 && (
-            <div className="absolute bottom-2 right-2.5 px-1.5 py-0.5 rounded bg-slate-950/75 text-white font-mono text-[11px] font-semibold tabular-nums tracking-tight">
-              BP {topBp.toLocaleString()}
-            </div>
-          )}
 
           <div
             className="absolute bottom-0 inset-x-0 h-[3px]"

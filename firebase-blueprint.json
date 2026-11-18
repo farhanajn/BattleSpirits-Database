@@ -1,0 +1,529 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Private user account record isolating PII such as email from public community views.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified account email address (private)",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Profile avatar URL",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of account creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update"
+        }
+      },
+      "required": ["uid", "email", "displayName", "photoURL", "createdAt", "updatedAt"]
+    },
+    "UserDeckFolder": {
+      "title": "UserDeckFolder",
+      "description": "Cloud-synced deck organization folder owned by a user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "color": {
+          "type": "string",
+          "enum": ["", "Red", "Purple", "White", "Yellow", "Green", "Blue"],
+          "maxLength": 20
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerUid", "name", "color", "clientCreatedAt", "createdAt", "updatedAt"]
+    },
+    "UserDeck": {
+      "title": "UserDeck",
+      "description": "Cloud-synced Battle Spirits deck list owned by a user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "format": {
+          "type": "string",
+          "enum": ["Standard", "Eternal"],
+          "maxLength": 16
+        },
+        "archetype": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "folderId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "clientUpdatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "entries": {
+          "type": "array",
+          "description": "Array of { cardId, quantity } objects (max 100)"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "name",
+        "format",
+        "archetype",
+        "folderId",
+        "category",
+        "clientUpdatedAt",
+        "entries",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserBookmark": {
+      "title": "UserBookmark",
+      "description": "Bookmarked community post reference inside user private subcollection.",
+      "type": "object",
+      "properties": {
+        "postId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["postId", "ownerUid", "createdAt"]
+    },
+    "PublicProfile": {
+      "title": "PublicProfile",
+      "description": "Public Battle Spirits builder profile containing non-sensitive social info only.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "bio": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "favoriteColor": {
+          "type": "string",
+          "enum": ["Red", "Purple", "White", "Yellow", "Green", "Blue"],
+          "maxLength": 20
+        },
+        "followersCount": {
+          "type": "integer"
+        },
+        "isPublic": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "photoURL",
+        "bio",
+        "favoriteColor",
+        "followersCount",
+        "isPublic",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ProfileFollower": {
+      "title": "ProfileFollower",
+      "description": "Follow edge linking a follower user to a builder profile.",
+      "type": "object",
+      "properties": {
+        "followerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "targetUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["followerUid", "targetUid", "createdAt"]
+    },
+    "CommunityPost": {
+      "title": "CommunityPost",
+      "description": "Shared Battle Spirits deck showcase or tournament result report.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "authorPhoto": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "postType": {
+          "type": "string",
+          "enum": ["deck", "tournament"],
+          "maxLength": 16
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "deckName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "format": {
+          "type": "string",
+          "enum": ["Standard", "Eternal"],
+          "maxLength": 16
+        },
+        "archetype": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "primaryColor": {
+          "type": "string",
+          "enum": ["Red", "Purple", "White", "Yellow", "Green", "Blue"],
+          "maxLength": 20
+        },
+        "colors": {
+          "type": "array",
+          "description": "Up to 6 card color strings"
+        },
+        "cardCount": {
+          "type": "integer"
+        },
+        "featuredCardId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "entries": {
+          "type": "array",
+          "description": "Snapshot array of card entries in the shared deck (1..100)"
+        },
+        "eventName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "eventTier": {
+          "type": "string",
+          "enum": ["", "Local Store", "SB (Shop Battle)", "CS (Championship)", "Area Qualifier", "National"],
+          "maxLength": 32
+        },
+        "placement": {
+          "type": "string",
+          "enum": ["", "1st Place", "2nd Place", "Top 4", "Top 8", "Top 16", "Participant"],
+          "maxLength": 24
+        },
+        "record": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "mvpCardId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "mvpCardName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "tags": {
+          "type": "array",
+          "description": "Up to 6 tag strings"
+        },
+        "likesCount": {
+          "type": "integer"
+        },
+        "commentsCount": {
+          "type": "integer"
+        },
+        "lastCommentId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "importsCount": {
+          "type": "integer"
+        },
+        "isPublic": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "authorUid",
+        "authorName",
+        "authorPhoto",
+        "postType",
+        "title",
+        "summary",
+        "deckName",
+        "format",
+        "archetype",
+        "primaryColor",
+        "colors",
+        "cardCount",
+        "featuredCardId",
+        "entries",
+        "eventName",
+        "eventTier",
+        "placement",
+        "record",
+        "mvpCardId",
+        "mvpCardName",
+        "tags",
+        "likesCount",
+        "commentsCount",
+        "lastCommentId",
+        "importsCount",
+        "isPublic",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PostLike": {
+      "title": "PostLike",
+      "description": "Like document tied atomically to a community post.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "postId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "postId", "createdAt"]
+    },
+    "PostComment": {
+      "title": "PostComment",
+      "description": "Comment reply on a community post.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "postId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "authorPhoto": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "postId", "authorUid", "authorName", "authorPhoto", "text", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Private user account metadata with PII (email) strictly locked to the owner."
+    },
+    "/users/{userId}/folders/{folderId}": {
+      "schema": { "$ref": "#/entities/UserDeckFolder" },
+      "description": "Cloud-saved deck folders private to the user."
+    },
+    "/users/{userId}/decks/{deckId}": {
+      "schema": { "$ref": "#/entities/UserDeck" },
+      "description": "Cloud-saved deck lists private to the user."
+    },
+    "/users/{userId}/bookmarks/{postId}": {
+      "schema": { "$ref": "#/entities/UserBookmark" },
+      "description": "Saved community post bookmarks private to the user."
+    },
+    "/publicProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/PublicProfile" },
+      "description": "Public builder profile summary without PII."
+    },
+    "/publicProfiles/{userId}/followers/{followerId}": {
+      "schema": { "$ref": "#/entities/ProfileFollower" },
+      "description": "Follower relationship documents under a builder profile."
+    },
+    "/posts/{postId}": {
+      "schema": { "$ref": "#/entities/CommunityPost" },
+      "description": "Public community deck showcases and tournament result reports."
+    },
+    "/posts/{postId}/likes/{userId}": {
+      "schema": { "$ref": "#/entities/PostLike" },
+      "description": "User likes per community post."
+    },
+    "/posts/{postId}/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/PostComment" },
+      "description": "Discussion comments on community posts."
+    }
+  }
+}

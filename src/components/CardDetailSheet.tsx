@@ -13,10 +13,11 @@ import {
   Columns2,
   ArrowLeftRight,
   Search,
-  Globe,
   Network,
   Maximize2,
   Ban,
+  AlertTriangle,
+  CheckCircle2,
   Scale,
   Share2,
   Copy,
@@ -33,7 +34,12 @@ import {
   SymbolIcon,
 } from './SymbolIcon';
 import { analyzeCardSynergies } from '../utils/cardSynergy';
-import { formatRestrictionSummary, getMaxCardCopies, isTokenCard } from '../utils/cardRules';
+import {
+  formatRestrictionSummary,
+  getCardLegalityStatus,
+  getMaxCardCopies,
+  isTokenCard,
+} from '../utils/cardRules';
 import {
   CardShareImageResult,
   generateCardShareImage,
@@ -50,7 +56,6 @@ interface CardDetailSheetProps {
   onClose: () => void;
   onSelectCard?: (card: BattleSpiritsCard) => void;
   onUpdateDeckQty: (cardId: string, delta: number) => void;
-  onCardHydrated?: (card: BattleSpiritsCard) => void;
 }
 
 function getMinCost(c: BattleSpiritsCard): number {
@@ -66,53 +71,6 @@ function getMaxBp(c: BattleSpiritsCard): number {
   return Math.max(...c.levels.map((l) => l.bp || 0));
 }
 
-function mergeHydratedCard(
-  base: BattleSpiritsCard,
-  hydrated: BattleSpiritsCard
-): BattleSpiritsCard {
-  return {
-    ...base,
-    ...hydrated,
-    id: base.id,
-    cardNumber: base.cardNumber,
-    setCode: base.setCode,
-    setName: base.setName,
-    rarity: base.rarity,
-    type: hydrated.type ?? base.type,
-    subtypeLabel: hydrated.subtypeLabel,
-    levels: hydrated.levels ?? [],
-    braveCondition: hydrated.braveCondition,
-    braveBonusBp: hydrated.braveBonusBp,
-    summonCondition: hydrated.summonCondition,
-    symbols: hydrated.symbols ?? base.symbols,
-    effects: hydrated.effects?.length ? hydrated.effects : base.effects,
-    galleryImages: hydrated.galleryImages?.length
-      ? hydrated.galleryImages
-      : base.galleryImages,
-    rulings: hydrated.rulings?.length ? hydrated.rulings : base.rulings,
-    isWikiLoaded: true,
-  };
-}
-
-async function fetchHydratedWikiCard(
-  target: BattleSpiritsCard
-): Promise<BattleSpiritsCard | null> {
-  if (!target.wikiTitle) return null;
-  const params = new URLSearchParams({
-    title: target.wikiTitle,
-    name: target.name,
-    cardNumber: target.cardNumber,
-    setCode: target.setCode,
-    setName: target.setName,
-    isRevival: target.isRevival ? 'true' : 'false',
-  });
-  const res = await fetch(`/api/wiki/card?${params.toString()}`);
-  if (!res.ok) return null;
-  const data = await res.json();
-  if (!data?.card) return null;
-  return mergeHydratedCard(target, data.card);
-}
-
 export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   card,
   allCards = [],
@@ -124,7 +82,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   onClose,
   onSelectCard,
   onUpdateDeckQty,
-  onCardHydrated,
 }) => {
   const [openRulingIdx, setOpenRulingIdx] = useState<number | null>(0);
   const [selectedArtIdx, setSelectedArtIdx] = useState(0);
@@ -139,7 +96,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     kind: 'copied' | 'shared' | 'downloaded' | 'info';
     text: string;
   } | null>(null);
-  const [hydrating, setHydrating] = useState(false);
 
   const [compareMode, setCompareMode] = useState(false);
   const [synergyMode, setSynergyMode] = useState(false);
@@ -151,9 +107,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   );
   const [pickerOpen, setPickerOpen] = useState(false);
   const [compareQuery, setCompareQuery] = useState('');
-  const [searchingWikiCompare, setSearchingWikiCompare] = useState(false);
-  const [wikiCompareResults, setWikiCompareResults] = useState<BattleSpiritsCard[]>([]);
-  const [hydratingCompare, setHydratingCompare] = useState(false);
 
   const [dragOffsetX, setDragOffsetX] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
@@ -186,7 +139,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     setCompareAdHocCard(null);
     setPickerOpen(false);
     setCompareQuery('');
-    setWikiCompareResults([]);
     setDragOffsetX(0);
     setIsDragging(false);
   }, [card?.id]);
@@ -216,29 +168,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     return () => cancelAnimationFrame(raf);
   }, [slideStage]);
 
-  useEffect(() => {
-    if (!card || !card.wikiTitle || card.isWikiLoaded) return;
-
-    let cancelled = false;
-    setHydrating(true);
-    fetchHydratedWikiCard(card)
-      .then((merged) => {
-        if (!cancelled && merged && onCardHydrated) {
-          onCardHydrated(merged);
-        }
-      })
-      .catch(() => {
-        // keep current card fields gracefully
-      })
-      .finally(() => {
-        if (!cancelled) setHydrating(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [card?.id, card?.wikiTitle, card?.isWikiLoaded]);
-
   const compareCard = useMemo(() => {
     if (!compareCardId) return null;
     return (
@@ -247,46 +176,10 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     );
   }, [allCards, compareCardId, compareAdHocCard]);
 
-  useEffect(() => {
-    if (!compareMode || !compareCard || !compareCard.wikiTitle || compareCard.isWikiLoaded) {
-      return;
-    }
-
-    let cancelled = false;
-    setHydratingCompare(true);
-    fetchHydratedWikiCard(compareCard)
-      .then((merged) => {
-        if (cancelled || !merged) return;
-        setCompareAdHocCard(merged);
-        if (onCardHydrated) {
-          onCardHydrated(merged);
-        }
-      })
-      .catch(() => {
-        // keep fallback compare card fields cleanly
-      })
-      .finally(() => {
-        if (!cancelled) setHydratingCompare(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [compareMode, compareCard?.id, compareCard?.wikiTitle, compareCard?.isWikiLoaded]);
-
   const compareCandidates = useMemo(() => {
     if (!card) return [];
     const q = compareQuery.trim().toLowerCase();
-    const mergedPool = new Map<string, BattleSpiritsCard>();
-    for (const c of allCards) {
-      if (c.id !== card.id) mergedPool.set(c.id, c);
-    }
-    for (const c of wikiCompareResults) {
-      if (c.id !== card.id && !mergedPool.has(c.id)) {
-        mergedPool.set(c.id, c);
-      }
-    }
-    const pool = Array.from(mergedPool.values());
+    const pool = allCards.filter((c) => c.id !== card.id);
 
     if (q) {
       return pool
@@ -314,7 +207,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
         return score(b) - score(a);
       })
       .slice(0, 24);
-  }, [allCards, wikiCompareResults, card, compareQuery]);
+  }, [allCards, card, compareQuery]);
 
   const synergyAnalysis = useMemo(() => {
     if (!card || !synergyMode) return null;
@@ -486,25 +379,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
     setCompareMode(true);
   };
 
-  const handleWikiCompareSearch = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const q = compareQuery.trim();
-    if (!q) return;
-    setSearchingWikiCompare(true);
-    try {
-      const res = await fetch(`/api/wiki/search?q=${encodeURIComponent(q)}`);
-      if (!res.ok) return;
-      const data = (await res.json()) as { cards?: BattleSpiritsCard[] };
-      if (Array.isArray(data.cards)) {
-        setWikiCompareResults(data.cards);
-      }
-    } catch {
-      // ignore transient search error
-    } finally {
-      setSearchingWikiCompare(false);
-    }
-  };
-
   const meta = COLOR_META[card.color];
   const reductionEntries = (
     Object.entries(card.reduction) as [BattleSymbolKind, number][]
@@ -519,6 +393,17 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   const isToken = isTokenCard(card);
   const maxCopies = getMaxCardCopies(card);
   const isBanned = !isToken && maxCopies === 0;
+  const legalityStatus = getCardLegalityStatus(card, activeDeckFormat);
+  const legalityBadgeClasses =
+    legalityStatus.tone === 'legal'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+      : legalityStatus.tone === 'warning'
+      ? 'bg-amber-50 border-amber-300 text-amber-900'
+      : legalityStatus.tone === 'restricted'
+      ? 'bg-orange-50 border-orange-300 text-orange-900'
+      : legalityStatus.tone === 'banned'
+      ? 'bg-red-50 border-red-300 text-red-800'
+      : 'bg-slate-100 border-slate-300 text-slate-700';
   const usesAdventSummon =
     Boolean(card.subtypeLabel && /contract/i.test(card.subtypeLabel)) ||
     card.effects.some((e) => /Summon\/Advent Condition|Contract Advent|\bAdvent\b/i.test(`${e.timing} ${e.text}`));
@@ -711,13 +596,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
     return (
       <div className="space-y-5">
-        {(hydrating || hydratingCompare) && (
-          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2 text-xs text-slate-600">
-            <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
-            <span>Syncing full English card stats and effects from Battle Spirits Wiki...</span>
-          </div>
-        )}
-
         {/* Side-by-Side Card Headers */}
         <div className="grid grid-cols-2 gap-3 sm:gap-4">
           {[
@@ -1129,13 +1007,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
     return (
       <div className="space-y-4">
-        {hydrating && (
-          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2 text-xs text-slate-600">
-            <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
-            <span>Syncing full card families and keywords from Battle Spirits Wiki...</span>
-          </div>
-        )}
-
         {/* Source Card Synergy Profile */}
         <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
           <div className="flex items-start justify-between gap-3">
@@ -1427,6 +1298,27 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 {card.setName}
               </p>
             )}
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-slate-500">
+                Legality ({activeDeckFormat}):
+              </span>
+              <span
+                data-testid="card-legality-badge"
+                title={legalityStatus.detail}
+                className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg border text-xs font-bold leading-tight ${legalityBadgeClasses}`}
+              >
+                {legalityStatus.tone === 'legal' ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                ) : legalityStatus.tone === 'banned' ? (
+                  <Ban className="w-3.5 h-3.5 shrink-0" />
+                ) : legalityStatus.tone === 'token' ? (
+                  <Layers className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>{legalityStatus.label}</span>
+              </span>
+            </div>
           </div>
 
           <button
@@ -1571,30 +1463,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 )}
               </div>
 
-              <form onSubmit={handleWikiCompareSearch} className="flex gap-2">
-                <div className="relative flex-1">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  <input
-                    type="search"
-                    value={compareQuery}
-                    onChange={(e) => setCompareQuery(e.target.value)}
-                    placeholder="Filter loaded cards or search Wiki (name, card number, family)..."
-                    className="w-full min-h-[44px] pl-9 pr-3 rounded-xl bg-white border border-slate-200 text-xs sm:text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={!compareQuery.trim() || searchingWikiCompare}
-                  className="min-h-[44px] px-3.5 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-slate-800 disabled:opacity-40 transition-colors cursor-pointer shrink-0"
-                >
-                  {searchingWikiCompare ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Globe className="w-4 h-4" />
-                  )}
-                  <span className="hidden sm:inline">Search Wiki</span>
-                </button>
-              </form>
+              <div className="relative">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="search"
+                  value={compareQuery}
+                  onChange={(e) => setCompareQuery(e.target.value)}
+                  placeholder="Search offline cards by name, card number, or family..."
+                  className="w-full min-h-[44px] pl-9 pr-3 rounded-xl bg-white border border-slate-200 text-xs sm:text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
+                />
+              </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-64 overflow-y-auto pr-1">
                 {compareCandidates.map((cand) => {
@@ -1631,7 +1509,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 })}
                 {compareCandidates.length === 0 && (
                   <div className="col-span-full py-6 text-center text-xs text-slate-500">
-                    No matching loaded cards. Press Search Wiki to pull matching cards.
+                    No matching cards found in the offline database.
                   </div>
                 )}
               </div>
@@ -1794,6 +1672,26 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                       />
                     </div>
                     <div className="flex items-center justify-between py-1 border-b border-slate-100 gap-2">
+                      <span className="text-slate-500 shrink-0">
+                        Legality ({activeDeckFormat})
+                      </span>
+                      <span
+                        title={legalityStatus.detail}
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-bold ${legalityBadgeClasses}`}
+                      >
+                        {legalityStatus.tone === 'legal' ? (
+                          <CheckCircle2 className="w-3 h-3 shrink-0" />
+                        ) : legalityStatus.tone === 'banned' ? (
+                          <Ban className="w-3 h-3 shrink-0" />
+                        ) : legalityStatus.tone === 'token' ? (
+                          <Layers className="w-3 h-3 shrink-0" />
+                        ) : (
+                          <AlertTriangle className="w-3 h-3 shrink-0" />
+                        )}
+                        <span>{legalityStatus.label}</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-1 border-b border-slate-100 gap-2">
                       <span className="text-slate-500 shrink-0">Format Legality</span>
                       <span
                         className={`font-semibold text-right ${
@@ -1837,16 +1735,6 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   </div>
                 </div>
               </div>
-
-              {hydrating && (
-                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-2 text-xs text-slate-600">
-                  <Loader2 className="w-4 h-4 animate-spin text-red-600" />
-                  <span>
-                    Loading full English card text and alternate artworks from Battle
-                    Spirits Wiki...
-                  </span>
-                </div>
-              )}
 
               {!isLegalInActiveDeck && (
                 <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950">
@@ -1962,9 +1850,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   </div>
                 ) : (
                   <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-500">
-                    {hydrating
-                      ? 'Fetching English effect text...'
-                      : 'No effect text recorded for this card.'}
+                    No effect text recorded for this card.
                   </div>
                 )}
               </div>
@@ -2153,12 +2039,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             )}
 
             <div className="overflow-y-auto flex-1 px-4 sm:px-6 py-4 space-y-3">
-              {hydrating && card.rulings.length === 0 ? (
-                <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center gap-2.5 text-xs sm:text-sm text-slate-600">
-                  <Loader2 className="w-4 h-4 animate-spin text-red-600 shrink-0" />
-                  <span>Loading official Q&amp;A rulings from Battle Spirits Wiki...</span>
-                </div>
-              ) : filteredModalRulings.length > 0 ? (
+              {filteredModalRulings.length > 0 ? (
                 filteredModalRulings.map((r, idx) => (
                   <div
                     key={`${idx}-${r.question.slice(0, 24)}`}

@@ -11,13 +11,13 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'icon.svg'],
+        includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'icon.svg', 'cards.json'],
         manifest: {
           id: '/',
           name: 'SpiritsDex — Battle Spirits Card Database',
           short_name: 'SpiritsDex',
           description:
-            'Mobile-optimized Battle Spirits trading card game database, deck builder, and offline card browser.',
+            '100% Offline-ready Battle Spirits trading card game English database, deck builder, and card browser.',
           theme_color: '#F7F8FA',
           background_color: '#F7F8FA',
           display: 'standalone',
@@ -45,8 +45,9 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,jpeg,webp,woff,woff2}'],
-          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,jpeg,webp,woff,woff2,json}'],
+          globIgnores: ['**/assets/aistudio/**'],
+          maximumFileSizeToCacheInBytes: 30 * 1024 * 1024,
           navigateFallback: 'index.html',
           navigateFallbackDenylist: [/^\/api\//],
           cleanupOutdatedCaches: true,
@@ -54,27 +55,13 @@ export default defineConfig(() => {
           skipWaiting: true,
           runtimeCaching: [
             {
-              urlPattern: /^\/api\/wiki\/image/i,
-              handler: 'CacheFirst',
-              options: {
-                cacheName: 'bs-card-artwork-v1',
-                expiration: {
-                  maxEntries: 600,
-                  maxAgeSeconds: 60 * 60 * 24 * 30,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
-            {
-              urlPattern: /^\/api\/wiki\/(?:directory|sets\/)/i,
+              urlPattern: /^\/cards\.json$/i,
               handler: 'StaleWhileRevalidate',
               options: {
-                cacheName: 'bs-wiki-sets-v1',
+                cacheName: 'bs-cards-json-v1',
                 expiration: {
-                  maxEntries: 80,
-                  maxAgeSeconds: 60 * 60 * 24 * 14,
+                  maxEntries: 4,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
                 },
                 cacheableResponse: {
                   statuses: [0, 200],
@@ -82,14 +69,13 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /^\/api\/wiki\/(?:banlist|card|search)/i,
-              handler: 'NetworkFirst',
+              urlPattern: /^\/images\/.*/i,
+              handler: 'CacheFirst',
               options: {
-                cacheName: 'bs-wiki-cards-v1',
-                networkTimeoutSeconds: 3,
+                cacheName: 'bs-local-images-v1',
                 expiration: {
-                  maxEntries: 500,
-                  maxAgeSeconds: 60 * 60 * 24 * 14,
+                  maxEntries: 10000,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
                 },
                 cacheableResponse: {
                   statuses: [0, 200],
@@ -135,7 +121,89 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
+      },
+    },
+    build: {
+      sourcemap: false,
+      minify: 'esbuild',
+      cssMinify: true,
+      target: 'es2020',
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            const normalizedId = id.replace(/\\/g, '/');
+
+            // Split rarely used export, deck-import/playtest, and static fallback modules
+            if (
+              normalizedId.includes('/src/utils/cardShareImage') ||
+              normalizedId.includes('/src/utils/deckImageExporter') ||
+              normalizedId.includes('/src/utils/deckDataExporter')
+            ) {
+              return 'utils-exporters';
+            }
+            if (
+              normalizedId.includes('/src/utils/decklistImport') ||
+              normalizedId.includes('/src/utils/deckShare') ||
+              normalizedId.includes('/src/utils/testHand') ||
+              normalizedId.includes('/src/utils/cardSynergy')
+            ) {
+              return 'utils-deck-tools';
+            }
+            if (normalizedId.includes('/src/data/cards.ts')) {
+              return 'data-cards';
+            }
+
+            if (!normalizedId.includes('/node_modules/')) return undefined;
+
+            // Split Firestore engine (~413 kB) separately from Firebase App/Auth (~166 kB)
+            if (
+              normalizedId.includes('firebase-firestore') ||
+              normalizedId.includes('/@firebase/firestore') ||
+              normalizedId.includes('/firebase/firestore')
+            ) {
+              return 'vendor-firestore';
+            }
+            if (
+              normalizedId.includes('/@firebase/') ||
+              normalizedId.includes('/firebase/')
+            ) {
+              return 'vendor-firebase-core';
+            }
+
+            // Split charting libraries separately (Recharts vs D3)
+            if (
+              normalizedId.includes('/recharts/') ||
+              normalizedId.includes('/victory-vendor/') ||
+              normalizedId.includes('/es-toolkit/') ||
+              normalizedId.includes('/decimal.js-light/') ||
+              normalizedId.includes('/lodash')
+            ) {
+              return 'vendor-recharts';
+            }
+            if (
+              normalizedId.includes('/d3') ||
+              normalizedId.includes('/internmap/') ||
+              normalizedId.includes('/delaunator/') ||
+              normalizedId.includes('/robust-predicates/')
+            ) {
+              return 'vendor-d3';
+            }
+
+            if (normalizedId.includes('/lucide-react/')) return 'vendor-icons';
+            if (normalizedId.includes('/motion/') || normalizedId.includes('/framer-motion/')) {
+              return 'vendor-motion';
+            }
+            if (
+              normalizedId.includes('/react/') ||
+              normalizedId.includes('/react-dom/') ||
+              normalizedId.includes('/scheduler/')
+            ) {
+              return 'vendor-react';
+            }
+            return undefined;
+          },
+        },
       },
     },
     server: {

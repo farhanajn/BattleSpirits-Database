@@ -11,7 +11,6 @@ import {
   Loader2,
   FileText,
   ClipboardPaste,
-  Globe,
   X,
   FileDown,
   FileJson,
@@ -25,6 +24,10 @@ import {
   ChevronRight,
   Pencil,
   Search,
+  LayoutGrid,
+  List,
+  Maximize2,
+  Cloud,
 } from 'lucide-react';
 import {
   BattleSpiritsCard,
@@ -37,6 +40,7 @@ import {
   GameFormat,
 } from '../types/card';
 import { ALL_COLORS, ALL_TYPES, COLOR_META } from '../data/theme';
+import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
 import { DeckCompositionChart } from './DeckCompositionChart';
 import { DeckStatsPanel } from './DeckStatsPanel';
@@ -48,7 +52,6 @@ import { buildShareDeckUrl } from '../utils/deckShare';
 import { getMaxCardCopies, isTokenCard } from '../utils/cardRules';
 import {
   buildImportedDeckEntries,
-  extractSetCodeFromCardNumber,
   parseDecklistText,
 } from '../utils/decklistImport';
 
@@ -80,12 +83,12 @@ interface DeckBuilderViewProps {
     newDeckArchetype?: string;
     newDeckFolderId?: string;
   }) => void;
-  onSyncMissingImportCards?: (queries: {
-    setCodes: string[];
-    queries: string[];
-  }) => Promise<number>;
   onInspectCard: (card: BattleSpiritsCard) => void;
   onBrowseCatalog: () => void;
+  cloudUserEmail?: string | null;
+  cloudSyncing?: boolean;
+  onSignInGoogle?: () => void;
+  onSyncNow?: () => void;
   onNotify?: (message: string) => void;
 }
 
@@ -105,9 +108,12 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   onDeleteDeck,
   onUpdateCardQty,
   onImportDeckEntries,
-  onSyncMissingImportCards,
   onInspectCard,
   onBrowseCatalog,
+  cloudUserEmail,
+  cloudSyncing = false,
+  onSignInGoogle,
+  onSyncNow,
   onNotify,
 }) => {
   const [creating, setCreating] = useState(false);
@@ -121,7 +127,6 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const [importDeckName, setImportDeckName] = useState('');
   const [importDeckFormat, setImportDeckFormat] = useState<GameFormat | null>(null);
   const [importDeckFolderId, setImportDeckFolderId] = useState<string>('');
-  const [syncingMissing, setSyncingMissing] = useState(false);
   const importTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [copied, setCopied] = useState(false);
   const [showTextExport, setShowTextExport] = useState(false);
@@ -143,6 +148,8 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
   const [folderFormName, setFolderFormName] = useState('');
   const [folderFormColor, setFolderFormColor] = useState<CardColor | ''>('Red');
   const [confirmDeleteFolderId, setConfirmDeleteFolderId] = useState<string | null>(null);
+  const [rosterViewMode, setRosterViewMode] = useState<'list' | 'images'>('list');
+  const [fullDeckGalleryOpen, setFullDeckGalleryOpen] = useState(false);
 
   const activeDeck = decks.find((d) => d.id === activeDeckId) || decks[0];
   const activeFormat: GameFormat = activeDeck?.format || 'Eternal';
@@ -426,34 +433,6 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     onNotify?.('Paste your deck list text directly into the box');
   };
 
-  const handleSyncMissing = async () => {
-    if (!importPreview || importPreview.unmatchedLines.length === 0 || !onSyncMissingImportCards) {
-      return;
-    }
-    setSyncingMissing(true);
-    try {
-      const setCodes: string[] = [];
-      const queries: string[] = [];
-      for (const line of importPreview.unmatchedLines) {
-        if (line.parsedCardNumber) {
-          const sc = extractSetCodeFromCardNumber(line.parsedCardNumber);
-          if (sc) setCodes.push(sc);
-          queries.push(line.parsedCardNumber);
-        } else if (line.parsedName) {
-          queries.push(line.parsedName);
-        }
-      }
-      const synced = await onSyncMissingImportCards({ setCodes, queries });
-      if (synced > 0) {
-        onNotify?.('Synced matching Wiki sets — re-checking deck list');
-      } else {
-        onNotify?.('No additional matching cards found on Wiki');
-      }
-    } finally {
-      setSyncingMissing(false);
-    }
-  };
-
   const handleApplyImport = () => {
     if (!importPreview || importPreview.aggregatedEntries.length === 0) return;
 
@@ -506,7 +485,36 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h1 className="font-display text-2xl font-bold text-slate-900">Deck Builder</h1>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="font-display text-2xl font-bold text-slate-900">Deck Builder</h1>
+            {cloudUserEmail ? (
+              <button
+                type="button"
+                onClick={onSyncNow}
+                disabled={cloudSyncing}
+                className="min-h-[28px] px-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:bg-emerald-100 disabled:opacity-60"
+                title={`Synced with ${cloudUserEmail}`}
+              >
+                {cloudSyncing ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Cloud className="w-3 h-3" />
+                )}
+                <span>{cloudSyncing ? 'Syncing Cloud...' : 'Saved to Google Cloud'}</span>
+              </button>
+            ) : (
+              onSignInGoogle && (
+                <button
+                  type="button"
+                  onClick={onSignInGoogle}
+                  className="min-h-[28px] px-2.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Cloud className="w-3 h-3 text-slate-500" />
+                  <span>Sign in with Google to Back Up Decks</span>
+                </button>
+              )
+            )}
+          </div>
           <p className="text-sm text-slate-500">
             Build for Standard (Block A cards only) or Eternal (all-era cards), 40+ cards, max 3 copies unless restricted.
           </p>
@@ -780,24 +788,6 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                   )}
                   )
                 </div>
-
-                {importPreview.unmatchedLines.length > 0 && onSyncMissingImportCards && (
-                  <button
-                    type="button"
-                    onClick={handleSyncMissing}
-                    disabled={syncingMissing}
-                    className="min-h-[36px] px-3 rounded-lg bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    {syncingMissing ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Globe className="w-3.5 h-3.5" />
-                    )}
-                    <span>
-                      {syncingMissing ? 'Searching Wiki...' : 'Lookup Unmatched on Wiki'}
-                    </span>
-                  </button>
-                )}
               </div>
 
               {importPreview.matchedLines.length > 0 && (
@@ -1772,17 +1762,62 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
           <div className="lg:col-span-7">
             <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+              <div className="px-4 py-3 border-b border-slate-100 flex flex-wrap items-center justify-between gap-2">
                 <h3 className="text-sm font-semibold text-slate-900">
                   Deck Roster ({resolvedEntries.length} unique)
                 </h3>
-                <button
-                  type="button"
-                  onClick={onBrowseCatalog}
-                  className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 cursor-pointer"
-                >
-                  + Add Cards
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {resolvedEntries.length > 0 && (
+                    <>
+                      <div
+                        role="group"
+                        aria-label="Deck roster view mode"
+                        className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setRosterViewMode('list')}
+                          className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                            rosterViewMode === 'list'
+                              ? 'bg-white text-slate-900 shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <List className="w-3.5 h-3.5" />
+                          <span>List</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setRosterViewMode('images')}
+                          className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                            rosterViewMode === 'images'
+                              ? 'bg-white text-slate-900 shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <LayoutGrid className="w-3.5 h-3.5" />
+                          <span>Full Images</span>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setFullDeckGalleryOpen(true)}
+                        className="min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                        title="Open full visual card decklist"
+                      >
+                        <Maximize2 className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">View Full Visual</span>
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={onBrowseCatalog}
+                    className="min-h-[40px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 cursor-pointer whitespace-nowrap"
+                  >
+                    + Add Cards
+                  </button>
+                </div>
               </div>
 
               {resolvedEntries.length === 0 ? (
@@ -1811,6 +1846,79 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                       <span>Import Deck List</span>
                     </button>
                   </div>
+                </div>
+              ) : rosterViewMode === 'images' ? (
+                <div className="p-3 sm:p-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                  {resolvedEntries.map(({ card, quantity }) => {
+                    const maxCopies = getMaxCopies(card);
+                    const cardFormats = card.formats || ['Eternal'];
+                    const isIllegalInStd =
+                      activeFormat === 'Standard' && !cardFormats.includes('Standard');
+                    const isOverRestricted = quantity > maxCopies;
+
+                    return (
+                      <div
+                        key={card.id}
+                        className={`rounded-2xl border overflow-hidden flex flex-col bg-white ${
+                          isIllegalInStd || isOverRestricted
+                            ? 'border-amber-300 ring-1 ring-amber-200'
+                            : 'border-slate-200'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onInspectCard(card)}
+                          className="relative aspect-[5/7] w-full bg-slate-950 overflow-hidden cursor-pointer group focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600"
+                          title={`Inspect ${card.name}`}
+                        >
+                          <CardArtwork
+                            card={card}
+                            fit="contain"
+                            className="w-full h-full bg-slate-950"
+                          />
+                          <div className="absolute top-2 right-2 px-2 py-0.5 rounded-lg bg-slate-950/90 text-white font-mono text-xs font-bold tabular-nums shadow-md border border-white/15">
+                            ×{quantity}
+                          </div>
+                        </button>
+                        <div className="p-2 flex flex-col gap-1.5 bg-white border-t border-slate-100">
+                          <button
+                            type="button"
+                            onClick={() => onInspectCard(card)}
+                            className="text-left text-xs font-semibold text-slate-900 truncate hover:text-red-700 cursor-pointer"
+                          >
+                            {card.name}
+                          </button>
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="font-mono text-[10px] text-slate-500 truncate">
+                              {card.cardNumber}
+                            </span>
+                            <div className="flex items-center border border-slate-200 rounded-lg overflow-hidden shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => onUpdateCardQty(card.id, -1)}
+                                className="min-h-[30px] min-w-[30px] flex items-center justify-center text-slate-700 hover:bg-slate-100 cursor-pointer"
+                                aria-label={`Remove one ${card.name}`}
+                              >
+                                <Minus className="w-3 h-3" />
+                              </button>
+                              <span className="px-1.5 font-mono text-[11px] font-bold tabular-nums">
+                                {quantity}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => onUpdateCardQty(card.id, 1)}
+                                disabled={quantity >= maxCopies}
+                                className="min-h-[30px] min-w-[30px] flex items-center justify-center text-slate-700 hover:bg-slate-100 disabled:opacity-35 cursor-pointer"
+                                aria-label={`Add one ${card.name}`}
+                              >
+                                <Plus className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 <ul className="divide-y divide-slate-100">
@@ -1944,6 +2052,69 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
                   })}
                 </ul>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fullscreen Full-Image Decklist Viewer */}
+      {fullDeckGalleryOpen && activeDeck && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/92 backdrop-blur-md flex flex-col"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="full-deck-gallery-title"
+          onClick={() => setFullDeckGalleryOpen(false)}
+        >
+          <div
+            className="px-4 sm:px-6 py-3.5 border-b border-white/10 flex items-center justify-between gap-3 shrink-0"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="min-w-0">
+              <h2
+                id="full-deck-gallery-title"
+                className="font-display text-base sm:text-lg font-bold text-white truncate"
+              >
+                {activeDeck.name}
+              </h2>
+              <p className="text-xs text-slate-400 font-mono tabular-nums">
+                {activeDeck.format} · {totalCards} total cards · {resolvedEntries.length} unique
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setFullDeckGalleryOpen(false)}
+              className="min-h-[40px] min-w-[40px] rounded-xl bg-white/10 text-white hover:bg-white/20 flex items-center justify-center shrink-0 cursor-pointer"
+              aria-label="Close full image decklist"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <div
+            className="flex-1 overflow-y-auto p-4 sm:p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4">
+              {resolvedEntries.map(({ card, quantity }) => (
+                <button
+                  key={`full-${card.id}`}
+                  type="button"
+                  onClick={() => {
+                    setFullDeckGalleryOpen(false);
+                    onInspectCard(card);
+                  }}
+                  className="group relative aspect-[5/7] rounded-2xl overflow-hidden bg-slate-900 border border-white/10 hover:border-white/35 transition-all cursor-pointer text-left"
+                >
+                  <CardArtwork
+                    card={card}
+                    fit="contain"
+                    className="w-full h-full bg-slate-950"
+                  />
+                  <div className="absolute top-2 right-2 px-2.5 py-0.5 rounded-lg bg-slate-950/90 text-white font-mono text-xs font-bold tabular-nums shadow-lg border border-white/15">
+                    ×{quantity}
+                  </div>
+                </button>
+              ))}
             </div>
           </div>
         </div>
