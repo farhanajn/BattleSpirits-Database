@@ -44,6 +44,7 @@ import {
   CardShareImageResult,
   generateCardShareImage,
 } from '../utils/cardShareImage';
+import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
 
 interface CardDetailSheetProps {
   card: BattleSpiritsCard | null;
@@ -225,6 +226,28 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
       ? navigableCards[navIndex + 1]
       : null;
   const hasNavigation = navIndex >= 0 && navigableCards.length > 1 && Boolean(onSelectCard);
+
+  const detailExtraUrls = useMemo(() => {
+    const urls: string[] = [];
+    if (card?.galleryImages) {
+      for (const item of card.galleryImages) {
+        if (item?.url) urls.push(item.url);
+      }
+    }
+    if (compareCard?.artworkImage) {
+      urls.push(compareCard.artworkImage);
+    }
+    return urls;
+  }, [card?.galleryImages, compareCard?.artworkImage]);
+
+  useWikiImagePrefetch({
+    cards: navigableCards,
+    currentIndex: navIndex >= 0 ? navIndex : 0,
+    lookahead: 4,
+    lookbehind: 1,
+    extraUrls: detailExtraUrls,
+    enabled: Boolean(card),
+  });
 
   const navigateAdjacent = React.useCallback(
     (direction: 'prev' | 'next') => {
@@ -1535,6 +1558,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                         card={card}
                         imageUrl={activeArt?.url}
                         fit="contain"
+                        eager
                         className="w-full h-full bg-slate-950"
                       />
                       <span className="absolute bottom-2 right-2 px-2 py-1 rounded-lg bg-slate-950/80 text-white text-[11px] font-semibold inline-flex items-center gap-1 opacity-90 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
@@ -2277,6 +2301,7 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                 card={card}
                 imageUrl={activeArt?.url}
                 fit="contain"
+                eager
                 className="w-full h-full bg-slate-950"
               />
             </div>

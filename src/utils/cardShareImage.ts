@@ -1,6 +1,7 @@
 import { ALL_SYMBOLS, COLOR_META, SYMBOL_META } from '../data/theme';
 import { BattleSpiritsCard, BattleSymbolKind } from '../types/card';
 import { formatRestrictionSummary, getMaxCardCopies, isTokenCard } from './cardRules';
+import { buildWikiImageUrl } from './wikiImageClient';
 
 export interface CardShareImageResult {
   blob: Blob;
@@ -235,11 +236,11 @@ export async function generateCardShareImage(
   card: BattleSpiritsCard,
   preferredImageUrl?: string
 ): Promise<CardShareImageResult> {
-  const artSrc = preferredImageUrl || card.artworkImage || '';
+  const artSrc = buildWikiImageUrl(card, preferredImageUrl);
   const symbolImages = new Map<BattleSymbolKind, HTMLImageElement | null>();
 
   const [artImage] = await Promise.all([
-    loadImageWithTimeout(artSrc, 3200),
+    loadImageWithTimeout(artSrc, 4500),
     ...ALL_SYMBOLS.map(async (sym) => {
       const img = await loadImageWithTimeout(SYMBOL_META[sym].image, 1800);
       symbolImages.set(sym, img);

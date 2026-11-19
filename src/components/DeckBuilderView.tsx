@@ -43,11 +43,11 @@ import { ALL_COLORS, ALL_TYPES, COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
 import { DeckCompositionChart } from './DeckCompositionChart';
+import { DeckCostChart } from './DeckCostChart';
 import { DeckStatsPanel } from './DeckStatsPanel';
 import { DeckD3Charts } from './DeckD3Charts';
 import { TestHandPanel } from './TestHandPanel';
-import { exportDecklistImage } from '../utils/deckImageExporter';
-import { exportDeckAsFile } from '../utils/deckDataExporter';
+import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
 import { buildShareDeckUrl } from '../utils/deckShare';
 import { getMaxCardCopies, isTokenCard } from '../utils/cardRules';
 import {
@@ -266,6 +266,21 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
   const [selectedCostBucket, setSelectedCostBucket] = useState<number | null>(null);
 
+  const deckCardsForPrefetch = useMemo(
+    () => resolvedEntries.map((entry) => entry.card),
+    [resolvedEntries]
+  );
+
+  useWikiImagePrefetch({
+    cards: deckCardsForPrefetch,
+    currentIndex: 0,
+    lookahead: fullDeckGalleryOpen ? 16 : 8,
+    lookbehind: 0,
+    enabled:
+      deckCardsForPrefetch.length > 0 &&
+      (rosterViewMode === 'images' || fullDeckGalleryOpen),
+  });
+
   const typeCounts = ALL_TYPES.reduce((acc, type) => {
     acc[type] = resolvedEntries
       .filter((e) => e.card.type === type)
@@ -377,6 +392,7 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     if (!activeDeck || resolvedEntries.length === 0 || downloading) return;
     setDownloading(true);
     try {
+      const { exportDecklistImage } = await import('../utils/deckImageExporter');
       const filename = await exportDecklistImage(activeDeck, resolvedEntries);
       setDownloaded(true);
       onNotify?.(`Saved ${filename}`);
@@ -388,9 +404,10 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
     }
   };
 
-  const handleExportDeckFile = (fileFormat: 'json' | 'csv') => {
+  const handleExportDeckFile = async (fileFormat: 'json' | 'csv') => {
     if (!activeDeck || resolvedEntries.length === 0) return;
     try {
+      const { exportDeckAsFile } = await import('../utils/deckDataExporter');
       const filename = exportDeckAsFile(activeDeck, resolvedEntries, fileFormat);
       setLastExportedFormat(fileFormat);
       onNotify?.(`Exported ${filename}`);
@@ -1500,11 +1517,19 @@ export const DeckBuilderView: React.FC<DeckBuilderViewProps> = ({
 
               <DeckStatsPanel resolvedEntries={resolvedEntries} totalCards={totalCards} />
 
+              <DeckCostChart
+                resolvedEntries={resolvedEntries}
+                totalCards={totalCards}
+                selectedCostBucket={selectedCostBucket}
+                onSelectCostBucket={setSelectedCostBucket}
+              />
+
               <DeckD3Charts
                 resolvedEntries={resolvedEntries}
                 totalCards={totalCards}
                 selectedCostBucket={selectedCostBucket}
                 onSelectCostBucket={setSelectedCostBucket}
+                showCostCurve={false}
               />
 
               <DeckCompositionChart typeCounts={typeCounts} totalCards={totalCards} />

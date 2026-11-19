@@ -72,7 +72,7 @@ export function buildDeckJsonString(
       setCode: card.setCode,
       setName: card.setName,
       restriction: card.restriction || 'Unlimited',
-      formats: card.formats,
+      formats: Array.isArray(card.formats) ? card.formats : ['Eternal'],
       version: card.isRevival ? 'Revival' : 'Original',
     })),
   };
@@ -118,6 +118,8 @@ export function buildDeckCsvString(
         : card.secondaryColor
         ? [card.color, card.secondaryColor]
         : [card.color];
+    const formatsList =
+      Array.isArray(card.formats) && card.formats.length > 0 ? card.formats : ['Eternal'];
 
     return [
       deck.name,
@@ -133,7 +135,7 @@ export function buildDeckCsvString(
       card.setCode,
       card.setName,
       card.restriction || 'Unlimited',
-      card.formats.join(' / '),
+      formatsList.join(' / '),
       card.isRevival ? 'Revival' : 'Original',
     ]
       .map(escapeCsvCell)

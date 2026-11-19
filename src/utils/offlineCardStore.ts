@@ -16,6 +16,7 @@ export interface CachedBanListSnapshot {
 export interface OfflineSnapshot {
   cards: BattleSpiritsCard[];
   productSets?: ProductSet[];
+  setSyncedAt?: number;
   banList?: CachedBanListSnapshot;
 }
 
@@ -86,10 +87,13 @@ export async function loadOfflineSnapshot(): Promise<OfflineSnapshot> {
     );
 
     let productSets: ProductSet[] | undefined;
+    let setSyncedAt: number | undefined;
     let banList: CachedBanListSnapshot | undefined;
     for (const entry of metaEntries) {
       if (entry?.key === 'productSets' && Array.isArray(entry.value)) {
         productSets = entry.value as ProductSet[];
+      } else if (entry?.key === 'setSyncedAt' && typeof entry.value === 'number') {
+        setSyncedAt = entry.value;
       } else if (
         entry?.key === 'banList' &&
         entry.value &&
@@ -99,7 +103,7 @@ export async function loadOfflineSnapshot(): Promise<OfflineSnapshot> {
       }
     }
 
-    return { cards, productSets, banList };
+    return { cards, productSets, setSyncedAt, banList };
   } finally {
     db.close();
   }
@@ -134,9 +138,10 @@ export async function saveOfflineCards(cards: BattleSpiritsCard[]): Promise<void
 
 export async function saveOfflineMeta(meta: {
   productSets?: ProductSet[];
+  setSyncedAt?: number;
   banList?: CachedBanListSnapshot;
 }): Promise<void> {
-  if (!meta.productSets && !meta.banList) return;
+  if (!meta.productSets && meta.setSyncedAt === undefined && !meta.banList) return;
   const db = await openOfflineDB();
   if (!db) return;
 
@@ -147,6 +152,9 @@ export async function saveOfflineMeta(meta: {
         const store = tx.objectStore(STORE_META);
         if (meta.productSets) {
           store.put({ key: 'productSets', value: meta.productSets });
+        }
+        if (typeof meta.setSyncedAt === 'number') {
+          store.put({ key: 'setSyncedAt', value: meta.setSyncedAt });
         }
         if (meta.banList) {
           store.put({ key: 'banList', value: meta.banList });

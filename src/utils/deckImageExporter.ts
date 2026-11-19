@@ -1,5 +1,6 @@
 import { ALL_COLORS, ALL_SYMBOLS, ALL_TYPES, COLOR_META, SYMBOL_META } from '../data/theme';
 import { BattleSpiritsCard, BattleSymbolKind, CardType, Deck } from '../types/card';
+import { buildWikiImageUrl } from './wikiImageClient';
 
 export interface ResolvedDeckEntry {
   card: BattleSpiritsCard;
@@ -138,7 +139,8 @@ export async function exportDecklistImage(
 
   await Promise.all([
     ...sortedEntries.map(async ({ card }) => {
-      const img = await loadImageWithTimeout(card.artworkImage);
+      const artSrc = buildWikiImageUrl(card);
+      const img = await loadImageWithTimeout(artSrc, 3500);
       loadedImages.set(card.id, img);
     }),
     ...ALL_SYMBOLS.map(async (sym) => {

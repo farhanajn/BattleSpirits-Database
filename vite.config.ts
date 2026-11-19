@@ -46,7 +46,6 @@ export default defineConfig(() => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,jpeg,webp,woff,woff2,json}'],
-          globIgnores: ['**/assets/aistudio/**'],
           maximumFileSizeToCacheInBytes: 30 * 1024 * 1024,
           navigateFallback: 'index.html',
           navigateFallbackDenylist: [/^\/api\//],
@@ -69,13 +68,13 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /^\/images\/.*/i,
-              handler: 'CacheFirst',
+              urlPattern: /^\/api\/wiki\/image/i,
+              handler: 'StaleWhileRevalidate',
               options: {
-                cacheName: 'bs-local-images-v1',
+                cacheName: 'bs-wiki-images-v1',
                 expiration: {
-                  maxEntries: 10000,
-                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                  maxEntries: 600,
+                  maxAgeSeconds: 60 * 60 * 24 * 30,
                 },
                 cacheableResponse: {
                   statuses: [0, 200],
@@ -191,9 +190,6 @@ export default defineConfig(() => {
             }
 
             if (normalizedId.includes('/lucide-react/')) return 'vendor-icons';
-            if (normalizedId.includes('/motion/') || normalizedId.includes('/framer-motion/')) {
-              return 'vendor-motion';
-            }
             if (
               normalizedId.includes('/react/') ||
               normalizedId.includes('/react-dom/') ||

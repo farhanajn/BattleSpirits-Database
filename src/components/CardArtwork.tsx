@@ -1,12 +1,21 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { BattleSpiritsCard } from '../types/card';
 import { COLOR_META } from '../data/theme';
+import {
+  buildFallbackWikiImageUrl,
+  buildWikiImageUrl,
+  getCachedWikiImageStatus,
+  markWikiImageError,
+  markWikiImageLoaded,
+} from '../utils/wikiImageClient';
 
 interface CardArtworkProps {
   card: BattleSpiritsCard;
   imageUrl?: string;
   className?: string;
   fit?: 'cover' | 'contain';
+  eager?: boolean;
 }
 
 export const CardArtwork: React.FC<CardArtworkProps> = ({
@@ -14,42 +23,114 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
   imageUrl,
   className = '',
   fit = 'cover',
+  eager = false,
 }) => {
-  const activeSrc = imageUrl || card.artworkImage;
-  const [imgError, setImgError] = useState(false);
-  const meta = COLOR_META[card.color];
+  const primarySrc = useMemo(
+    () => buildWikiImageUrl(card, imageUrl),
+    [card, imageUrl]
+  );
+  const fallbackSrc = useMemo(() => buildFallbackWikiImageUrl(card), [card]);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [inView, setInView] = useState<boolean>(
+    () =>
+      eager ||
+      typeof IntersectionObserver === 'undefined' ||
+      getCachedWikiImageStatus(primarySrc) === 'loaded'
+  );
+  const [useFallback, setUseFallback] = useState<boolean>(false);
+  const [loaded, setLoaded] = useState<boolean>(false);
+  const [finalError, setFinalError] = useState<boolean>(false);
+
+  const meta = COLOR_META[card.color] || COLOR_META.Red;
 
   useEffect(() => {
-    setImgError(false);
-  }, [activeSrc]);
+    const primaryStatus = primarySrc ? getCachedWikiImageStatus(primarySrc) : 'error';
+    const hasDistinctFallback = Boolean(fallbackSrc && fallbackSrc !== primarySrc);
+    const fallbackStatus = hasDistinctFallback
+      ? getCachedWikiImageStatus(fallbackSrc)
+      : 'error';
 
-  if (activeSrc && !imgError) {
-    return (
-      <div className={`relative overflow-hidden bg-slate-900 ${className}`}>
-        <img
-          src={activeSrc}
-          alt={card.name}
-          referrerPolicy="no-referrer"
-          loading="lazy"
-          onError={() => setImgError(true)}
-          className={
-            fit === 'contain'
-              ? 'w-full h-full object-contain'
-              : 'w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]'
+    if (primaryStatus === 'error') {
+      if (hasDistinctFallback && fallbackStatus !== 'error') {
+        setUseFallback(true);
+        setFinalError(false);
+        setLoaded(false);
+      } else {
+        setUseFallback(false);
+        setFinalError(true);
+        setLoaded(false);
+      }
+    } else if (!primarySrc) {
+      if (hasDistinctFallback && fallbackStatus !== 'error') {
+        setUseFallback(true);
+        setFinalError(false);
+        setLoaded(false);
+      } else {
+        setUseFallback(false);
+        setFinalError(true);
+        setLoaded(false);
+      }
+    } else {
+      setUseFallback(false);
+      setFinalError(false);
+      setLoaded(false);
+    }
+  }, [primarySrc, fallbackSrc]);
+
+  useEffect(() => {
+    if (eager || inView) return;
+    const el = containerRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') {
+      setInView(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting || entry.intersectionRatio > 0) {
+            setInView(true);
+            observer.disconnect();
+            break;
           }
-        />
-        {fit === 'cover' && (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
-        )}
-      </div>
+        }
+      },
+      { rootMargin: '260px 0px' }
     );
-  }
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [eager, inView]);
+
+  const activeSrc = useFallback ? fallbackSrc : primarySrc;
+  const shouldRenderImg = Boolean(activeSrc && !finalError && (eager || inView));
+
+  const handleLoad = () => {
+    if (activeSrc) markWikiImageLoaded(activeSrc);
+    setLoaded(true);
+  };
+
+  const handleError = () => {
+    if (activeSrc) markWikiImageError(activeSrc);
+    if (!useFallback && fallbackSrc && fallbackSrc !== primarySrc) {
+      const fbStatus = getCachedWikiImageStatus(fallbackSrc);
+      if (fbStatus !== 'error') {
+        setUseFallback(true);
+        setLoaded(false);
+        return;
+      }
+    }
+    setFinalError(true);
+  };
 
   return (
     <div
+      ref={containerRef}
       className={`relative overflow-hidden bg-gradient-to-br ${meta.gradient} ${className}`}
-      aria-label={`${card.name} elemental illustration`}
+      aria-label={`${card.name} artwork`}
     >
+      {/* Elemental SVG Illustration Backdrop / Final Fallback */}
       <svg
         viewBox="0 0 320 240"
         className={`w-full h-full ${fit === 'contain' ? 'object-contain' : 'object-cover'}`}
@@ -99,11 +180,47 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
 
         {['dragon', 'phantom', 'mecha', 'seraph', 'beast', 'titan'].includes(card.artVariant) && (
           <g transform="translate(160 114)" fill="#FFFFFF" opacity="0.9">
-            <path d="M0,-58 L28,-12 L68,-26 L38,14 L46,56 L0,34 L-46,56 L-38,14 L-68,-26 L-28,-12 Z" fillOpacity="0.24" stroke="#FFFFFF" strokeWidth="2" />
+            <path
+              d="M0,-58 L28,-12 L68,-26 L38,14 L46,56 L0,34 L-46,56 L-38,14 L-68,-26 L-28,-12 Z"
+              fillOpacity="0.24"
+              stroke="#FFFFFF"
+              strokeWidth="2"
+            />
             <polygon points="0,-34 20,10 0,34 -20,10" />
           </g>
         )}
       </svg>
+
+      {/* Non-blocking loading shimmer + spinner while Wiki artwork loads */}
+      {shouldRenderImg && !loaded && (
+        <div
+          className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-950/35 animate-pulse"
+          aria-hidden="true"
+        >
+          <Loader2 className="w-5 h-5 text-white/80 animate-spin drop-shadow" />
+        </div>
+      )}
+
+      {/* Wiki-streamed card artwork */}
+      {shouldRenderImg && (
+        <img
+          src={activeSrc}
+          alt={card.name}
+          referrerPolicy="no-referrer"
+          loading={eager ? 'eager' : 'lazy'}
+          decoding="async"
+          onLoad={handleLoad}
+          onError={handleError}
+          className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${
+            loaded ? 'opacity-100' : 'opacity-0'
+          } ${
+            fit === 'contain'
+              ? 'object-contain bg-slate-950'
+              : 'object-cover transition-transform duration-300 group-hover:scale-[1.03]'
+          }`}
+        />
+      )}
+
       {fit === 'cover' && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/55 to-transparent" />
       )}

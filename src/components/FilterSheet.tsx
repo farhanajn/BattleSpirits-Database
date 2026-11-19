@@ -284,7 +284,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
             <option value="All">All Sets</option>
             {availableSets.map((s) => (
               <option key={s.setCode} value={s.setCode}>
-                {s.setCode} — {s.name}
+                {s.name && s.name !== s.setCode ? `${s.setCode} — ${s.name}` : s.setCode}
               </option>
             ))}
           </select>

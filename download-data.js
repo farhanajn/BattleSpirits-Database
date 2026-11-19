@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /**
- * Standalone Battle Spirits Wiki Offline Downloader
+ * Standalone Battle Spirits Wiki Data Exporter
  *
- * Fetches sets, cards, English translations, rulings Q&A, banlist restrictions,
- * and card artwork images from battle-spirits.fandom.com, saves images locally
- * into public/images/, and writes clean normalized data into public/cards.json.
+ * Fetches sets, cards, English translations, rulings Q&A, and banlist restrictions
+ * from battle-spirits.fandom.com and writes clean normalized data into public/cards.json
+ * pointing artwork directly at the runtime /api/wiki/image proxy (zero local card image bloat).
  *
  * Usage:
  *   node download-data.js
  *   node download-data.js --sets=26RBS01,BS77,TOKENS
- *   node download-data.js --concurrency=12 --max-sets=40
- *   node download-data.js --no-images
+ *   node download-data.js --download-images
  */
 
 import fs from 'node:fs/promises';
@@ -48,7 +47,8 @@ const requestedSets = requestedSetsRaw
   : null;
 const maxSetsArg = getArgVal('--max-sets=');
 const maxSets = maxSetsArg ? Math.max(1, Number(maxSetsArg) || 999) : null;
-const skipImages = hasFlag('--no-images');
+const downloadImagesLocally = hasFlag('--download-images');
+const skipImages = !downloadImagesLocally || hasFlag('--no-images');
 const freshMode = hasFlag('--fresh');
 const imgConcurrency = Math.max(2, Math.min(24, Number(getArgVal('--concurrency=') || 12) || 12));
 const maxAltImagesPerCard = Math.max(
@@ -70,68 +70,68 @@ const KNOWN_SET_META = {
     colors: ['Red', 'Yellow', 'Blue'],
   },
   BS76: {
-    name: 'Contract Saga: Proof Vol. 1 – Radiance of the Eternal Kings',
-    releaseDate: 'May 2026',
+    name: 'Contract Saga: Proof Volume 1 – Radiance of the Eternal Kings',
+    releaseDate: 'May 30th, 2026',
     tagline: 'First Eternal Booster introducing Contract Nexuses and the Bannerace archetype.',
     colors: ['Red', 'Purple', 'White', 'Yellow', 'Green', 'Blue'],
   },
   BS75: {
-    name: 'Contract Saga: Cycle Vol. 4 – Assembling Heroes',
-    releaseDate: 'Feb 2026',
+    name: 'Contract Saga: Cycle Volume 4 – Assembling Heroes',
+    releaseDate: 'February 14th, 2026',
     tagline: 'Final chapter of Contract Saga: Cycle featuring Indra and Khaos.',
     colors: ['Red', 'Purple', 'White', 'Yellow', 'Green', 'Blue'],
   },
   BS72: {
-    name: 'Contract Saga: Cycle Vol. 1 – Return and Reawake',
-    releaseDate: 'May 2025',
+    name: 'Contract Saga: Cycle Volume 1 – Return and Reawake',
+    releaseDate: 'May 17th, 2025',
     tagline: 'Introduces Contract Grandwalker Artemis, Nyx, Lugh, and AX-Rares.',
     colors: ['Red', 'Purple', 'White'],
   },
   BS71: {
-    name: 'Contract Saga: True Vol. 4 – Return of the King of Gods',
-    releaseDate: 'Jan 2025',
+    name: 'Contract Saga: True Volume 4 – Return of the King of Gods',
+    releaseDate: 'Jan 25th, 2025',
     tagline: 'Crowning chapter of Contract Saga: True featuring Zeus and Olym deities.',
     colors: ['Red', 'Yellow'],
   },
   BS68: {
-    name: 'Contract Saga: True Vol. 1 – Battle of the Gods',
-    releaseDate: 'Apr 2024',
+    name: 'Contract Saga: True Volume 1 – Battle of the Gods',
+    releaseDate: 'April 27th, 2024',
     tagline: 'Introduced Contract Grandwalker Nexuses led by Hades and Athena.',
     colors: ['Purple', 'White'],
   },
   BS62: {
-    name: 'Contract Saga Vol. 3 – Rise of Rivals',
+    name: 'Contract Saga Volume 3 – Rise of Rivals',
     releaseDate: '2022',
     tagline: 'Contract Era booster featuring XX-Rares and high-impact Ultimates.',
     colors: ['Yellow', 'Blue'],
   },
   BS52: {
-    name: 'Chronicle of Rebirth Vol. 1',
-    releaseDate: '2020',
+    name: 'Rebirth Saga Volume 1 – The Returner',
+    releaseDate: 'April 25th, 2020',
     tagline: 'Introduced Rebirth double-sided cards.',
     colors: ['Green', 'Purple', 'White'],
   },
   BS45: {
-    name: 'Divine Awakening Vol. 2',
-    releaseDate: '2018',
+    name: 'Grand Advent Saga Volume 2 – Reincarnating Ultimate Deity',
+    releaseDate: 'July 28th, 2018',
     tagline: 'Advent Era set featuring Grandwalker Nexuses and Divine Spirits.',
     colors: ['White', 'Purple', 'Yellow', 'Blue'],
   },
   BS19: {
-    name: 'Sword-Eyes Era Vol. 1 – Darkness Awakening',
-    releaseDate: '2012',
+    name: 'Sword Generation',
+    releaseDate: 'October 13, 2012',
     tagline: 'Introduced Sword Braves and Curse/Trash recursion staples.',
     colors: ['Purple', 'Green', 'Blue'],
   },
   BS09: {
-    name: 'Supernova',
-    releaseDate: '2010',
+    name: 'Crush of Supernova',
+    releaseDate: 'August 6, 2010',
     tagline: 'Home of Supernova Dragon Siegwurm Nova and Meteor Storm.',
     colors: ['Red', 'Purple', 'Yellow', 'Green'],
   },
   BS01: {
     name: 'Dawn of the Spirit (Call of the Core)',
-    releaseDate: 'Sep 2008',
+    releaseDate: 'Sep 13, 2008',
     tagline: 'The inaugural Battle Spirits booster set introducing Awaken, High Speed, and Siegfried.',
     colors: ['Red', 'Purple', 'White', 'Green'],
   },
@@ -328,7 +328,8 @@ const STANDARD_KEYWORDS = [
 async function loadWikiSetMetadata() {
   try {
     const raw = await fs.readFile(SET_METADATA_TS_PATH, 'utf8');
-    const startIdx = raw.indexOf('{');
+    const eqIdx = raw.indexOf('= {');
+    const startIdx = eqIdx !== -1 ? eqIdx + 2 : raw.indexOf('{');
     const endIdx = raw.lastIndexOf('}');
     if (startIdx !== -1 && endIdx > startIdx) {
       return JSON.parse(raw.slice(startIdx, endIdx + 1));
@@ -356,19 +357,23 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (const code of standardBoosters) {
     const known = KNOWN_SET_META[code];
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || known?.name || `Standard Booster ${code}`;
+    const setName = wikiMeta?.name || known?.name || code;
     list.push({
       setCode: code,
-      wikiTitle: code,
+      wikiTitle: wikiMeta?.wikiTitle || code,
       category: 'Standard Booster',
       name: setName,
       jpName: '',
       productType: 'Booster Set',
-      releaseDate: known?.releaseDate || wikiMeta?.releaseDate || '2026+',
+      releaseDate: wikiMeta?.releaseDate || known?.releaseDate || '2026+',
       formats: ['Standard', 'Eternal'],
       blockLabel: 'Standard Format (Block A+)',
       isLatestStandard: code === '26RBS01',
-      tagline: known?.tagline || `${setName} (${code}) — Official Battle Spirits Standard Format expansion.`,
+      tagline:
+        known?.tagline ||
+        (setName !== code
+          ? `${setName} (${code}) — Official Battle Spirits Standard Format expansion.`
+          : `${code} — Battle Spirits Standard Format expansion.`),
       featuredCardId: `${code.toLowerCase()}-001`,
       colors: known?.colors || ALL_COLORS,
       totalCardsInSet: 0,
@@ -379,10 +384,10 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (let n = 14; n >= 1; n--) {
     const code = `26RSD${String(n).padStart(2, '0')}`;
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || `Standard Entry / Starter Deck ${code}`;
+    const setName = wikiMeta?.name || code;
     list.push({
       setCode: code,
-      wikiTitle: code,
+      wikiTitle: wikiMeta?.wikiTitle || code,
       category: 'Standard Starter',
       name: setName,
       jpName: '',
@@ -390,7 +395,10 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: wikiMeta?.releaseDate || '2026+',
       formats: ['Standard', 'Eternal'],
       blockLabel: 'Standard Format Starter',
-      tagline: `${setName} (${code}) — Pre-constructed Standard Format starter deck.`,
+      tagline:
+        setName !== code
+          ? `${setName} (${code}) — Pre-constructed Standard Format starter deck.`
+          : `${code} — Battle Spirits Standard Format starter deck.`,
       featuredCardId: `${code.toLowerCase()}-001`,
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -402,20 +410,22 @@ function buildDirectory(WIKI_SET_METADATA) {
     const code = `BS${String(n).padStart(2, '0')}`;
     const known = KNOWN_SET_META[code];
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || known?.name || `Booster Set ${code}`;
+    const setName = wikiMeta?.name || known?.name || code;
     list.push({
       setCode: code,
-      wikiTitle: code,
+      wikiTitle: wikiMeta?.wikiTitle || code,
       category: 'Booster',
       name: setName,
       jpName: '',
       productType: 'Booster Set',
       releaseDate:
-        known?.releaseDate || wikiMeta?.releaseDate || (n >= 76 ? '2026' : n >= 68 ? '2024–2026' : 'Eternal Era'),
+        wikiMeta?.releaseDate || known?.releaseDate || (n >= 76 ? '2026' : n >= 68 ? '2024–2026' : 'Eternal Era'),
       formats: ['Eternal'],
       blockLabel: n >= 76 ? 'Eternal Booster' : 'Eternal Format (BS01–BS75)',
       isLatestEternal: code === 'BS77',
-      tagline: known?.tagline || `${setName} (${code}) — Main Booster expansion.`,
+      tagline:
+        known?.tagline ||
+        (setName !== code ? `${setName} (${code}) — Main Booster expansion.` : `${code} — Main Booster expansion.`),
       featuredCardId: `${code.toLowerCase()}-001`,
       colors: known?.colors || ALL_COLORS,
       totalCardsInSet: 0,
@@ -427,18 +437,20 @@ function buildDirectory(WIKI_SET_METADATA) {
     const code = `SD${String(n).padStart(2, '0')}`;
     const known = KNOWN_SET_META[code];
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || known?.name || `Starter / Mega Deck ${code}`;
+    const setName = wikiMeta?.name || known?.name || code;
     list.push({
       setCode: code,
-      wikiTitle: code,
+      wikiTitle: wikiMeta?.wikiTitle || code,
       category: 'Starter Deck',
       name: setName,
       jpName: '',
       productType: setName.toLowerCase().includes('mega') ? 'Mega Deck' : 'Starter Deck',
-      releaseDate: known?.releaseDate || wikiMeta?.releaseDate || 'Eternal Era',
+      releaseDate: wikiMeta?.releaseDate || known?.releaseDate || 'Eternal Era',
       formats: ['Eternal'],
       blockLabel: 'Eternal Starter / Mega Deck',
-      tagline: known?.tagline || `${setName} (${code}) — Pre-constructed Deck.`,
+      tagline:
+        known?.tagline ||
+        (setName !== code ? `${setName} (${code}) — Pre-constructed Deck.` : `${code} — Pre-constructed Deck.`),
       featuredCardId: `${code.toLowerCase()}-001`,
       colors: known?.colors || ALL_COLORS,
       totalCardsInSet: 0,
@@ -449,7 +461,7 @@ function buildDirectory(WIKI_SET_METADATA) {
   {
     const cbxCode = 'CBX01';
     const cbxMeta = WIKI_SET_METADATA[cbxCode];
-    const cbxName = cbxMeta?.name || 'Collaboration Booster EX: Gundam - Destiny & Freedom';
+    const cbxName = cbxMeta?.name || cbxCode;
     list.push({
       setCode: cbxCode,
       wikiTitle: cbxMeta?.wikiTitle || cbxCode,
@@ -460,7 +472,10 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: cbxMeta?.releaseDate || 'Feb 2024',
       formats: ['Eternal'],
       blockLabel: 'Collab Booster EX',
-      tagline: `${cbxName} (${cbxCode}) — Extra Collaboration Booster.`,
+      tagline:
+        cbxName !== cbxCode
+          ? `${cbxName} (${cbxCode}) — Extra Collaboration Booster.`
+          : `${cbxCode} — Extra Collaboration Booster.`,
       featuredCardId: 'cbx01-cbx01-001',
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -471,7 +486,7 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (let n = 34; n >= 1; n--) {
     const code = `CB${String(n).padStart(2, '0')}`;
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || `Collab Booster ${code}`;
+    const setName = wikiMeta?.name || code;
     list.push({
       setCode: code,
       wikiTitle: wikiMeta?.wikiTitle || code,
@@ -482,7 +497,7 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: wikiMeta?.releaseDate || 'Eternal Era',
       formats: ['Eternal'],
       blockLabel: 'Collab Booster (CB01–CB34)',
-      tagline: `${setName} (${code}) — Collaboration Booster.`,
+      tagline: setName !== code ? `${setName} (${code}) — Collaboration Booster.` : `${code} — Collaboration Booster.`,
       featuredCardId: `${code.toLowerCase()}-${code.toLowerCase()}-001`,
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -493,7 +508,7 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (let n = 51; n >= 1; n--) {
     const code = `BSC${String(n).padStart(2, '0')}`;
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || `Supplementary Set ${code}`;
+    const setName = wikiMeta?.name || code;
     list.push({
       setCode: code,
       wikiTitle: wikiMeta?.wikiTitle || code,
@@ -504,7 +519,10 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: wikiMeta?.releaseDate || 'Eternal Era',
       formats: ['Eternal'],
       blockLabel: 'Supplementary Set (BSC01–BSC51)',
-      tagline: `${setName} (${code}) — Supplementary / Diva / X-Rare expansion.`,
+      tagline:
+        setName !== code
+          ? `${setName} (${code}) — Supplementary / Diva / X-Rare expansion.`
+          : `${code} — Supplementary / Diva / X-Rare expansion.`,
       featuredCardId: `${code.toLowerCase()}-${code.toLowerCase()}-001`,
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -515,7 +533,7 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (let n = 50; n >= 1; n--) {
     const code = `PB${String(n).padStart(2, '0')}`;
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || `Premium Bandai Set ${code}`;
+    const setName = wikiMeta?.name || code;
     const wikiTitle = wikiMeta?.wikiTitle || code;
     list.push({
       setCode: code,
@@ -527,7 +545,10 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: wikiMeta?.releaseDate || 'Premium Bandai',
       formats: ['Eternal'],
       blockLabel: 'Premium Bandai (PB01–PB50)',
-      tagline: `${setName} (${code}) — Premium Bandai limited edition release.`,
+      tagline:
+        setName !== code
+          ? `${setName} (${code}) — Premium Bandai limited edition release.`
+          : `${code} — Premium Bandai limited edition release.`,
       featuredCardId: `${code.toLowerCase()}-${code.toLowerCase()}-001`,
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -538,7 +559,7 @@ function buildDirectory(WIKI_SET_METADATA) {
   for (let n = 12; n >= 1; n--) {
     const code = `PC${String(n).padStart(2, '0')}`;
     const wikiMeta = WIKI_SET_METADATA[code];
-    const setName = wikiMeta?.name || `Premium Card Set ${code}`;
+    const setName = wikiMeta?.name || code;
     list.push({
       setCode: code,
       wikiTitle: wikiMeta?.wikiTitle || code,
@@ -549,7 +570,7 @@ function buildDirectory(WIKI_SET_METADATA) {
       releaseDate: wikiMeta?.releaseDate || 'Premium Card Set',
       formats: ['Eternal'],
       blockLabel: 'Premium Card Set (PC01–PC12)',
-      tagline: `${setName} (${code}) — Retail Premium Card Set.`,
+      tagline: setName !== code ? `${setName} (${code}) — Retail Premium Card Set.` : `${code} — Retail Premium Card Set.`,
       featuredCardId: `${code.toLowerCase()}-${code.toLowerCase()}-001`,
       colors: ALL_COLORS,
       totalCardsInSet: 0,
@@ -1858,9 +1879,11 @@ async function downloadImageFile(remoteUrl, destPath) {
 }
 
 async function main() {
-  console.log('=== BattleSpirits Wiki Offline Data & Image Downloader ===');
+  console.log('=== BattleSpirits Wiki Data Exporter ===');
   await fs.mkdir(PUBLIC_DIR, { recursive: true });
-  await fs.mkdir(IMAGES_DIR, { recursive: true });
+  if (downloadImagesLocally) {
+    await fs.mkdir(IMAGES_DIR, { recursive: true });
+  }
 
   const wikiMetaMap = await loadWikiSetMetadata();
   const fullDirectory = buildDirectory(wikiMetaMap);
@@ -2110,32 +2133,55 @@ async function main() {
     console.log('4/5 Skipping image download (--no-images flag or 0 candidates).');
   }
 
-  // Finalize cards with local /images/... paths (only pointing to files that actually exist on disk!)
+  // Finalize cards using runtime Wiki proxy URLs (or local /images/ only when --download-images is explicitly set)
+  const buildProxyImageUrl = (file, fallback, title) => {
+    const qs = new URLSearchParams();
+    if (file) qs.set('file', file);
+    if (fallback) qs.set('fallback', fallback);
+    if (title) qs.set('title', title);
+    return `/api/wiki/image?${qs.toString()}`;
+  };
+
   const finalizedNewCards = hydratedCards.map((card) => {
     const cands = card._galleryCandidates || [];
-    const localGallery = [];
+    const resolvedGallery = [];
     const seenUrls = new Set();
 
     for (const cand of cands) {
-      const localPath = downloadedLocalMap.get(cand.fileName.toLowerCase());
-      const fallbackDiskPng = `/images/${toSafeLocalImageName(`${cand.fallbackNumber}.png`)}`;
-      const fallbackDiskJpg = `/images/${toSafeLocalImageName(`${cand.fallbackNumber}.jpg`)}`;
-      const chosen =
-        [localPath, fallbackDiskPng, fallbackDiskJpg].find(
-          (p) => p && existsSync(path.join(PUBLIC_DIR, p.replace(/^\//, '')))
-        ) || '';
+      let chosen = '';
+      if (downloadImagesLocally) {
+        const localPath = downloadedLocalMap.get(cand.fileName.toLowerCase());
+        const fallbackDiskPng = `/images/${toSafeLocalImageName(`${cand.fallbackNumber}.png`)}`;
+        const fallbackDiskJpg = `/images/${toSafeLocalImageName(`${cand.fallbackNumber}.jpg`)}`;
+        chosen =
+          [localPath, fallbackDiskPng, fallbackDiskJpg].find(
+            (p) => p && existsSync(path.join(PUBLIC_DIR, p.replace(/^\//, '')))
+          ) || '';
+      } else {
+        chosen = buildProxyImageUrl(
+          cand.fileName,
+          cand.fallbackNumber || card.cardNumber,
+          card.wikiTitle || card.name
+        );
+      }
 
       if (chosen && !seenUrls.has(chosen)) {
         seenUrls.add(chosen);
-        localGallery.push({ url: chosen, caption: cand.caption });
+        resolvedGallery.push({ url: chosen, caption: cand.caption });
       }
     }
+
+    const fallbackPrimary = buildProxyImageUrl(
+      undefined,
+      card.cardNumber,
+      card.wikiTitle || card.name
+    );
 
     const { _galleryCandidates, ...cleanCard } = card;
     return {
       ...cleanCard,
-      artworkImage: localGallery[0]?.url || '',
-      galleryImages: localGallery.length > 0 ? localGallery : undefined,
+      artworkImage: resolvedGallery[0]?.url || fallbackPrimary,
+      galleryImages: resolvedGallery.length > 0 ? resolvedGallery : undefined,
     };
   });
 

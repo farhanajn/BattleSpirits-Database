@@ -11,6 +11,7 @@ interface CardThumbnailProps {
   deckQty: number;
   onSelect: (card: BattleSpiritsCard) => void;
   onAddToDeck: (card: BattleSpiritsCard) => void;
+  onHoverOrFocus?: () => void;
 }
 
 export const CardThumbnail: React.FC<CardThumbnailProps> = ({
@@ -18,6 +19,7 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
   deckQty,
   onSelect,
   onAddToDeck,
+  onHoverOrFocus,
 }) => {
   const cardColors: CardColor[] =
     card.colors && card.colors.length > 0
@@ -50,7 +52,11 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       : `${cardColors.length}-Color`;
 
   return (
-    <article className="group bg-white border border-slate-200 rounded-2xl overflow-hidden flex flex-col transition-colors hover:border-slate-300">
+    <article
+      onMouseEnter={onHoverOrFocus}
+      onFocus={onHoverOrFocus}
+      className="group bg-white border border-slate-200 rounded-2xl overflow-hidden flex flex-col transition-colors hover:border-slate-300"
+    >
       <button
         type="button"
         onClick={() => onSelect(card)}

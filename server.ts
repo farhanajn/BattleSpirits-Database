@@ -2,12 +2,15 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  buildWikiDirectory,
   fetchWikiImageBytes,
+  getManualCardMappingsList,
+  getSyncedWikiDirectory,
   getWikiBanList,
   getWikiCardDetail,
   getWikiSet,
   hydrateWikiCardsBatch,
+  resolveWikiCardImageMetadata,
+  runMissingArtworkDiagnostic,
   searchWikiCards,
 } from './server/wikiService.ts';
 import type { BattleSpiritsCard } from './src/types/card.ts';
@@ -22,8 +25,8 @@ async function startServer() {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/wiki/directory', (_req, res) => {
-    const sets = buildWikiDirectory();
-    res.json({ sets });
+    const { sets, syncedAt } = getSyncedWikiDirectory();
+    res.json({ sets, syncedAt });
   });
 
   app.get('/api/wiki/banlist', async (_req, res) => {
@@ -106,22 +109,105 @@ async function startServer() {
     }
   });
 
+  app.get('/api/wiki/manual-mappings', (_req, res) => {
+    const mappings = getManualCardMappingsList();
+    res.json({ count: mappings.length, mappings });
+  });
+
+  app.get('/api/wiki/artwork-diagnostics', async (req, res) => {
+    try {
+      const setCode = req.query.set ? String(req.query.set).trim() : undefined;
+      const limitRaw = req.query.limit ? Number(req.query.limit) : setCode ? 300 : 120;
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(2500, limitRaw) : 120;
+      const onlyMissing = req.query.onlyMissing === 'true' || req.query.onlyMissing === '1';
+      const report = await runMissingArtworkDiagnostic({
+        setCode,
+        limit,
+        onlyMissing,
+      });
+      res.json(report);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Artwork diagnostic failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.get('/api/wiki/image-url', async (req, res) => {
+    const file = String(req.query.file || '').trim();
+    const fallback = req.query.fallback ? String(req.query.fallback).trim() : undefined;
+    const title = req.query.title ? String(req.query.title).trim() : undefined;
+    const name = req.query.name ? String(req.query.name).trim() : undefined;
+    const jpName =
+      req.query.jp || req.query.jpName
+        ? String(req.query.jp || req.query.jpName).trim()
+        : undefined;
+    const setCode =
+      req.query.set || req.query.setCode
+        ? String(req.query.set || req.query.setCode).trim()
+        : undefined;
+    const id = req.query.id ? String(req.query.id).trim() : undefined;
+    const isRevival =
+      req.query.rv === '1' || req.query.rv === 'true' || req.query.isRevival === 'true';
+
+    if (!file && !fallback && !title && !name && !jpName) {
+      res.status(400).json({ ok: false, error: 'Missing image lookup parameters' });
+      return;
+    }
+
+    const meta = await resolveWikiCardImageMetadata({
+      id,
+      fileName: file || undefined,
+      cardNumber: fallback,
+      wikiTitle: title,
+      name,
+      jpName,
+      setCode,
+      isRevival: isRevival || undefined,
+    });
+    res.setHeader('Cache-Control', 'public, max-age=43200');
+    res.json(meta);
+  });
+
   app.get('/api/wiki/image', async (req, res) => {
     const file = String(req.query.file || '').trim();
-    const fallback = req.query.fallback ? String(req.query.fallback) : undefined;
-    if (!file && !fallback) {
+    const fallback = req.query.fallback ? String(req.query.fallback).trim() : undefined;
+    const title = req.query.title ? String(req.query.title).trim() : undefined;
+    const name = req.query.name ? String(req.query.name).trim() : undefined;
+    const jpName =
+      req.query.jp || req.query.jpName
+        ? String(req.query.jp || req.query.jpName).trim()
+        : undefined;
+    const setCode =
+      req.query.set || req.query.setCode
+        ? String(req.query.set || req.query.setCode).trim()
+        : undefined;
+    const id = req.query.id ? String(req.query.id).trim() : undefined;
+    const isRevival =
+      req.query.rv === '1' || req.query.rv === 'true' || req.query.isRevival === 'true';
+
+    if (!file && !fallback && !title && !name && !jpName) {
       res.status(400).end();
       return;
     }
 
-    const result = await fetchWikiImageBytes(file, fallback);
+    const result = await fetchWikiImageBytes({
+      id,
+      fileName: file || undefined,
+      cardNumber: fallback,
+      wikiTitle: title,
+      name,
+      jpName,
+      setCode,
+      isRevival: isRevival || undefined,
+    });
     if (!result) {
       res.status(404).end();
       return;
     }
 
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Type', result.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
     res.send(result.buffer);
   });
 

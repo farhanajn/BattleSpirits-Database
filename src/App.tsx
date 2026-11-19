@@ -67,6 +67,14 @@ import {
   saveOfflineCards,
   saveOfflineMeta,
 } from './utils/offlineCardStore';
+import { buildWikiImageUrl } from './utils/wikiImageClient';
+import { useWikiImagePrefetch } from './hooks/useWikiImagePrefetch';
+import {
+  loadFastCachedSets,
+  matchesIndexedSetQuery,
+  saveFastCachedSets,
+  synchronizeAndIndexSets,
+} from './utils/setMetadataSync';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'settings';
 
@@ -223,18 +231,43 @@ function computeSetReleaseRank(s: ProductSet, idx: number, total: number): numbe
 interface SearchSetIntent {
   exactSetCode?: string;
   paddedSetNum?: string;
+  rawDigits?: string;
 }
 
 function resolveSearchSetIntent(
   rawQuery: string,
-  knownSetCodes: Set<string>
+  knownSetCodes: Set<string>,
+  numericSetCodes?: Set<string>
 ): SearchSetIntent | null {
   const q = rawQuery.trim().toLowerCase();
   if (!q) return null;
 
-  const numOnly = q.match(/^(?:set\s*)?(\d{1,2})$/i);
+  const explicitSetPrefix = /^set\s+/i.test(q);
+  const numOnly = q.match(/^(?:set\s*)?(\d{1,4})$/i);
   if (numOnly) {
-    return { paddedSetNum: numOnly[1].padStart(2, '0') };
+    const rawDigits = numOnly[1];
+    const padded = rawDigits.length <= 2 ? rawDigits.padStart(2, '0') : rawDigits;
+    const unpadded = String(Number(rawDigits));
+    const exactNumCode = knownSetCodes.has(rawDigits)
+      ? rawDigits
+      : knownSetCodes.has(padded)
+      ? padded
+      : knownSetCodes.has(unpadded)
+      ? unpadded
+      : numericSetCodes?.has(rawDigits)
+      ? rawDigits
+      : numericSetCodes?.has(padded)
+      ? padded
+      : undefined;
+
+    // Preserve literal text search for 3-4 digit numbers (e.g. BP values) unless it matches a known/numeric set code or has "set " prefix
+    if (rawDigits.length <= 2 || exactNumCode || explicitSetPrefix) {
+      return {
+        ...(exactNumCode ? { exactSetCode: exactNumCode } : {}),
+        paddedSetNum: rawDigits.length <= 2 ? padded : rawDigits,
+        rawDigits,
+      };
+    }
   }
 
   const stripped = q.replace(/^set\s+/i, '').trim();
@@ -542,7 +575,7 @@ function mergeCardsIntoMap(
       keywords: primary.keywords && primary.keywords.length > 0 ? primary.keywords : secondary?.keywords || [],
       flavorText: primary.flavorText || secondary?.flavorText || '',
       illustrator: primary.illustrator || secondary?.illustrator || '',
-      artworkImage: primary.artworkImage || secondary?.artworkImage || '',
+      artworkImage: '',
       galleryImages:
         primary.galleryImages && primary.galleryImages.length > 0
           ? primary.galleryImages
@@ -551,6 +584,17 @@ function mergeCardsIntoMap(
       wikiTitle: primary.wikiTitle || secondary?.wikiTitle,
       isWikiLoaded: Boolean(primary.isWikiLoaded || secondary?.isWikiLoaded),
     };
+
+    merged.artworkImage = buildWikiImageUrl(
+      merged,
+      primary.artworkImage || secondary?.artworkImage || ''
+    );
+    if (merged.galleryImages && merged.galleryImages.length > 0) {
+      merged.galleryImages = merged.galleryImages.map((g) => ({
+        ...g,
+        url: buildWikiImageUrl(merged, g.url),
+      }));
+    }
 
     if (options?.banList) {
       merged.restriction = resolveBanRestriction(merged, options.banList);
@@ -576,8 +620,14 @@ export default function App() {
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  const [productSets, setProductSets] = useState<ProductSet[]>(PRODUCT_SETS);
+  const [productSets, setProductSets] = useState<ProductSet[]>(() => {
+    const cached = loadFastCachedSets();
+    return cached
+      ? synchronizeAndIndexSets([PRODUCT_SETS, cached.sets]).sets
+      : PRODUCT_SETS;
+  });
   const [loadingCardsJson, setLoadingCardsJson] = useState(true);
+  const [searchAnchorIndex, setSearchAnchorIndex] = useState(0);
 
   // Google Firebase Auth & Cloud Sync State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -743,36 +793,19 @@ export default function App() {
             void saveOfflineMeta({ banList: nextBanList });
           }
 
-          if (Array.isArray(data.sets) && data.sets.length > 0) {
-            const curatedByCode = new Map(
-              PRODUCT_SETS.map((s) => [s.setCode.toUpperCase(), s])
-            );
-            const mergedSets = data.sets.map((localSet) => {
-              const curated = curatedByCode.get(localSet.setCode.toUpperCase());
-              if (!curated) return localSet;
-              const isGeneric =
-                /^(?:Booster Set |Starter \/ Mega Deck |Standard (?:Booster|Entry) )/i.test(
-                  localSet.name
-                );
-              return {
-                ...localSet,
-                name: !isGeneric && localSet.name ? localSet.name : curated.name,
-                jpName: curated.jpName || localSet.jpName,
-                releaseDate: curated.releaseDate || localSet.releaseDate,
-                tagline: curated.tagline || localSet.tagline,
-                featuredCardId: curated.featuredCardId || localSet.featuredCardId,
-                colors: curated.colors.length > 0 ? curated.colors : localSet.colors,
-                totalCardsInSet: curated.totalCardsInSet || localSet.totalCardsInSet,
-              };
+          if (Array.isArray(data.sets) || (Array.isArray(data.cards) && data.cards.length > 0)) {
+            const incomingCards = Array.isArray(data.cards) ? data.cards : [];
+            const incomingSets = Array.isArray(data.sets) ? data.sets : [];
+            setProductSets((curr) => {
+              const synced = synchronizeAndIndexSets(
+                [PRODUCT_SETS, curr, incomingSets],
+                incomingCards
+              );
+              const syncedAt = Date.now();
+              saveFastCachedSets(synced.sets, syncedAt);
+              void saveOfflineMeta({ productSets: synced.sets, setSyncedAt: syncedAt });
+              return synced.sets;
             });
-            const seenCodes = new Set(mergedSets.map((s) => s.setCode.toUpperCase()));
-            for (const c of PRODUCT_SETS) {
-              if (!seenCodes.has(c.setCode.toUpperCase())) {
-                mergedSets.push(c);
-              }
-            }
-            setProductSets(mergedSets);
-            void saveOfflineMeta({ productSets: mergedSets });
           }
 
           if (Array.isArray(data.cards) && data.cards.length > 0) {
@@ -915,9 +948,11 @@ export default function App() {
         setBanList((curr) => curr || snapshot.banList!);
       }
       if (snapshot.productSets && snapshot.productSets.length > 0) {
-        setProductSets((curr) =>
-          curr.length <= PRODUCT_SETS.length ? snapshot.productSets! : curr
-        );
+        setProductSets((curr) => {
+          const merged = synchronizeAndIndexSets([PRODUCT_SETS, curr, snapshot.productSets!]);
+          saveFastCachedSets(merged.sets, snapshot.setSyncedAt || Date.now());
+          return merged.sets;
+        });
       }
       if (snapshot.cards.length > 0) {
         setCardsMap(
@@ -929,6 +964,43 @@ export default function App() {
         );
       }
     });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Re-use cached set metadata or synchronize missing/stale directory metadata with Wiki server
+  useEffect(() => {
+    if (typeof window === 'undefined' || navigator.onLine === false) return;
+    const SIX_HOURS_MS = 1000 * 60 * 60 * 6;
+    const cached = loadFastCachedSets();
+    if (
+      cached &&
+      cached.sets.length > PRODUCT_SETS.length &&
+      Date.now() - cached.syncedAt < SIX_HOURS_MS
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    fetch('/api/wiki/directory')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { sets?: ProductSet[]; syncedAt?: number } | null) => {
+        if (cancelled || !payload || !Array.isArray(payload.sets) || payload.sets.length === 0) {
+          return;
+        }
+        const syncedAt = typeof payload.syncedAt === 'number' ? payload.syncedAt : Date.now();
+        setProductSets((curr) => {
+          const merged = synchronizeAndIndexSets([PRODUCT_SETS, curr, payload.sets!]);
+          saveFastCachedSets(merged.sets, syncedAt);
+          void saveOfflineMeta({ productSets: merged.sets, setSyncedAt: syncedAt });
+          return merged.sets;
+        });
+      })
+      .catch(() => {
+        // Offline or unreachable — existing fast cache / IndexedDB metadata remains active
+      });
+
     return () => {
       cancelled = true;
     };
@@ -994,11 +1066,18 @@ export default function App() {
 
   const allCardsList = useMemo(() => Object.values(cardsMap), [cardsMap]);
 
+  const indexedSetDirectory = useMemo(
+    () => synchronizeAndIndexSets([productSets], allCardsList),
+    [productSets, allCardsList]
+  );
+
+  const syncedProductSets = indexedSetDirectory.sets;
+
   const availableSets = useMemo(() => {
-    return productSets
+    return syncedProductSets
       .filter((s) => matchesFormatFilter(s.formats, filters.format))
       .map((s) => ({ setCode: s.setCode, name: s.name }));
-  }, [productSets, filters.format]);
+  }, [syncedProductSets, filters.format]);
 
   const availableKeywords = useMemo(() => {
     const set = new Set<string>();
@@ -1029,9 +1108,7 @@ export default function App() {
       if (next.format !== filters.format) {
         let resolvedSetCode = next.setCode;
         if (resolvedSetCode !== 'All') {
-          const matchedSet = productSets.find(
-            (s) => s.setCode.toUpperCase() === resolvedSetCode.toUpperCase()
-          );
+          const matchedSet = indexedSetDirectory.byCode.get(resolvedSetCode.toUpperCase());
           if (!matchedSet || !matchesFormatFilter(matchedSet.formats, next.format)) {
             resolvedSetCode = 'All';
           }
@@ -1040,7 +1117,7 @@ export default function App() {
       }
       setFilters(next);
     },
-    [filters.format, productSets]
+    [filters.format, indexedSetDirectory]
   );
 
   const handleFormatSwitch = useCallback(
@@ -1052,37 +1129,40 @@ export default function App() {
 
   const releaseRankBySetCode = useMemo(() => {
     const map = new Map<string, number>();
-    const total = productSets.length;
-    productSets.forEach((s, idx) => {
+    const total = syncedProductSets.length;
+    syncedProductSets.forEach((s, idx) => {
       map.set(s.setCode.toUpperCase(), computeSetReleaseRank(s, idx, total));
     });
     return map;
-  }, [productSets]);
+  }, [syncedProductSets]);
 
   const knownSetCodes = useMemo(() => {
     const codes = new Set<string>(['TOKENS', 'REVIVAL']);
-    productSets.forEach((s) => codes.add(s.setCode.toUpperCase()));
-    allCardsList.forEach((c) => {
-      if (c.setCode) codes.add(c.setCode.toUpperCase());
-    });
+    for (const code of indexedSetDirectory.byCode.keys()) {
+      codes.add(code);
+    }
     return codes;
-  }, [productSets, allCardsList]);
+  }, [indexedSetDirectory]);
 
-  const setLookupByCode = useMemo(() => {
-    const map = new Map<string, ProductSet>();
-    productSets.forEach((s) => map.set(s.setCode.toUpperCase(), s));
-    return map;
-  }, [productSets]);
+  const setLookupByCode = indexedSetDirectory.byCode;
 
   const filteredCards = useMemo(() => {
     const q = filters.search.trim().toLowerCase();
     const qCompact = q.replace(/[\s-]+/g, '');
     const qTokens = q ? q.split(/\s+/).filter(Boolean) : [];
-    const searchSetIntent = resolveSearchSetIntent(q, knownSetCodes);
+    const searchSetIntent = resolveSearchSetIntent(
+      q,
+      knownSetCodes,
+      indexedSetDirectory.numericSetCodes
+    );
 
     const setQ = filters.setQuery.trim().toLowerCase();
     const setQCompact = setQ.replace(/[\s-]+/g, '');
-    const setQIntent = resolveSearchSetIntent(setQ, knownSetCodes);
+    const setQIntent = resolveSearchSetIntent(
+      setQ,
+      knownSetCodes,
+      indexedSetDirectory.numericSetCodes
+    );
 
     const matchesSetIntent = (card: BattleSpiritsCard, intent: SearchSetIntent) => {
       const cardSetUpper = card.setCode.toUpperCase();
@@ -1090,11 +1170,20 @@ export default function App() {
       if (intent.exactSetCode) {
         if (intent.exactSetCode === 'TOKENS') return Boolean(card.isToken);
         if (intent.exactSetCode === 'REVIVAL') return Boolean(card.isRevival);
-        return cardSetUpper === intent.exactSetCode || cardPrefix === intent.exactSetCode;
+        if (cardSetUpper === intent.exactSetCode || cardPrefix === intent.exactSetCode) {
+          return true;
+        }
+      }
+      if (intent.rawDigits && cardSetUpper === intent.rawDigits.toUpperCase()) {
+        return true;
       }
       if (intent.paddedSetNum) {
         const endRegex = new RegExp(`(?:^|[^0-9])${intent.paddedSetNum}$`, 'i');
-        return endRegex.test(cardSetUpper) || endRegex.test(cardPrefix);
+        return (
+          cardSetUpper === intent.paddedSetNum ||
+          endRegex.test(cardSetUpper) ||
+          endRegex.test(cardPrefix)
+        );
       }
       return false;
     };
@@ -1121,9 +1210,16 @@ export default function App() {
           if (!matchesSetIntent(card, setQIntent)) return false;
         } else {
           const matchedSet = setLookupByCode.get(card.setCode.toUpperCase());
+          const indexedMatch = matchedSet
+            ? matchesIndexedSetQuery(matchedSet, setQ, indexedSetDirectory.tokensByCode)
+            : false;
           const setHay = `${card.setCode} ${card.setName} ${matchedSet?.jpName || ''} ${matchedSet?.tagline || ''}`.toLowerCase();
           const setHayCompact = setHay.replace(/[\s-]+/g, '');
-          if (!setHay.includes(setQ) && !(setQCompact.length >= 2 && setHayCompact.includes(setQCompact))) {
+          if (
+            !indexedMatch &&
+            !setHay.includes(setQ) &&
+            !(setQCompact.length >= 2 && setHayCompact.includes(setQCompact))
+          ) {
             return false;
           }
         }
@@ -1233,7 +1329,20 @@ export default function App() {
     });
 
     return dedupedList;
-  }, [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode]);
+  }, [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]);
+
+  useEffect(() => {
+    setSearchAnchorIndex(0);
+  }, [filteredCards]);
+
+  // Pre-fetch upcoming card images in Search gallery using wikiImageClient cache
+  useWikiImagePrefetch({
+    cards: filteredCards,
+    currentIndex: searchAnchorIndex,
+    lookahead: 8,
+    lookbehind: 2,
+    enabled: activeTab === 'search' && filteredCards.length > 0,
+  });
 
   const navigableCards = useMemo(() => {
     if (activeTab === 'search') {
@@ -1649,9 +1758,7 @@ export default function App() {
   };
 
   const openSetInSearch = (setCode: string) => {
-    const targetSet = productSets.find(
-      (s) => s.setCode.toUpperCase() === setCode.toUpperCase()
-    );
+    const targetSet = indexedSetDirectory.byCode.get(setCode.toUpperCase());
     let nextFormat = filters.format;
     if (targetSet && !matchesFormatFilter(targetSet.formats, nextFormat)) {
       nextFormat = targetSet.formats.includes('Standard') ? 'Standard' : 'Eternal';
@@ -1670,16 +1777,20 @@ export default function App() {
 
   const activeSetMeta = useMemo(() => {
     if (filters.setCode !== 'All') {
-      return productSets.find((s) => s.setCode.toUpperCase() === filters.setCode.toUpperCase());
+      return indexedSetDirectory.byCode.get(filters.setCode.toUpperCase());
     }
     if (filters.setQuery.trim()) {
-      const intent = resolveSearchSetIntent(filters.setQuery, knownSetCodes);
+      const intent = resolveSearchSetIntent(
+        filters.setQuery,
+        knownSetCodes,
+        indexedSetDirectory.numericSetCodes
+      );
       if (intent?.exactSetCode) {
         return setLookupByCode.get(intent.exactSetCode);
       }
     }
     return undefined;
-  }, [filters.setCode, filters.setQuery, productSets, knownSetCodes, setLookupByCode]);
+  }, [filters.setCode, filters.setQuery, indexedSetDirectory, knownSetCodes, setLookupByCode]);
 
   const handleGoogleSignIn = async () => {
     if (signingIn) return;
@@ -1844,7 +1955,7 @@ export default function App() {
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-4 pb-24 lg:py-8">
         {activeTab === 'catalog' && (
           <CatalogMenuView
-            productSets={productSets}
+            productSets={syncedProductSets}
             cards={allCardsList}
             cardsById={cardsMap}
             activeDeckQtyMap={activeDeckQtyMap}
@@ -2140,13 +2251,14 @@ export default function App() {
                 </div>
               ) : (
                 <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-                  {filteredCards.map((card) => (
+                  {filteredCards.map((card, idx) => (
                     <CardThumbnail
                       key={card.id}
                       card={card}
                       deckQty={activeDeckQtyMap[card.id] || 0}
                       onSelect={setSelectedCard}
                       onAddToDeck={handleQuickAddToDeck}
+                      onHoverOrFocus={() => setSearchAnchorIndex(idx)}
                     />
                   ))}
                 </div>

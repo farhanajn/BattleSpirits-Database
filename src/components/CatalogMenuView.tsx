@@ -17,6 +17,8 @@ import { ALL_COLORS, COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { CardThumbnail } from './CardThumbnail';
 import { SymbolIcon } from './SymbolIcon';
+import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
+import { buildSetSearchTokens, matchesIndexedSetQuery } from '../utils/setMetadataSync';
 
 type SetCategoryTab =
   | 'all'
@@ -112,6 +114,30 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
     return filtered.slice(0, 8);
   }, [cards, activeFormat]);
 
+  const catalogPrefetchList = useMemo(
+    () =>
+      latestFeaturedCard
+        ? [latestFeaturedCard, ...newestCards.filter((c) => c.id !== latestFeaturedCard.id)]
+        : newestCards,
+    [latestFeaturedCard, newestCards]
+  );
+
+  useWikiImagePrefetch({
+    cards: catalogPrefetchList,
+    currentIndex: 0,
+    lookahead: 8,
+    lookbehind: 0,
+    enabled: catalogPrefetchList.length > 0,
+  });
+
+  const setTokensByCode = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const s of formatFilteredSets) {
+      map.set(s.setCode.toUpperCase(), buildSetSearchTokens(s));
+    }
+    return map;
+  }, [formatFilteredSets]);
+
   const filteredDirectorySets = useMemo(() => {
     const q = setQuery.trim().toLowerCase();
     return formatFilteredSets.filter((s) => {
@@ -150,14 +176,12 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
       }
       if (setCategory === 'promo' && s.category !== 'Promo') return false;
 
-      if (q) {
-        const hay =
-          `${s.setCode} ${s.name} ${s.jpName || ''} ${s.tagline} ${s.blockLabel} ${s.releaseDate} ${s.productType}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+      if (q && !matchesIndexedSetQuery(s, q, setTokensByCode)) {
+        return false;
       }
       return true;
     });
-  }, [formatFilteredSets, setCategory, setQuery]);
+  }, [formatFilteredSets, setCategory, setQuery, setTokensByCode]);
 
   // Single O(N) pass to compute available cards per set for the active format
   const cardCountsBySet = useMemo(() => {

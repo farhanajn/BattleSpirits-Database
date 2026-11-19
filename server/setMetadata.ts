@@ -154,13 +154,15 @@ export const WIKI_SET_METADATA: Record<string, { name: string; releaseDate?: str
     "name": "Contract Saga Volume 2 – Liberation of God"
   },
   "BS60": {
-    "name": "Contract Saga Volume 1 – First Partner"
+    "name": "Contract Saga Volume 1 – First Partner",
+    "releaseDate": "May 28th, 2022"
   },
   "BS59": {
     "name": "True Rebirth Saga Volume 4 – Ragnarok Moment"
   },
   "BS58": {
-    "name": "True Rebirth Saga Volume 3 – World Memory"
+    "name": "True Rebirth Saga Volume 3 – World Memory",
+    "releaseDate": "October 30th, 2021"
   },
   "BS57": {
     "name": "True Rebirth Saga Volume 2 – Never End Story",
@@ -170,7 +172,8 @@ export const WIKI_SET_METADATA: Record<string, { name: string; releaseDate?: str
     "name": "True Rebirth Saga Volume 1 – Future Truth"
   },
   "BS55": {
-    "name": "Rebirth Saga Volume 4 – All Over"
+    "name": "Rebirth Saga Volume 4 – All Over",
+    "releaseDate": "January 30th, 2021"
   },
   "BS54": {
     "name": "Rebirth Saga Volume 3 – World Break",
@@ -698,7 +701,7 @@ export const WIKI_SET_METADATA: Record<string, { name: string; releaseDate?: str
   "BSC12": {"name":"Constellation Saga 12 Zodiac Booster"},
   "BSC13": {"name":"Life Counter Set"},
   "BSC14": {"name":"X-Rare Pack"},
-  "BSC15": {"name":"Dream Booster: Burst Impact"},
+  "BSC15": {"name":"Dream Booster: Burst Impact","releaseDate":"23 November 2013"},
   "BSC16": {"name":"Diva Booster :Tunes of Goddesses"},
   "BSC17": {"name":"All Kira Booster: Dazzling Ultimate King"},
   "BSC18": {"name":"Diva Booster: Diva Symphony"},
@@ -706,8 +709,8 @@ export const WIKI_SET_METADATA: Record<string, { name: string; releaseDate?: str
   "BSC20": {"name":"Fierce Battle! The 15 Sengoku Armies","releaseDate":"June 20, 2015"},
   "BSC21": {"name":"All Kira Booster: Famous Swords Collection","releaseDate":"September 5th, 2015"},
   "BSC22": {"name":"Revival Booster: Rebirth of the Dragon Emperor","releaseDate":"December 19th, 2015"},
-  "BSC23": {"name":"Soul Hymn of War"},
-  "BSC24": {"name":"Collaboration Booster Ultra Kaiju Super Battle"},
+  "BSC23": {"name":"Soul Hymn of War","releaseDate":"20th February, 2016"},
+  "BSC24": {"name":"Collaboration Booster Ultra Kaiju Super Battle","releaseDate":"19th March, 2016"},
   "BSC25": {"name":"Dream Booster: Imagine of Flame and Wind"},
   "BSC26": {"name":"Collaboration Booster: Roar of the King of Kaiju","releaseDate":"August 13, 2016"},
   "BSC27": {"name":"All Kira Booster: Ultimate Returns","releaseDate":"October 29th, 2016"},

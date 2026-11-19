@@ -16,6 +16,7 @@ interface DeckD3ChartsProps {
   totalCards: number;
   selectedCostBucket: number | null;
   onSelectCostBucket: (bucket: number | null) => void;
+  showCostCurve?: boolean;
 }
 
 const VALID_COLOR_SET = new Set<CardColor>(ALL_COLORS);
@@ -49,6 +50,7 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
   totalCards,
   selectedCostBucket,
   onSelectCostBucket,
+  showCostCurve = true,
 }) => {
   const curveContainerRef = useRef<HTMLDivElement>(null);
   const curveSvgRef = useRef<SVGSVGElement>(null);
@@ -516,70 +518,72 @@ export const DeckD3Charts: React.FC<DeckD3ChartsProps> = ({
   return (
     <div className="space-y-4 pt-2 border-t border-slate-100">
       {/* D3 Mana Curve Bar Chart */}
-      <div>
-        <div className="flex items-center justify-between gap-2 mb-2">
-          <span className="text-xs font-semibold text-slate-700">
-            Mana Curve (D3 Bar Chart)
-          </span>
-          <span className="text-[11px] font-mono text-slate-500 tabular-nums">
-            {hoveredCost
-              ? `Cost ${hoveredCost.bucket === 8 ? '8+' : hoveredCost.bucket}: ${hoveredCost.total} cards`
-              : 'Tap bar to inspect'}
-          </span>
-        </div>
-
-        <div
-          ref={curveContainerRef}
-          className="w-full rounded-xl bg-slate-50/70 border border-slate-200/70 px-2 pt-2 pb-1 overflow-hidden"
-        >
-          <svg
-            ref={curveSvgRef}
-            role="img"
-            aria-label="Dynamic D3 Mana Curve stacked bar chart by card cost and color"
-            className="block w-full select-none"
-          />
-        </div>
-
-        {activeBucketDetail && (
-          <div className="mt-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1.5">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold text-slate-900">
-                Cost {activeBucketDetail.bucket === 8 ? '8+' : activeBucketDetail.bucket} Cards
-              </span>
-              <span className="font-mono text-slate-600 tabular-nums">
-                {activeBucketDetail.total} cards (
-                {totalCards > 0
-                  ? Math.round((activeBucketDetail.total / totalCards) * 100)
-                  : 0}
-                %)
-              </span>
-            </div>
-            {activeBucketDetail.cards.length === 0 ? (
-              <p className="text-xs text-slate-500">No cards at this cost in deck.</p>
-            ) : (
-              <ul className="space-y-1.5">
-                {activeBucketDetail.cards.map(({ card, quantity }) => (
-                  <li
-                    key={card.id}
-                    className="flex items-center justify-between gap-2 text-xs text-slate-700"
-                  >
-                    <span className="inline-flex items-center gap-1.5 min-w-0">
-                      <SymbolIcon color={card.color} size="xs" variant="gem" />
-                      <span className="truncate">{card.name}</span>
-                    </span>
-                    <span className="font-mono font-semibold tabular-nums shrink-0">
-                      ×{quantity}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
+      {showCostCurve && (
+        <div>
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <span className="text-xs font-semibold text-slate-700">
+              Mana Curve (D3 Bar Chart)
+            </span>
+            <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+              {hoveredCost
+                ? `Cost ${hoveredCost.bucket === 8 ? '8+' : hoveredCost.bucket}: ${hoveredCost.total} cards`
+                : 'Tap bar to inspect'}
+            </span>
           </div>
-        )}
-      </div>
+
+          <div
+            ref={curveContainerRef}
+            className="w-full rounded-xl bg-slate-50/70 border border-slate-200/70 px-2 pt-2 pb-1 overflow-hidden"
+          >
+            <svg
+              ref={curveSvgRef}
+              role="img"
+              aria-label="Dynamic D3 Mana Curve stacked bar chart by card cost and color"
+              className="block w-full select-none"
+            />
+          </div>
+
+          {activeBucketDetail && (
+            <div className="mt-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-900">
+                  Cost {activeBucketDetail.bucket === 8 ? '8+' : activeBucketDetail.bucket} Cards
+                </span>
+                <span className="font-mono text-slate-600 tabular-nums">
+                  {activeBucketDetail.total} cards (
+                  {totalCards > 0
+                    ? Math.round((activeBucketDetail.total / totalCards) * 100)
+                    : 0}
+                  %)
+                </span>
+              </div>
+              {activeBucketDetail.cards.length === 0 ? (
+                <p className="text-xs text-slate-500">No cards at this cost in deck.</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {activeBucketDetail.cards.map(({ card, quantity }) => (
+                    <li
+                      key={card.id}
+                      className="flex items-center justify-between gap-2 text-xs text-slate-700"
+                    >
+                      <span className="inline-flex items-center gap-1.5 min-w-0">
+                        <SymbolIcon color={card.color} size="xs" variant="gem" />
+                        <span className="truncate">{card.name}</span>
+                      </span>
+                      <span className="font-mono font-semibold tabular-nums shrink-0">
+                        ×{quantity}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* D3 Color Distribution Bar Chart */}
-      <div className="pt-2 border-t border-slate-100">
+      <div className={showCostCurve ? 'pt-2 border-t border-slate-100' : ''}>
         <div className="flex items-center justify-between gap-2 mb-2">
           <span className="text-xs font-semibold text-slate-700">
             Color Distribution (D3 Bar Chart)
