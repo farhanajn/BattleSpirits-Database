@@ -36,7 +36,7 @@ import {
 } from './wikiCardLookup.ts';
 
 const WIKI_API = 'https://battle-spirits.fandom.com/api.php';
-const WIKI_BASE = 'https://battle-spirits.fandom.com/wiki/';
+export const WIKI_BASE = 'https://battle-spirits.fandom.com/wiki/';
 const USER_AGENT = 'BattleSpiritsDB/1.0 (https://battle-spirits.fandom.com)';
 
 interface CacheEntry<T> {
@@ -207,7 +207,7 @@ function parseBanListWikitext(wikitext: string): WikiBanListSnapshot {
   return snapshot;
 }
 
-async function ensureBanListLoaded(): Promise<WikiBanListSnapshot> {
+export async function ensureBanListLoaded(): Promise<WikiBanListSnapshot> {
   const now = Date.now();
   if (banListCache && banListCache.expiresAt > now) {
     return banListCache.value;
@@ -260,7 +260,7 @@ export async function getWikiBanList(): Promise<WikiBanListSnapshot> {
   return ensureBanListLoaded();
 }
 
-function resolveCardRestriction(
+export function resolveCardRestriction(
   cardNumber: string,
   cardName: string,
   isRevival?: boolean,
@@ -898,7 +898,7 @@ function mergeStoredSetRecord(existing: ProductSet | undefined, incoming: Produc
   };
 }
 
-function upsertStoredSetMetadata(incoming: ProductSet): ProductSet {
+export function upsertStoredSetMetadata(incoming: ProductSet): ProductSet {
   const code = (incoming.setCode || '').trim().toUpperCase();
   if (!code || code === 'BSS01') return incoming;
   const merged = mergeStoredSetRecord(DIRECTORY_MAP.get(code), incoming);
@@ -1049,7 +1049,7 @@ function stripWikiNoise(raw: string): string {
     .replace(/<ref[^/]*\/>/gi, '');
 }
 
-function normalizeColor(raw: string): CardColor[] {
+export function normalizeColor(raw: string): CardColor[] {
   const cleaned = stripWikiNoise(raw)
     .replace(/<[^>]+>/g, ' ')
     .replace(/\{\{|\}\}/g, ' ');
@@ -1070,7 +1070,7 @@ function normalizeColor(raw: string): CardColor[] {
   return found.length > 0 ? found : ['Red'];
 }
 
-function normalizeType(raw: string): { type: CardType; subtypeLabel?: string } {
+export function normalizeType(raw: string): { type: CardType; subtypeLabel?: string } {
   const cleaned = cleanWikitextInline(stripWikiNoise(raw))
     .replace(/\s+/g, ' ')
     .trim();
@@ -1100,7 +1100,7 @@ function normalizeType(raw: string): { type: CardType; subtypeLabel?: string } {
   return { type, subtypeLabel };
 }
 
-function normalizeRarity(raw: string): CardRarity {
+export function normalizeRarity(raw: string): CardRarity {
   const cleaned = cleanWikitextInline(stripWikiNoise(raw)).trim();
   const lower = cleaned.toLowerCase();
   if (lower.includes('contract x') || lower === 'cx' || lower === 'cx-rare') return 'CX';
@@ -1117,7 +1117,7 @@ function normalizeRarity(raw: string): CardRarity {
   return 'C';
 }
 
-function defaultVariant(type: CardType, color: CardColor): BattleSpiritsCard['artVariant'] {
+export function defaultVariant(type: CardType, color: CardColor): BattleSpiritsCard['artVariant'] {
   if (type === 'Magic') return 'magic';
   if (type === 'Nexus') return 'nexus';
   if (type === 'Brave') return 'brave';
@@ -1167,7 +1167,7 @@ function extractTabberSegment(raw: string, wantRevival: boolean): string {
   );
 }
 
-function cleanWikitextInline(raw: string): string {
+export function cleanWikitextInline(raw: string): string {
   let out = extractTabberSegment(stripWikiNoise(raw), false)
     .replace(/\u00A0/g, ' ')
     .replace(/\{\{!\}\}/g, '|')
@@ -1266,7 +1266,7 @@ function cleanWikitextInline(raw: string): string {
   return out;
 }
 
-function parseTemplateFields(block: string): Record<string, string> {
+export function parseTemplateFields(block: string): Record<string, string> {
   const fields: Record<string, string> = {};
   const chunks: string[] = [];
   let braceDepth = 0;
@@ -1568,7 +1568,7 @@ function extractCardTableBlocks(wikitext: string): string[] {
   return extractTaggedCardTableBlocks(wikitext).map((t) => t.block);
 }
 
-function extractTaggedCardTableBlocks(wikitext: string): TaggedCardBlock[] {
+export function extractTaggedCardTableBlocks(wikitext: string): TaggedCardBlock[] {
   const blocks: TaggedCardBlock[] = [];
   const startRegex = /\{\{CardTable\d*/gi;
   let match: RegExpExecArray | null;
@@ -1730,7 +1730,7 @@ async function fetchWithRetry(
   throw lastError instanceof Error ? lastError : new Error('Wiki request failed');
 }
 
-async function fetchWikiJson(params: Record<string, string>): Promise<Record<string, unknown>> {
+export async function fetchWikiJson(params: Record<string, string>): Promise<Record<string, unknown>> {
   const search = new URLSearchParams({ ...params, format: 'json' });
   return withWikiSemaphore(async () => {
     const res = await fetchWithRetry(`${WIKI_API}?${search.toString()}`, {
@@ -1749,14 +1749,14 @@ async function fetchWikiJson(params: Record<string, string>): Promise<Record<str
   });
 }
 
-interface WikiPageBundle {
+export interface WikiPageBundle {
   wikitext: string;
   pageImages: string[];
 }
 
 const pageBundleCache = new Map<string, CacheEntry<WikiPageBundle>>();
 
-async function batchFetchWikiPages(titles: string[]): Promise<Map<string, WikiPageBundle>> {
+export async function batchFetchWikiPages(titles: string[]): Promise<Map<string, WikiPageBundle>> {
   const result = new Map<string, WikiPageBundle>();
   const toFetch: string[] = [];
   const now = Date.now();
@@ -2231,7 +2231,7 @@ export function hydrateCardFromWikitext(
   };
 }
 
-function parseSetTableRows(
+export function parseSetTableRows(
   wikitext: string,
   setMeta: ProductSet
 ): BattleSpiritsCard[] {
@@ -2443,7 +2443,7 @@ function parseSetTableRows(
   return cards;
 }
 
-function enrichSetMetadata(base: ProductSet, wikitext: string, parsedCards: BattleSpiritsCard[]): ProductSet {
+export function enrichSetMetadata(base: ProductSet, wikitext: string, parsedCards: BattleSpiritsCard[]): ProductSet {
   const introMatch = wikitext.match(/(?:Introduction|Overview)\s*\n\|-\s*\n\|\s*colspan="[^"]+"\s*\|\s*([\s\S]*?)(?=\n\|-|$)/i);
   const introRaw = introMatch ? cleanWikitextInline(introMatch[1]) : '';
 
@@ -3287,6 +3287,7 @@ function normalizeLookupCriteria(
       jpName: extra?.jpName?.trim() || undefined,
       setCode: extra?.setCode?.trim() || undefined,
       isRevival: extra?.isRevival,
+      stage: extra?.stage || 'all',
     };
   }
   return {
@@ -3298,6 +3299,7 @@ function normalizeLookupCriteria(
     jpName: fileNameOrCriteria.jpName?.trim() || undefined,
     setCode: fileNameOrCriteria.setCode?.trim() || undefined,
     isRevival: fileNameOrCriteria.isRevival,
+    stage: fileNameOrCriteria.stage || 'all',
   };
 }
 
@@ -3311,10 +3313,11 @@ function buildLookupCacheKey(criteria: CardLookupCriteria): string {
     (criteria.jpName || '').toLowerCase(),
     (criteria.setCode || '').toLowerCase(),
     criteria.isRevival ? 'rv' : 'orig',
+    criteria.stage || 'all',
   ].join('|');
 }
 
-function extractFilenameFromWikiUrl(url: string): string {
+export function extractFilenameFromWikiUrl(url: string): string {
   const clean = url.split('/revision/')[0].split('/').pop() || '';
   try {
     return decodeURIComponent(clean);
@@ -3665,14 +3668,12 @@ async function tryResolveFromCandidateTitles(
   let diagnosticNote: string | undefined;
 
   for (const item of ranked) {
-    const canRelaxForTitleOnly =
+    const canRelaxForManualTitle =
       !requireStrictScore &&
-      !criteria.name &&
-      !criteria.cardNumber &&
-      !criteria.jpName &&
-      item.evalRes.meta.hasCardTable;
+      !item.evalRes.meta.isDisambigOrList &&
+      (item.evalRes.meta.hasCardTable || item.page.pageImages.some(isCardArtworkFile));
 
-    if (!item.evalRes.accepted && !canRelaxForTitleOnly) continue;
+    if (!item.evalRes.accepted && !canRelaxForManualTitle) continue;
 
     const art = await extractPreferredArtworkFromPage(item.page, criteria);
     if (art) {
@@ -3694,7 +3695,7 @@ async function tryResolveFromCandidateTitles(
   return { hit: null, diagnosticNote };
 }
 
-async function resolveWikiImageUrl(fileNames: string[]): Promise<string | null> {
+export async function resolveWikiImageUrl(fileNames: string[]): Promise<string | null> {
   const cleanNames = fileNames
     .map((f) => f.replace(/^File:/i, '').trim())
     .filter((f) => Boolean(f) && !isNonCardWikiIcon(f));
@@ -3792,7 +3793,13 @@ export async function resolveCardArtworkWithTrace(
         ? input.cardNumber.split('-')[0].trim()
         : undefined),
     isRevival: input.isRevival,
+    stage: input.stage || 'all',
   };
+  const stageMode = criteria.stage || 'all';
+  const runExact = stageMode === 'all' || stageMode === 'exact';
+  const runNormalized = stageMode === 'all' || stageMode === 'normalized';
+  const runSetNumber = stageMode === 'all' || stageMode === 'set_number';
+  const runJapanese = stageMode === 'all' || stageMode === 'japanese';
 
   const cacheKey = buildLookupCacheKey(criteria);
   const now = Date.now();
@@ -3829,13 +3836,16 @@ export async function resolveCardArtworkWithTrace(
 
     try {
       // STAGE 0: Manual Verified Card Mapping (Highest Priority)
-      const manual = findManualCardMapping({
-        id: criteria.id,
-        cardNumber: criteria.cardNumber,
-        name: criteria.name || criteria.wikiTitle,
-        wikiTitle: criteria.wikiTitle,
-        isRevival,
-      });
+      const manual =
+        stageMode === 'all' || stageMode === 'exact'
+          ? findManualCardMapping({
+              id: criteria.id,
+              cardNumber: criteria.cardNumber,
+              name: criteria.name || criteria.wikiTitle,
+              wikiTitle: criteria.wikiTitle,
+              isRevival,
+            })
+          : undefined;
       if (manual) {
         stagesAttempted.push('stage0:manual-mapping');
         if (manual.artworkUrl && !isNonCardWikiIcon(manual.artworkUrl)) {
@@ -3875,7 +3885,11 @@ export async function resolveCardArtworkWithTrace(
         if (manual.wikiTitle) {
           const pageRes = await tryResolveFromCandidateTitles(
             [manual.wikiTitle],
-            { ...criteria, wikiTitle: manual.wikiTitle },
+            {
+              wikiTitle: manual.wikiTitle,
+              cardNumber: manual.cardNumber || criteria.cardNumber,
+              isRevival,
+            },
             discoveredResults,
             false
           );
@@ -3896,7 +3910,7 @@ export async function resolveCardArtworkWithTrace(
       }
 
       // Fast-Path Direct File Check when an explicit artwork filename is provided
-      if (criteria.fileName && isCardArtworkFile(criteria.fileName)) {
+      if (runExact && criteria.fileName && isCardArtworkFile(criteria.fileName)) {
         stagesAttempted.push('stage1:direct-file');
         const fileCands = expandWikiFileCandidates(criteria.fileName, undefined, {
           isSideB,
@@ -3922,7 +3936,7 @@ export async function resolveCardArtworkWithTrace(
       const exactTitleList = Array.from(
         new Set([criteria.wikiTitle, criteria.name].filter((x): x is string => Boolean(x)))
       );
-      if (exactTitleList.length > 0) {
+      if (runExact && exactTitleList.length > 0) {
         stagesAttempted.push('stage1:exact-name-page');
         const exactRes = await tryResolveFromCandidateTitles(
           exactTitleList,
@@ -3952,7 +3966,7 @@ export async function resolveCardArtworkWithTrace(
         cleanCardNumber &&
         cleanCardNumber.toUpperCase() !== 'WIKI' &&
         /[A-Z0-9]{2,}-[A-Z0-9]+/i.test(cleanCardNumber);
-      if (hasValidNumber) {
+      if (runSetNumber && hasValidNumber) {
         stagesAttempted.push('stage2:card-number');
         const numCands = expandWikiFileCandidates(undefined, cleanCardNumber, {
           isSideB,
@@ -4004,7 +4018,7 @@ export async function resolveCardArtworkWithTrace(
 
       // STAGE 3: Normalized Card Name (punctuation, spaces, hyphens, apostrophes, Roman<->Arabic)
       const seedName = criteria.name || criteria.wikiTitle || '';
-      if (seedName) {
+      if (runNormalized && seedName) {
         stagesAttempted.push('stage3:normalized-name');
         const romanArabic = generateRomanArabicVariants(seedName);
         const normalizedClean = normalizeCardSearchText(seedName);
@@ -4087,7 +4101,7 @@ export async function resolveCardArtworkWithTrace(
       const altCandidates = buildAlternateTitleCandidates(criteria).filter(
         (t) => !exactTitleList.includes(t)
       );
-      if (altCandidates.length > 0) {
+      if (runNormalized && altCandidates.length > 0) {
         stagesAttempted.push('stage4:alternate-aliases');
         const altRes = await tryResolveFromCandidateTitles(
           altCandidates.slice(0, 10),
@@ -4148,7 +4162,7 @@ export async function resolveCardArtworkWithTrace(
       const detectedJp =
         cleanJp ||
         (/[\u3040-\u30FF\u4E00-\u9FFF]/.test(seedName) ? seedName : '');
-      if (detectedJp) {
+      if (runJapanese && detectedJp) {
         stagesAttempted.push('stage5:japanese-name');
         const jpVariants = Array.from(
           new Set([
@@ -4187,7 +4201,7 @@ export async function resolveCardArtworkWithTrace(
 
       // STAGE 6: Set Code + Card Number Lookup (Wiki Search + Set Table Cross-Reference)
       const setUpper = (criteria.setCode || '').trim().toUpperCase();
-      if (setUpper && setUpper !== 'WIKI' && (cleanCardNumber || seedName)) {
+      if (runSetNumber && setUpper && setUpper !== 'WIKI' && (cleanCardNumber || seedName)) {
         stagesAttempted.push('stage6:set-plus-number');
         const setQueries = Array.from(
           new Set(
@@ -4271,7 +4285,7 @@ export async function resolveCardArtworkWithTrace(
 
       // STAGE 7: OpenSearch & Redirect Resolution
       const openQuery = stripCardNameDecorations(seedName) || cleanCardNumber;
-      if (openQuery && openQuery.length >= 3) {
+      if (runNormalized && openQuery && openQuery.length >= 3) {
         stagesAttempted.push('stage7:opensearch-redirects');
         const openQueries = Array.from(
           new Set([openQuery, ...generateRomanArabicVariants(openQuery)])

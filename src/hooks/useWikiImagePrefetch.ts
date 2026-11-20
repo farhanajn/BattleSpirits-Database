@@ -4,8 +4,10 @@ import {
   buildFallbackWikiImageUrl,
   buildWikiImageUrl,
   getCachedWikiImageStatus,
+  isCardSessionLookupFailed,
   preloadWikiImage,
 } from '../utils/wikiImageClient';
+import { getManualWikiMapping } from '../utils/ManualWikiMapping';
 
 export interface UseWikiImagePrefetchOptions {
   /** Ordered list of cards in the active gallery, grid, or deck view */
@@ -94,6 +96,7 @@ export function useWikiImagePrefetch({
       for (let i = safeAnchor; i <= maxEnd; i++) {
         const card = cards[i];
         if (!card) continue;
+        if (!getManualWikiMapping(card) && isCardSessionLookupFailed(card)) continue;
         pushTarget(buildWikiImageUrl(card), buildFallbackWikiImageUrl(card));
       }
 
@@ -102,6 +105,7 @@ export function useWikiImagePrefetch({
       for (let i = safeAnchor - 1; i >= minStart; i--) {
         const card = cards[i];
         if (!card) continue;
+        if (!getManualWikiMapping(card) && isCardSessionLookupFailed(card)) continue;
         pushTarget(buildWikiImageUrl(card), buildFallbackWikiImageUrl(card));
       }
     }

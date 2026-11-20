@@ -5,10 +5,14 @@ import { COLOR_META } from '../data/theme';
 import {
   buildFallbackWikiImageUrl,
   buildWikiImageUrl,
+  clearCardSessionLookupFailure,
   getCachedWikiImageStatus,
+  isCardSessionLookupFailed,
+  markCardSessionLookupFailed,
   markWikiImageError,
   markWikiImageLoaded,
 } from '../utils/wikiImageClient';
+import { getManualWikiMapping } from '../utils/ManualWikiMapping';
 
 interface CardArtworkProps {
   card: BattleSpiritsCard;
@@ -45,6 +49,14 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
   const meta = COLOR_META[card.color] || COLOR_META.Red;
 
   useEffect(() => {
+    const hasManual = Boolean(getManualWikiMapping(card));
+    if (!imageUrl && !hasManual && isCardSessionLookupFailed(card)) {
+      setUseFallback(false);
+      setFinalError(true);
+      setLoaded(false);
+      return;
+    }
+
     const primaryStatus = primarySrc ? getCachedWikiImageStatus(primarySrc) : 'error';
     const hasDistinctFallback = Boolean(fallbackSrc && fallbackSrc !== primarySrc);
     const fallbackStatus = hasDistinctFallback
@@ -76,7 +88,7 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
       setFinalError(false);
       setLoaded(false);
     }
-  }, [primarySrc, fallbackSrc]);
+  }, [card, imageUrl, primarySrc, fallbackSrc]);
 
   useEffect(() => {
     if (eager || inView) return;
@@ -108,6 +120,7 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
 
   const handleLoad = () => {
     if (activeSrc) markWikiImageLoaded(activeSrc);
+    clearCardSessionLookupFailure(card);
     setLoaded(true);
   };
 
@@ -120,6 +133,9 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
         setLoaded(false);
         return;
       }
+    }
+    if (!imageUrl && !getManualWikiMapping(card)) {
+      markCardSessionLookupFailed(card);
     }
     setFinalError(true);
   };

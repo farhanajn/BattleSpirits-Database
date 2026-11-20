@@ -1,0 +1,899 @@
+The production deployment package MUST remain below 250 MB. This is a strict requirement, not a suggestion.
+
+---
+
+1. CRITICAL RULES — PRESERVE THE EXISTING APPLICATION
+
+Before making any changes, inspect the existing application and understand its architecture.
+
+Do not redesign Spiritsdex.
+
+Do not remove, replace, reset, or break any existing:
+
+- Card records
+- Set records
+- User accounts
+- User data
+- Decks
+- Saved collections
+- Community features
+- Manually verified artwork mappings
+- UI components
+- Features
+- Firebase configuration
+- Existing database structure unless a backward-compatible migration is necessary
+
+Do not make unrelated changes.
+
+Preserve the current UI, styling, navigation, and user experience. Integrate the new functionality into the existing architecture as much as possible.
+
+Do not replace the existing card database with a new database.
+
+Do not delete existing card data to make synchronization easier.
+
+Use safe, backward-compatible changes.
+
+---
+
+2. AUDIT THE EXISTING ARCHITECTURE
+
+Inspect the existing codebase, especially:
+
+- `public/cards.json`
+- `src/data/cards.ts`
+- `src/utils/wikiImageClient.ts`
+- `src/utils/ManualWikiMapping.ts`
+- `server/manualCardMappings.ts`
+- `server/wikiCardLookup.ts`
+- `server/wikiService.ts`
+- `src/App.tsx`
+- `src/components/CardArtwork.tsx`
+- `src/hooks/useWikiImagePrefetch.ts`
+- Existing catalog/set/category data
+- Existing admin dashboard
+- Existing Firebase/Firestore configuration
+- API routes
+- Search and filter logic
+- Pagination logic
+- Card imports and synchronization
+- Production build and deployment configuration
+
+Determine:
+
+1. How the current card database is populated.
+2. Why the current catalog is incomplete.
+3. How Wiki API discovery works.
+4. How artwork lookup works.
+5. How manual mappings are stored and prioritized.
+6. Where large files or dependencies contribute to deployment size.
+7. Whether the current hosting architecture supports reliable background scheduled jobs.
+8. How new catalog data can be safely stored without increasing the production bundle size.
+
+Do not begin implementation until you understand the existing architecture and have established the current production build size.
+
+---
+
+3. COMPLETE BATTLE SPIRITS WIKI SET DISCOVERY
+
+Implement an automatic system to discover all Battle Spirits sets available on the Wiki.
+
+Do not rely solely on a manually maintained set list or the sets currently included in Spiritsdex.
+
+The discovery system must support:
+
+- Standard booster sets
+- Starter decks
+- Structure decks
+- Promotional sets
+- Special releases
+- Collaboration sets
+- Reprints
+- Alternate releases
+- Japanese releases
+- Other officially listed Battle Spirits card sets
+
+Discovery requirements
+
+- Discover sets through verified Wiki API, category, index, and listing structures.
+- Automatically identify newly added Wiki sets.
+- Fully paginate every result.
+- Do not silently truncate results.
+- Do not stop after an arbitrary number of sets.
+- Record source information for every discovered set.
+- Track scan progress and failures.
+- Allow failed scans to be retried.
+- Allow interrupted scans to resume.
+
+Number-only sets
+
+Some sets may only have identifiers such as:
+
+- BS01
+- BS02
+- BS03
+- SD01
+- SD02
+
+These are valid sets.
+
+Requirements:
+
+- Never exclude sets because they lack a descriptive title.
+- Use the set code as the fallback display name.
+- Never invent set names.
+- Ensure number-only sets are searchable, filterable, navigable, and displayed correctly.
+- Preserve the set identifier during import.
+
+---
+
+4. COMPLETE CARD DISCOVERY FOR EVERY SET
+
+For every discovered set, enumerate all available cards.
+
+The system must discover cards independently of whether artwork exists.
+
+Include:
+
+- Cards with artwork
+- Cards without artwork
+- Japanese-only cards
+- Promotional cards
+- Special releases
+- Reprints
+- Alternate versions
+- Cards listed in unusual Wiki page structures
+- Cards with incomplete metadata
+
+Pagination and completeness
+
+- Fully paginate all card listings and API responses.
+- Do not use arbitrary maximum card counts that silently exclude records.
+- Do not stop scanning a set because some cards failed to parse.
+- Track cards that could not be processed.
+- Log API errors and parsing failures.
+- Support retrying failed pages or sets.
+- Support resumable scans.
+
+**Missing artwork must never prevent a card from being discovered or imported.**
+
+Catalog discovery is not artwork lookup. They must be separate systems.
+
+---
+
+5. CARD METADATA EXTRACTION AND NORMALIZATION
+
+Extract all available and verified card metadata from the Wiki.
+
+Potential fields include:
+
+- Official card name
+- English name
+- Japanese name
+- Alternate names
+- Card number
+- Set code
+- Set name
+- Card type
+- Color
+- Cost
+- Reduction symbols
+- Rarity
+- Effect text
+- Description
+- Flavor text
+- Wiki page title
+- Wiki page URL
+- Artwork URL
+- Artwork filename
+- Other metadata supported by the existing Spiritsdex schema
+
+Data handling rules
+
+- Map metadata into the existing card schema.
+- Preserve official card names.
+- Preserve Japanese characters and Unicode.
+- Normalize whitespace and matching formats.
+- Do not invent card details.
+- Do not invent set names.
+- Do not discard valid cards just because metadata is incomplete.
+- Represent unavailable fields using the existing missing-data conventions.
+- Preserve original Wiki identifiers and source references where possible.
+- Ensure the data remains searchable using existing search functionality.
+
+---
+
+6. CATALOG COMPARISON, DUPLICATE DETECTION & SAFE IMPORT
+
+Build a reliable catalog comparison system between the Wiki and Spiritsdex.
+
+Each discovered card should be classified as:
+
+- Existing and matched
+- Missing from Spiritsdex
+- Uncertain match
+- Potential duplicate
+- Existing card with updated metadata
+
+Use multiple matching signals:
+
+1. Exact card number or identifier
+2. Exact official name
+3. Japanese name
+4. Set code
+5. Normalized card name
+6. Wiki page title
+7. Alternate names
+
+Do not automatically merge uncertain matches.
+
+Safe import requirements
+
+- Import verified missing cards.
+- Preserve manually verified card information.
+- Do not overwrite existing verified data with uncertain Wiki data.
+- Do not duplicate existing cards.
+- Do not delete existing cards.
+- Do not overwrite manually verified artwork mappings.
+- Keep catalog imports independent from artwork retrieval.
+- Make import idempotent.
+- Running synchronization repeatedly must not duplicate or corrupt data.
+- Use safe database writes and transactions where appropriate.
+
+Import workflow
+
+Implement the following workflow:
+
+**Scan Wiki → Compare Catalog → Review Results → Validate → Import Missing Cards**
+
+Where appropriate, require administrator review before importing uncertain matches or overwriting metadata.
+
+---
+
+7. IMPROVE WIKI ARTWORK LOOKUP WITHOUT BREAKING IT
+
+Continue using and improve the existing Wiki artwork system.
+
+Preserve existing lookup functionality, including:
+
+- Manual mapping priority
+- Exact name matching
+- Normalized name matching
+- Set code + card number matching
+- Japanese name matching
+- Alternate name matching
+- Existing image validation
+- Existing caching
+- Existing fallback artwork
+- Diagnostics
+- Retry logic
+- Request deduplication
+- Failure tracking
+
+Matching requirements
+
+Handle:
+
+- Punctuation differences
+- Spaces and whitespace
+- Capitalization
+- Apostrophes
+- Special characters
+- Roman numerals versus Arabic numerals
+- Leading articles such as “The”
+- CamelCase
+- Japanese and English names
+- Alternate names
+- Subtitle differences
+- Side-B cards
+- Revival versions
+- Promo cards
+- Different image filename formats
+
+Do not use the first Wiki search result as artwork without validating it.
+
+Verify the image match using card name, card number, set code, metadata, and Wiki page context whenever possible.
+
+### Manual mapping priority
+
+Existing manually verified mappings must always take precedence over automated Wiki lookup.
+
+Preserve:
+
+- `src/utils/ManualWikiMapping.ts`
+- `server/manualCardMappings.ts`
+- All current manually verified mappings
+
+Support both direct artwork URLs and verified Wiki titles/filenames as appropriate.
+
+Do not delete existing mappings.
+
+If an artwork lookup fails:
+
+- Use the existing fallback image.
+- Record the failure in diagnostics.
+- Do not block the card from appearing in Spiritsdex.
+
+---
+
+8. ADMIN CATALOG DISCOVERY & SYNCHRONIZATION DASHBOARD
+
+Integrate a catalog management system into the existing admin interface.
+
+Do not redesign the app.
+
+Catalog overview
+
+Display:
+
+- Total Wiki sets discovered
+- Total sets currently in Spiritsdex
+- Sets successfully scanned
+- Sets pending scanning
+- Sets failed scanning
+- Total cards discovered on Wiki
+- Existing cards matched
+- Missing cards
+- Cards pending review
+- Potential duplicates
+- Cards with incomplete metadata
+- Cards missing artwork
+
+Set management
+
+For every discovered set, display:
+
+- Set code
+- Set name
+- Wiki source
+- Total discovered cards
+- Existing cards
+- Missing cards
+- Scan status
+- Last scan date
+- Errors, if any
+
+Allow administrators to:
+
+- Scan all sets
+- Scan a specific set
+- Resume interrupted scans
+- Retry failed sets
+- View scan progress
+- View scan errors
+- Review discovered cards
+- Compare Wiki data against the existing catalog
+
+### Import controls
+
+Provide separate controls for:
+
+- Scan Wiki
+- Compare Catalog
+- Review Missing Cards
+- Validate Import
+- Import Verified Cards
+- Retry Failed Scans
+
+Do not automatically import everything without a clear review or validation step.
+
+---
+
+9. PERIODIC BACKGROUND VALIDATION OF MANUAL ARTWORK URLS
+
+Implement a server-side background validation system that periodically checks all manually mapped artwork URLs and identifies broken links.
+
+This must be a real maintenance system, not just a dashboard display.
+
+A. Scheduled validation
+
+Validate manually mapped artwork URLs from the existing manual mapping registry, including:
+
+- `src/utils/ManualWikiMapping.ts`
+- `server/manualCardMappings.ts`
+- Any other authoritative manual artwork mapping source
+
+The validation system must:
+
+- Periodically check every manually mapped direct artwork URL.
+- Use HTTP `HEAD` requests where supported.
+- Fall back to lightweight `GET` requests if `HEAD` is unsupported or unreliable.
+- Avoid downloading or storing entire artwork files.
+- Follow redirects.
+- Record the final destination URL.
+- Validate Wiki title-based mappings through the Wiki API separately when applicable.
+- Use request timeouts.
+- Use bounded retries.
+- Respect rate limits.
+- Use controlled concurrency.
+- Prevent duplicate validation jobs from running simultaneously.
+
+Do not use a frontend timer or browser-based process as the scheduler.
+
+The scheduled task must be implemented through a reliable server-side scheduler compatible with the actual hosting architecture.
+
+If Cloud Run does not support reliable scheduled execution within the current configuration, use a compatible scheduling mechanism such as an external scheduler calling a secured server endpoint.
+
+Do not claim that background scheduling works unless the required scheduler is actually configured.
+
+B. Validation statuses
+
+Each mapping must support the following statuses:
+
+- `healthy` — successfully verified
+- `broken` — confirmed permanent failure
+- `redirected` — redirected to another valid location
+- `unverified` — not checked yet
+- `temporarily_unavailable` — timeout, network failure, rate limit, or temporary server error
+
+Record:
+
+- Card ID
+- Card name
+- Card number
+- Set code
+- Mapping type
+- Original URL
+- Wiki title or filename
+- Validation status
+- HTTP status code
+- Final URL
+- Last checked timestamp
+- Last successful validation timestamp
+- Consecutive confirmed failures
+- Failure reason
+
+Store validation information separately from the original artwork mapping.
+
+Never automatically delete or overwrite a manual artwork mapping because its validation failed.
+
+Temporary failures must not be classified as permanently broken.
+
+C. Admin dashboard for artwork validation
+
+Integrate validation results into the existing admin interface.
+
+Display:
+
+- Total manual mappings
+- Healthy links
+- Broken links
+- Redirected links
+- Temporary failures
+- Unverified mappings
+
+Provide a table or list containing:
+
+- Card name
+- Card number
+- Set code
+- Original mapped URL or Wiki title
+- Status
+- HTTP status
+- Last checked
+- Last successful check
+- Failure reason
+
+Add controls to:
+
+- Filter by validation status
+- Search by card name
+- Search by card number
+- Search by set
+- Validate all mappings
+- Validate individual mappings
+- Retry failed links
+- Open original URL
+- Refresh validation results
+
+Make broken mappings easy for administrators to identify.
+
+The validation dashboard must not disrupt normal card display or artwork loading.
+
+D. Schedule, recovery, and efficiency
+
+- Default validation schedule: every 24 hours.
+- Make the schedule configurable where practical.
+- Store results incrementally.
+- Use batches.
+- Resume safely after interruption.
+- Avoid unnecessarily rechecking successful links multiple times during the same cycle.
+- Avoid overlapping scheduled and manually triggered jobs.
+- Prevent temporary network issues from incorrectly marking large numbers of links broken.
+- Provide a `Run Validation Now` admin control.
+- Keep validation results persistent.
+
+E. Validation test cases
+
+Test:
+
+- HTTP 200
+- HTTP 404
+- HTTP 410
+- Valid redirect
+- HTTP 500
+- Timeout
+- Network failure
+- Rate-limited response
+- Wiki title mapping
+- Corrected artwork URL
+- Manual validation
+- Scheduled validation
+- Interrupted validation and recovery
+
+Expected behavior:
+
+- Valid links become healthy.
+- Permanent failures are marked broken.
+- Redirects are recorded.
+- Temporary failures remain temporary.
+- Corrected links can become healthy again.
+- The dashboard reflects current validation results.
+- Original mappings remain untouched.
+- Existing card artwork continues working.
+
+---
+
+10. PERFORMANCE, API LIMITS & RELIABILITY
+
+All new systems must be optimized for production.
+
+Implement where appropriate:
+
+- API caching
+- Request deduplication
+- Controlled concurrency
+- Pagination tracking
+- Rate-limit handling
+- Exponential backoff
+- Bounded retries
+- Timeouts
+- Error logging
+- Incremental scan progress
+- Resumable scans
+- Incremental validation progress
+- Safe database operations
+- Efficient database queries
+
+Avoid:
+
+- Hundreds or thousands of simultaneous requests
+- Repeated full Wiki scans unnecessarily
+- Loading the entire catalog into frontend memory
+- Downloading artwork unnecessarily
+- Storing duplicate card records
+- Creating enormous frontend bundles
+- Duplicating large JSON datasets
+- Excessive database writes
+
+Keep catalog scanning, comparison, import, and URL validation server-side whenever appropriate.
+
+Store catalog metadata, scan results, and validation status in the existing database/storage system rather than adding large bundled files.
+
+Cache metadata and artwork URLs, not entire artwork collections.
+
+---
+
+11. STRICT PRODUCTION BUILD SIZE LIMIT — 250 MB MAXIMUM
+
+THIS IS A MANDATORY REQUIREMENT
+
+The application must remain compatible with the current Google AI Studio / Cloud Run publishing workflow.
+
+The actual production deployment package MUST remain below 250 MB.**
+
+Treat 250 MB as a hard limit.
+
+Target below 150 MB whenever reasonably achievable, providing sufficient safety margin.
+
+New features must not make the app exceed the deployment limit.
+
+A. Measure the existing baseline first
+
+Before implementation:
+
+- Measure the current frontend production build.
+- Measure the actual deployment package if possible.
+- Inspect production dependencies.
+- Identify large files and folders.
+- Identify unnecessary assets.
+- Identify duplicate card artwork.
+- Identify large bundled JSON datasets.
+- Identify dependencies that significantly increase package size.
+
+Do not assume the frontend `dist` folder size equals the actual Cloud Run deployment package size.
+
+Record the baseline size before making changes.
+
+B. Prevent unnecessary size growth
+
+- Do not download or store Battle Spirits artwork locally.
+- Do not bundle the entire Wiki catalog into the frontend.
+- Do not bundle complete Wiki API responses.
+- Do not create offline copies of the full card database.
+- Do not duplicate existing datasets.
+- Do not store large validation logs inside the deployment directory.
+- Do not add unnecessary packages.
+- Reuse existing dependencies whenever possible.
+- Keep new dependencies lightweight.
+- Use database storage for discovered cards and metadata.
+- Keep catalog scanning server-side.
+- Keep validation server-side.
+- Use pagination.
+- Use lazy loading.
+- Avoid loading large datasets into frontend memory.
+- Cache metadata and URLs rather than image files.
+
+C. Production package optimization
+
+Inspect:
+
+- `node_modules`
+- Production dependencies
+- Development dependencies
+- Duplicate dependencies
+- Unused packages
+- Large image assets
+- Local card artwork
+- Large JSON files
+- Debugging files
+- Test files
+- Development tooling
+- Build caches
+- Source files unnecessarily copied into production
+- Docker/build configuration
+- `.dockerignore`
+- `.gitignore`
+- Deployment configuration
+
+Exclude unnecessary files from production only when safe.
+
+Do not accidentally remove files, runtime dependencies, assets, or configuration required for the application.
+
+Do not remove existing app features or card records to reduce size.
+
+D. Measure again after implementation
+
+After completing implementation:
+
+1. Run the production build.
+2. Measure frontend `dist` size.
+3. Measure server build size.
+4. Measure actual Cloud Run deployment package/container size whenever possible.
+5. Compare with the original baseline.
+6. Identify the largest files and folders.
+7. Identify any dependencies added.
+8. Confirm the actual package is below 250 MB.
+9. Optimize any unnecessary size increase.
+
+If the build approaches or exceeds 250 MB:
+
+- Stop and identify the cause.
+- Remove unnecessary dependencies safely.
+- Optimize packaging.
+- Exclude unnecessary production files.
+- Move large data into database storage or API queries.
+- Remove duplicate or unnecessary assets.
+- Rebuild and measure again.
+
+Do not solve build-size problems by deleting card records, user data, manual mappings, or existing features.
+
+E. Mandatory deployment gate
+
+The task is not considered fully complete unless:
+
+- [ ] Production build succeeds.
+- [ ] TypeScript checks pass.
+- [ ] Existing features remain functional.
+- [ ] Wiki discovery works.
+- [ ] Catalog comparison works.
+- [ ] Safe card import works.
+- [ ] Artwork lookup works.
+- [ ] Manual mapping priority is preserved.
+- [ ] Background validation works.
+- [ ] Scheduler is configured correctly.
+- [ ] No unnecessary local artwork has been added.
+- [ ] Actual deployment package is below 250 MB.
+- [ ] Cloud Run publishing remains compatible.
+
+If the actual Cloud Run package size cannot be measured, clearly state this limitation and report the closest verified measurement.
+
+**Do not claim the 250 MB limit is verified unless the actual deployment package was measured.**
+
+---
+
+12. TESTING AND VERIFICATION
+
+Run a comprehensive test after implementation.
+
+Catalog tests
+
+Verify:
+
+- All discoverable sets are found.
+- Number-only sets are included.
+- Set pagination works.
+- Card pagination works.
+- Every available card listing is scanned.
+- Cards without artwork are discovered.
+- Japanese-only cards are handled.
+- Promos and special sets are included.
+- Existing cards are matched correctly.
+- Missing cards are identified correctly.
+- Duplicate detection works.
+- Uncertain matches are not merged automatically.
+- Repeated synchronization does not duplicate cards.
+- Import does not overwrite manually verified data.
+- Interrupted scans can resume.
+- Failed sets can be retried.
+
+Artwork tests
+
+Verify:
+
+- Manual mapping priority.
+- Existing manual artwork continues working.
+- Automatic Wiki matching works.
+- Invalid or unrelated Wiki images are rejected.
+- Fallback artwork displays correctly.
+- Missing artwork does not block catalog import.
+- Diagnostics work correctly.
+- Request caching and deduplication work.
+
+Validation tests
+
+Verify:
+
+- Scheduled validation is configured.
+- Manual validation works.
+- HTTP statuses are classified correctly.
+- Broken URLs are shown in the admin dashboard.
+- Temporary failures are not permanently classified as broken.
+- Validation results persist.
+- Interrupted jobs can resume.
+- Corrected URLs can return to healthy status.
+- The original mapping is never automatically deleted.
+
+Existing application regression tests
+
+Verify that existing features remain functional:
+
+- Card search
+- Filters
+- Sorting
+- Card details
+- Artwork
+- Effects
+- Rulings
+- Sets
+- Deck builder
+- Deck management
+- Ban list
+- Community features
+- Accounts
+- Saved data
+- Admin tools
+- Firebase integration
+
+Build tests
+
+- Run TypeScript checks.
+- Run the existing test suite.
+- Run newly added tests.
+- Run the production build.
+- Inspect build output.
+- Measure deployment size.
+- Check for dependency increases.
+- Verify deployment compatibility.
+
+---
+
+13. FINAL IMPLEMENTATION REPORT
+
+When finished, provide a truthful, detailed implementation report.
+
+A. Catalog results
+
+Report:
+
+- Total Wiki sets discovered
+- Total sets successfully scanned
+- Sets failed
+- Sets pending
+- Total cards discovered
+- Existing cards matched
+- Missing cards identified
+- Cards imported
+- Uncertain matches
+- Potential duplicates
+- Number-only sets discovered
+
+B. Artwork results
+
+Report:
+
+- Manual mappings preserved
+- Artwork lookup improvements
+- Cards still missing artwork
+- Invalid artwork matches removed/rejected from display
+- Fallback behavior
+
+Do not remove manual mappings.
+
+C. Validation results
+
+Report:
+
+- Total mappings
+- Links validated
+- Healthy
+- Broken
+- Redirected
+- Temporarily unavailable
+- Unverified
+- Scheduler implementation
+- Validation interval
+- Dashboard implementation
+- Required deployment configuration
+
+D. Build and deployment results
+
+Report:
+
+- Original baseline size
+- Final frontend build size
+- Final server build size
+- Actual deployment/package size
+- Largest files/directories
+- Dependencies added
+- Dependencies removed
+- Optimizations performed
+- Build success/failure
+- Cloud Run compatibility
+- Whether the 250 MB limit was actually verified
+- Remaining margin below 250 MB
+
+E. Technical changes
+
+Report:
+
+- Files modified
+- Files created
+- Database changes
+- API endpoints created or modified
+- Scheduler configuration
+- Tests added
+- Test results
+- TypeScript status
+- Build status
+- Limitations
+- Any manual steps still required
+
+Clearly distinguish between:
+
+- Fully implemented and tested
+- Implemented but not verified
+- Partially implemented
+- Failed
+- Requires manual configuration
+
+---
+
+FINAL NON-NEGOTIABLE REQUIREMENTS
+
+1. Discover missing Battle Spirits sets and cards, not just artwork for cards that already exist.
+2. Support every available set, including number-only sets.
+3. Import missing cards safely without duplicates or overwriting manually verified information.
+4. Keep catalog discovery separate from artwork retrieval.
+5. Preserve all existing manual artwork mappings and prioritize them.
+6. Periodically validate manually mapped artwork URLs through a real server-side process.
+7. Display broken links and validation results in the admin dashboard.
+8. Preserve all existing Spiritsdex features, UI, card data, user data, and functionality.
+9. Avoid storing card artwork locally or bundling large Wiki datasets.
+10. Optimize the production package.
+11. Keep the actual production deployment package strictly below 250 MB.
+12. Verify the build and deployment constraints before declaring completion.
+13. Never fabricate scan counts, test results, deployment sizes, or completion status.
+
+The goal is to make Spiritsdex a comprehensive, synchronized Battle Spirits catalog with reliable artwork and automated maintenance, while remaining lightweight enough to publish successfully through the existing Google AI Studio / Cloud Run workflow.
+
+Make changes carefully, verify them, and provide a complete final report.

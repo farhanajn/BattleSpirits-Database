@@ -20,6 +20,13 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isAdmin() {
+      return isVerified() && (
+        request.auth.token.email == 'farhana.jn2000@gmail.com'
+        || exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -42,6 +49,10 @@ service cloud.firestore {
 
     function isValidFormat(fmt) {
       return fmt is string && fmt.size() <= 16 && fmt in ['Standard', 'Eternal'];
+    }
+
+    function isValidCardType(t) {
+      return t is string && t.size() <= 20 && t in ['Spirit', 'Ultimate', 'Brave', 'Nexus', 'Magic'];
     }
 
     function isValidUserAccount(data, userId) {
@@ -207,6 +218,126 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidCatalogSet(data, setCodeParam) {
+      return data.keys().hasAll([
+          'setCode', 'wikiTitle', 'name', 'jpName', 'category', 'productType',
+          'releaseDate', 'formats', 'blockLabel', 'tagline', 'featuredCardId',
+          'colors', 'totalCardsInSet', 'wikiUrl', 'sources', 'isNumberOnly',
+          'scanStatus', 'discoveredCount', 'existingCount', 'missingCount',
+          'lastScanAt', 'isPublished', 'updatedByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'setCode', 'wikiTitle', 'name', 'jpName', 'category', 'productType',
+          'releaseDate', 'formats', 'blockLabel', 'tagline', 'featuredCardId',
+          'colors', 'totalCardsInSet', 'wikiUrl', 'sources', 'isNumberOnly',
+          'scanStatus', 'discoveredCount', 'existingCount', 'missingCount',
+          'lastScanAt', 'isPublished', 'updatedByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.setCode is string && data.setCode == setCodeParam && isValidId(data.setCode)
+        && data.wikiTitle is string && data.wikiTitle.size() >= 1 && data.wikiTitle.size() <= 200
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 200
+        && data.jpName is string && data.jpName.size() <= 200
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.productType is string && data.productType.size() <= 60
+        && data.releaseDate is string && data.releaseDate.size() <= 80
+        && data.formats is list && data.formats.size() >= 1 && data.formats.size() <= 4
+        && data.formats[0] is string && data.formats[0].size() <= 20
+        && data.blockLabel is string && data.blockLabel.size() <= 80
+        && data.tagline is string && data.tagline.size() <= 500
+        && data.featuredCardId is string && data.featuredCardId.size() <= 128
+        && data.colors is list && data.colors.size() <= 6
+        && (data.colors.size() == 0 || (data.colors[0] is string && data.colors[0].size() <= 20))
+        && data.totalCardsInSet is int && data.totalCardsInSet >= 0
+        && data.wikiUrl is string && data.wikiUrl.size() <= 500
+        && data.sources is list && data.sources.size() <= 12
+        && (data.sources.size() == 0 || (data.sources[0] is string && data.sources[0].size() <= 120))
+        && data.isNumberOnly is bool
+        && data.scanStatus is string && data.scanStatus.size() <= 24 && data.scanStatus in ['pending', 'scanning', 'completed', 'failed']
+        && data.discoveredCount is int && data.discoveredCount >= 0
+        && data.existingCount is int && data.existingCount >= 0
+        && data.missingCount is int && data.missingCount >= 0
+        && data.lastScanAt is string && data.lastScanAt.size() <= 40
+        && data.isPublished is bool && data.isPublished == true
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCatalogCard(data, cardIdParam) {
+      return data.keys().hasAll([
+          'id', 'cardNumber', 'name', 'jpName', 'color', 'secondaryColor', 'colors',
+          'type', 'subtypeLabel', 'rarity', 'setCode', 'setName', 'formats', 'blockIcon',
+          'restriction', 'isRevival', 'isToken', 'cost', 'payloadJson', 'sourceTag',
+          'missingArtwork', 'isPublished', 'importedByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'cardNumber', 'name', 'jpName', 'color', 'secondaryColor', 'colors',
+          'type', 'subtypeLabel', 'rarity', 'setCode', 'setName', 'formats', 'blockIcon',
+          'restriction', 'isRevival', 'isToken', 'cost', 'payloadJson', 'sourceTag',
+          'missingArtwork', 'isPublished', 'importedByUid', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == cardIdParam && isValidId(data.id)
+        && data.cardNumber is string && data.cardNumber.size() >= 1 && data.cardNumber.size() <= 64
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 200
+        && data.jpName is string && data.jpName.size() <= 200
+        && isValidColor(data.color)
+        && isValidOptionalColor(data.secondaryColor)
+        && data.colors is list && data.colors.size() >= 1 && data.colors.size() <= 6
+        && data.colors[0] is string && data.colors[0].size() <= 20
+        && isValidCardType(data.type)
+        && data.subtypeLabel is string && data.subtypeLabel.size() <= 80
+        && data.rarity is string && data.rarity.size() >= 1 && data.rarity.size() <= 16
+        && data.setCode is string && data.setCode.size() >= 1 && data.setCode.size() <= 64
+        && data.setName is string && data.setName.size() <= 200
+        && data.formats is list && data.formats.size() >= 1 && data.formats.size() <= 4
+        && data.formats[0] is string && data.formats[0].size() <= 20
+        && data.blockIcon is string && data.blockIcon.size() <= 64
+        && data.restriction is string && data.restriction.size() <= 32
+        && data.isRevival is bool
+        && data.isToken is bool
+        && data.cost is int && data.cost >= 0 && data.cost <= 99
+        && data.payloadJson is string && data.payloadJson.size() <= 20000
+        && data.sourceTag is string && data.sourceTag.size() <= 120
+        && data.missingArtwork is bool
+        && data.isPublished is bool && data.isPublished == true
+        && data.importedByUid is string && data.importedByUid == request.auth.uid && isValidId(data.importedByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidArtworkValidation(data, keyParam) {
+      return data.keys().hasAll([
+          'mappingKey', 'cardId', 'cardName', 'cardNumber', 'setCode', 'mappingType',
+          'originalUrl', 'wikiTitle', 'fileName', 'status', 'httpStatus', 'finalUrl',
+          'lastCheckedAt', 'lastSuccessAt', 'consecutiveFailures', 'failureReason',
+          'lastCycleId', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'mappingKey', 'cardId', 'cardName', 'cardNumber', 'setCode', 'mappingType',
+          'originalUrl', 'wikiTitle', 'fileName', 'status', 'httpStatus', 'finalUrl',
+          'lastCheckedAt', 'lastSuccessAt', 'consecutiveFailures', 'failureReason',
+          'lastCycleId', 'updatedAt'
+        ])
+        && data.mappingKey is string && data.mappingKey == keyParam && isValidId(data.mappingKey)
+        && data.cardId is string && data.cardId.size() <= 128
+        && data.cardName is string && data.cardName.size() <= 200
+        && data.cardNumber is string && data.cardNumber.size() <= 64
+        && data.setCode is string && data.setCode.size() <= 64
+        && data.mappingType is string && data.mappingType.size() <= 24 && data.mappingType in ['direct_url', 'wiki_file', 'wiki_title']
+        && data.originalUrl is string && data.originalUrl.size() <= 1000
+        && data.wikiTitle is string && data.wikiTitle.size() <= 200
+        && data.fileName is string && data.fileName.size() <= 250
+        && data.status is string && data.status.size() <= 32 && data.status in ['healthy', 'broken', 'redirected', 'unverified', 'temporarily_unavailable']
+        && data.httpStatus is int && data.httpStatus >= 0 && data.httpStatus <= 999
+        && data.finalUrl is string && data.finalUrl.size() <= 1000
+        && data.lastCheckedAt is string && data.lastCheckedAt.size() <= 40
+        && data.lastSuccessAt is string && data.lastSuccessAt.size() <= 40
+        && data.consecutiveFailures is int && data.consecutiveFailures >= 0
+        && data.failureReason is string && data.failureReason.size() <= 500
+        && data.lastCycleId is string && data.lastCycleId.size() <= 80
+        && data.updatedAt is timestamp;
+    }
+
     // --- 1. Private User Account (PII Isolated) & Cloud Decks/Folders/Bookmarks ---
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwner(userId);
@@ -283,14 +414,12 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Tier 1: Profile owner edits bio/display info
           (
             isOwner(userId)
             && incoming().followersCount == existing().followersCount
             && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'favoriteColor', 'updatedAt'])
           )
           ||
-          // Tier 2a: Atomic Follow increment (+1 backed by followers/{uid} create)
           (
             request.auth.uid != userId
             && incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'updatedAt'])
@@ -299,7 +428,6 @@ service cloud.firestore {
             && existsAfter(/databases/$(database)/documents/publicProfiles/$(userId)/followers/$(request.auth.uid))
           )
           ||
-          // Tier 2b: Atomic Unfollow decrement (-1 backed by followers/{uid} delete)
           (
             request.auth.uid != userId
             && incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'updatedAt'])
@@ -346,7 +474,6 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Tier 1: Post author edits details
           (
             existing().authorUid == request.auth.uid
             && incoming().likesCount == existing().likesCount
@@ -359,7 +486,6 @@ service cloud.firestore {
             ])
           )
           ||
-          // Tier 2a: Atomic Like (+1)
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'updatedAt'])
             && incoming().likesCount == existing().likesCount + 1
@@ -367,7 +493,6 @@ service cloud.firestore {
             && existsAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
           )
           ||
-          // Tier 2b: Atomic Unlike (-1)
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'updatedAt'])
             && incoming().likesCount == existing().likesCount - 1
@@ -376,7 +501,6 @@ service cloud.firestore {
             && !existsAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid))
           )
           ||
-          // Tier 2c: Atomic Comment increment (+1 backed by comments/{lastCommentId} create)
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['commentsCount', 'lastCommentId', 'updatedAt'])
             && incoming().commentsCount == existing().commentsCount + 1
@@ -385,7 +509,6 @@ service cloud.firestore {
             && existsAfter(/databases/$(database)/documents/posts/$(postId)/comments/$(incoming().lastCommentId))
           )
           ||
-          // Tier 2d: Increment importsCount (+1)
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['importsCount', 'updatedAt'])
             && incoming().importsCount == existing().importsCount + 1
@@ -423,6 +546,58 @@ service cloud.firestore {
         allow delete: if isVerified() && isValidId(postId) && isValidId(commentId)
           && existing().authorUid == request.auth.uid;
       }
+    }
+
+    // --- 4. Published Catalog Sets & Cards (Public Read, Admin Write) ---
+    match /catalogSets/{setCode} {
+      allow get: if isValidId(setCode) && existing().isPublished == true;
+      allow list: if existing().isPublished == true;
+      allow create: if isAdmin() && isValidId(setCode)
+        && isValidCatalogSet(incoming(), setCode)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(setCode)
+        && isValidCatalogSet(incoming(), setCode)
+        && incoming().setCode == existing().setCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(setCode);
+    }
+
+    match /catalogCards/{cardId} {
+      allow get: if isValidId(cardId) && existing().isPublished == true;
+      allow list: if existing().isPublished == true;
+      allow create: if isAdmin() && isValidId(cardId)
+        && isValidCatalogCard(incoming(), cardId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(cardId)
+        && isValidCatalogCard(incoming(), cardId)
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(cardId);
+    }
+
+    // --- 5. Admin-Only Manual Artwork URL Validation Status ---
+    match /artworkValidations/{mappingKey} {
+      allow get: if isAdmin() && isValidId(mappingKey);
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidId(mappingKey)
+        && isValidArtworkValidation(incoming(), mappingKey)
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(mappingKey)
+        && isValidArtworkValidation(incoming(), mappingKey)
+        && incoming().mappingKey == existing().mappingKey
+        && incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(mappingKey);
+    }
+
+    // --- 6. Immutable Admin Role Marker ---
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow write: if false;
     }
   }
 }

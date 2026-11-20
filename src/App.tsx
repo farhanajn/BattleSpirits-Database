@@ -68,6 +68,10 @@ import {
   saveOfflineMeta,
 } from './utils/offlineCardStore';
 import { buildWikiImageUrl } from './utils/wikiImageClient';
+import {
+  getManualWikiMapping,
+  resolveManualMappingArtworkUrl,
+} from './utils/ManualWikiMapping';
 import { useWikiImagePrefetch } from './hooks/useWikiImagePrefetch';
 import {
   loadFastCachedSets,
@@ -75,6 +79,7 @@ import {
   saveFastCachedSets,
   synchronizeAndIndexSets,
 } from './utils/setMetadataSync';
+import { fetchPublishedCatalogAdditions } from './utils/catalogCloudSync';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'settings';
 
@@ -451,7 +456,7 @@ function sanitizeCardTextTemplates(card: BattleSpiritsCard): BattleSpiritsCard {
   };
 }
 
-function mergeCardsIntoMap(
+export function mergeCardsIntoMap(
   prev: Record<string, BattleSpiritsCard>,
   incomingCards: BattleSpiritsCard[],
   options?: {
@@ -585,15 +590,42 @@ function mergeCardsIntoMap(
       isWikiLoaded: Boolean(primary.isWikiLoaded || secondary?.isWikiLoaded),
     };
 
-    merged.artworkImage = buildWikiImageUrl(
-      merged,
-      primary.artworkImage || secondary?.artworkImage || ''
-    );
-    if (merged.galleryImages && merged.galleryImages.length > 0) {
-      merged.galleryImages = merged.galleryImages.map((g) => ({
-        ...g,
-        url: buildWikiImageUrl(merged, g.url),
-      }));
+    const manualMapping = getManualWikiMapping(merged);
+    const manualArtworkUrl = manualMapping
+      ? resolveManualMappingArtworkUrl(merged, manualMapping)
+      : null;
+
+    if (manualMapping && manualArtworkUrl) {
+      if (manualMapping.wikiTitle) {
+        merged.wikiTitle = manualMapping.wikiTitle;
+      }
+      merged.artworkImage = manualArtworkUrl;
+      if (merged.galleryImages && merged.galleryImages.length > 0) {
+        const mappedRest = merged.galleryImages
+          .map((g) => ({
+            ...g,
+            url: buildWikiImageUrl(merged, g.url),
+          }))
+          .filter((g) => g.url && g.url !== manualArtworkUrl);
+        merged.galleryImages = [
+          {
+            url: manualArtworkUrl,
+            caption: manualMapping.notes || `${merged.cardNumber} — Verified Artwork`,
+          },
+          ...mappedRest,
+        ];
+      }
+    } else {
+      merged.artworkImage = buildWikiImageUrl(
+        merged,
+        primary.artworkImage || secondary?.artworkImage || ''
+      );
+      if (merged.galleryImages && merged.galleryImages.length > 0) {
+        merged.galleryImages = merged.galleryImages.map((g) => ({
+          ...g,
+          url: buildWikiImageUrl(merged, g.url),
+        }));
+      }
     }
 
     if (options?.banList) {
@@ -640,10 +672,7 @@ export default function App() {
   const foldersRef = useRef<DeckFolder[]>([]);
 
   const [cardsMap, setCardsMap] = useState<Record<string, BattleSpiritsCard>>(() => {
-    const initial: Record<string, BattleSpiritsCard> = {};
-    for (const c of BATTLE_SPIRITS_CARDS) {
-      initial[c.id] = c;
-    }
+    const { next: initial } = mergeCardsIntoMap({}, BATTLE_SPIRITS_CARDS);
     try {
       const savedWiki = localStorage.getItem(STORAGE_WIKI_CARDS_KEY);
       if (savedWiki) {
@@ -1005,6 +1034,61 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  const applyImportedCatalogAdditions = useCallback(
+    (incomingSets: ProductSet[], incomingCards: BattleSpiritsCard[]) => {
+      if (incomingSets.length > 0 || incomingCards.length > 0) {
+        setProductSets((curr) => {
+          const synced = synchronizeAndIndexSets([PRODUCT_SETS, curr, incomingSets], incomingCards);
+          const nowTs = Date.now();
+          saveFastCachedSets(synced.sets, nowTs);
+          void saveOfflineMeta({ productSets: synced.sets, setSyncedAt: nowTs });
+          return synced.sets;
+        });
+      }
+      if (incomingCards.length > 0) {
+        setCardsMap((prev) => {
+          const { next } = mergeCardsIntoMap(prev, incomingCards, {
+            banList,
+            preferExisting: true,
+          });
+          return next;
+        });
+      }
+    },
+    [banList]
+  );
+
+  // Merge non-destructive server-imported & Firestore-published Wiki catalog additions
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let cancelled = false;
+
+    fetch('/api/catalog/imported')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { sets?: ProductSet[]; cards?: BattleSpiritsCard[] } | null) => {
+        if (cancelled || !payload) return;
+        const sets = Array.isArray(payload.sets) ? payload.sets : [];
+        const cards = Array.isArray(payload.cards) ? payload.cards : [];
+        if (sets.length > 0 || cards.length > 0) {
+          applyImportedCatalogAdditions(sets, cards);
+        }
+      })
+      .catch(() => {
+        // Offline / server unavailable — IndexedDB & local bundles handle cleanly
+      });
+
+    void fetchPublishedCatalogAdditions().then(({ sets, cards }) => {
+      if (cancelled) return;
+      if (sets.length > 0 || cards.length > 0) {
+        applyImportedCatalogAdditions(sets, cards);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyImportedCatalogAdditions]);
 
   // Persist all hydrated or fetched card metadata into IndexedDB (debounced) so offline browsing & card details stay complete
   useEffect(() => {
@@ -2319,6 +2403,8 @@ export default function App() {
               onSignOutGoogle={() => void handleGoogleSignOut()}
               onSyncNow={() => void handleManualCloudSync()}
               onSaveProfile={handleUpdateOwnProfile}
+              onCatalogImported={applyImportedCatalogAdditions}
+              onNotify={showToast}
             />
           </ErrorBoundary>
         )}

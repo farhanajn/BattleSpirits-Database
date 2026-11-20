@@ -14,10 +14,11 @@ import {
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import { ALL_COLORS, COLOR_META } from '../data/theme';
-import { CardColor } from '../types/card';
+import type { BattleSpiritsCard, CardColor, ProductSet } from '../types/card';
 import { RulingsView } from './RulingsView';
 import { PWAInstallButton } from './PWAControls';
 import { SymbolIcon } from './SymbolIcon';
+import { AdminCatalogSection } from './AdminCatalogSection';
 
 interface SettingsViewProps {
   currentUser: User | null;
@@ -32,6 +33,8 @@ interface SettingsViewProps {
   onSignOutGoogle: () => void;
   onSyncNow: () => void;
   onSaveProfile: (bio: string, favoriteColor: CardColor) => Promise<boolean>;
+  onCatalogImported?: (sets: ProductSet[], cards: BattleSpiritsCard[]) => void;
+  onNotify?: (message: string) => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -47,6 +50,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onSignOutGoogle,
   onSyncNow,
   onSaveProfile,
+  onCatalogImported,
+  onNotify,
 }) => {
   const [bio, setBio] = useState(initialBio);
   const [favoriteColor, setFavoriteColor] = useState<CardColor>(initialFavoriteColor);
@@ -323,6 +328,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
       </section>
+
+      {/* Admin Catalog Sync, Comparison, Safe Import & Manual Artwork URL Validation */}
+      <AdminCatalogSection
+        currentUser={currentUser}
+        onCatalogImported={onCatalogImported}
+        onNotify={onNotify}
+      />
 
       {/* Official Rules, Format Guide, Turn Sequence & Reduction Cost Calculator */}
       <section className="pt-2 border-t border-slate-200">

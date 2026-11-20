@@ -10,6 +10,7 @@
    - Creating or deleting `/publicProfiles/{userId}/followers/{followerId}` requires a batched update to `/publicProfiles/{userId}.followersCount` verified with `existsAfter` / `getAfter`.
 5. **Immutable Identity & Server Timestamps**: `createdAt`, `authorUid`, `ownerUid`, and `id` cannot be forged on creation (`== request.time` / `== request.auth.uid`) or altered on update.
 6. **Volumetric & Array Bounds**: Every string check pairs with `.size()`, document IDs match `^[a-zA-Z0-9_\-]+$` (`<= 128`), and arrays (`entries`, `colors`, `tags`) enforce `size() <= MAX`.
+7. **Admin-Gated Catalog & Artwork Validation Collections**: `/catalogSets/{setCode}` and `/catalogCards/{cardId}` allow public reads ONLY where `resource.data.isPublished == true` and restrict all writes strictly to verified admins (`isAdmin()`). `/artworkValidations/{mappingKey}` restricts both reads and writes strictly to verified admins (`isAdmin()`).
 
 ## 2. Adversarial "Dirty Dozen" Attack Payloads (Expected: PERMISSION_DENIED)
 1. **Unverified Email Write**: Creating `/posts/p1` with `request.auth.token.email_verified == false`.
@@ -24,3 +25,4 @@
 10. **Client Timestamp Backdating**: Creating `/posts/p4` with `createdAt: Timestamp.fromDate(new Date('2020-01-01'))` instead of `serverTimestamp()` (`== request.time`).
 11. **Non-Author Post Edit**: Updating `/posts/p1.title` or deleting `/posts/p1` as `"other_user"`.
 12. **PII Injection into Public Profile**: Creating `/publicProfiles/u1` with an extra `email` field (blocked by `keys().hasOnly(...)`).
+13. **Non-Admin Catalog Tampering / Admin Role Escalation**: Writing to `/catalogCards/*`, `/catalogSets/*`, `/artworkValidations/*`, or `/admins/*` as a standard verified player.

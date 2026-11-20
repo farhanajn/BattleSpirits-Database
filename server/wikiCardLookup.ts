@@ -1,3 +1,10 @@
+export type WikiLookupStageMode =
+  | 'exact'
+  | 'normalized'
+  | 'set_number'
+  | 'japanese'
+  | 'all';
+
 export interface CardLookupCriteria {
   id?: string;
   fileName?: string;
@@ -7,6 +14,7 @@ export interface CardLookupCriteria {
   jpName?: string;
   setCode?: string;
   isRevival?: boolean;
+  stage?: WikiLookupStageMode;
 }
 
 export interface LookupResolutionTrace {

@@ -13,6 +13,25 @@ import {
   runMissingArtworkDiagnostic,
   searchWikiCards,
 } from './server/wikiService.ts';
+import {
+  compareCatalogWithWiki,
+  discoverAllWikiSets,
+  executeCatalogImport,
+  getCatalogDashboardSnapshot,
+  getImportedCatalogPayload,
+  runCatalogScanBatch,
+  scanWikiSetByCode,
+  setDiscoveredCardApproval,
+  validateCatalogImport,
+} from './server/catalogSyncService.ts';
+import {
+  getValidationDashboardSnapshot,
+  runManualValidationJob,
+  startManualValidationScheduler,
+  triggerScheduledValidation,
+  validateSingleMappingByKey,
+  verifyScheduledValidationAuth,
+} from './server/manualUrlValidator.ts';
 import type { BattleSpiritsCard } from './src/types/card.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -22,7 +41,7 @@ const PORT = Number(process.env.PORT || 3000);
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '2mb' }));
 
   app.get('/api/wiki/directory', (_req, res) => {
     const { sets, syncedAt } = getSyncedWikiDirectory();
@@ -148,6 +167,14 @@ async function startServer() {
     const id = req.query.id ? String(req.query.id).trim() : undefined;
     const isRevival =
       req.query.rv === '1' || req.query.rv === 'true' || req.query.isRevival === 'true';
+    const rawStage = String(req.query.stage || 'all').trim();
+    const stage =
+      rawStage === 'exact' ||
+      rawStage === 'normalized' ||
+      rawStage === 'set_number' ||
+      rawStage === 'japanese'
+        ? rawStage
+        : 'all';
 
     if (!file && !fallback && !title && !name && !jpName) {
       res.status(400).json({ ok: false, error: 'Missing image lookup parameters' });
@@ -163,6 +190,7 @@ async function startServer() {
       jpName,
       setCode,
       isRevival: isRevival || undefined,
+      stage,
     });
     res.setHeader('Cache-Control', 'public, max-age=43200');
     res.json(meta);
@@ -209,6 +237,237 @@ async function startServer() {
     res.setHeader('Content-Type', result.contentType);
     res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
     res.send(result.buffer);
+  });
+
+  // --- Public Imported Catalog Feed (additive non-destructive Wiki additions) ---
+  app.get('/api/catalog/imported', (_req, res) => {
+    try {
+      const payload = getImportedCatalogPayload();
+      res.setHeader('Cache-Control', 'no-cache');
+      res.json(payload);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load imported catalog';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // --- Admin Wiki Catalog Discovery, Comparison & Safe Import Routes ---
+  app.get('/api/admin/catalog/status', (req, res) => {
+    try {
+      const snapshot = getCatalogDashboardSnapshot({
+        setFilter: req.query.setFilter ? String(req.query.setFilter) : undefined,
+        classification: req.query.classification ? String(req.query.classification) : undefined,
+        setCode: req.query.setCode ? String(req.query.setCode) : undefined,
+        onlyMissingArtwork:
+          req.query.onlyMissingArtwork === 'true' || req.query.onlyMissingArtwork === '1',
+        onlyIncomplete:
+          req.query.onlyIncomplete === 'true' || req.query.onlyIncomplete === '1',
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+        offset: req.query.offset ? Number(req.query.offset) : undefined,
+      });
+      res.json(snapshot);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load catalog status';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/discover-sets', async (_req, res) => {
+    try {
+      const result = await discoverAllWikiSets();
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Set discovery failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/scan', async (req, res) => {
+    try {
+      const singleSetCode =
+        typeof req.body?.setCode === 'string' && req.body.setCode.trim()
+          ? req.body.setCode.trim()
+          : '';
+      if (singleSetCode) {
+        const result = await scanWikiSetByCode(singleSetCode);
+        res.json({
+          mode: 'single_set',
+          ...result,
+          overview: getCatalogDashboardSnapshot().overview,
+        });
+        return;
+      }
+
+      const rawMode = String(req.body?.mode || 'all');
+      const mode: 'all' | 'resume' | 'retry_failed' =
+        rawMode === 'resume' || rawMode === 'retry_failed' ? rawMode : 'all';
+      const maxSetsPerRun =
+        typeof req.body?.maxSetsPerRun === 'number' && req.body.maxSetsPerRun > 0
+          ? req.body.maxSetsPerRun
+          : 15;
+      const setCodes = Array.isArray(req.body?.setCodes)
+        ? req.body.setCodes.map((s: unknown) => String(s))
+        : undefined;
+
+      const result = await runCatalogScanBatch({
+        mode,
+        maxSetsPerRun,
+        setCodes,
+      });
+      res.json({ mode, ...result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog scan failed';
+      const status = /already running/i.test(message) ? 409 : 500;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/compare', (_req, res) => {
+    try {
+      const result = compareCatalogWithWiki();
+      res.json({ overview: result.overview, totalCompared: result.entries.length });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog comparison failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/review', (req, res) => {
+    try {
+      const discoveryKey = String(req.body?.discoveryKey || '').trim();
+      const approved = Boolean(req.body?.approved);
+      if (!discoveryKey) {
+        res.status(400).json({ error: 'Missing discoveryKey' });
+        return;
+      }
+      const updated = setDiscoveredCardApproval(discoveryKey, approved);
+      if (!updated) {
+        res.status(404).json({ error: 'Discovered card entry not found' });
+        return;
+      }
+      res.json({ entry: updated, overview: getCatalogDashboardSnapshot().overview });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to update review approval';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/validate-import', (req, res) => {
+    try {
+      const discoveryKeys = Array.isArray(req.body?.discoveryKeys)
+        ? req.body.discoveryKeys.map((k: unknown) => String(k))
+        : undefined;
+      const report = validateCatalogImport({
+        discoveryKeys,
+        includeMissing: req.body?.includeMissing !== false,
+        includeApprovedUpdates: req.body?.includeApprovedUpdates !== false,
+      });
+      res.json(report);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Import validation failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/import', (req, res) => {
+    try {
+      const discoveryKeys = Array.isArray(req.body?.discoveryKeys)
+        ? req.body.discoveryKeys.map((k: unknown) => String(k))
+        : undefined;
+      const result = executeCatalogImport({
+        discoveryKeys,
+        includeMissing: req.body?.includeMissing !== false,
+        includeApprovedUpdates: req.body?.includeApprovedUpdates !== false,
+      });
+      res.json({
+        ...result,
+        overview: getCatalogDashboardSnapshot().overview,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog import failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // --- Admin Manual Artwork URL Background Validation Routes ---
+  app.get('/api/admin/validation/status', (req, res) => {
+    try {
+      const snapshot = getValidationDashboardSnapshot({
+        status: req.query.status ? String(req.query.status) : undefined,
+        q: req.query.q ? String(req.query.q) : undefined,
+      });
+      res.json(snapshot);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load validation status';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/validation/run', async (req, res) => {
+    try {
+      const retryFailedOnly = Boolean(req.body?.retryFailedOnly);
+      const resumeInterrupted = Boolean(req.body?.resumeInterrupted);
+      const mappingKeys = Array.isArray(req.body?.mappingKeys)
+        ? req.body.mappingKeys.map((k: unknown) => String(k))
+        : undefined;
+      const result = await runManualValidationJob({
+        mappingKeys,
+        retryFailedOnly,
+        resumeInterrupted,
+        triggerSource: retryFailedOnly ? 'retry_failed' : resumeInterrupted ? 'resume' : 'manual',
+      });
+      res.json({
+        ...result,
+        scheduler: getValidationDashboardSnapshot().scheduler,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Manual URL validation failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/validation/check-one', async (req, res) => {
+    try {
+      const mappingKey = String(req.body?.mappingKey || '').trim();
+      if (!mappingKey) {
+        res.status(400).json({ error: 'Missing mappingKey' });
+        return;
+      }
+      const record = await validateSingleMappingByKey(mappingKey);
+      if (!record) {
+        res.status(404).json({ error: 'Manual mapping entry not found' });
+        return;
+      }
+      const snapshot = getValidationDashboardSnapshot();
+      res.json({ record, summary: snapshot.summary });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Single URL check failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/validation/scheduled', async (req, res) => {
+    const authCheck = verifyScheduledValidationAuth(req.headers);
+    if (!authCheck.authorized) {
+      res.status(401).json({ ok: false, error: 'Invalid or missing scheduler secret' });
+      return;
+    }
+
+    req.setTimeout(240_000);
+    res.setTimeout(240_000);
+
+    try {
+      const result = await triggerScheduledValidation();
+      res.status(200).json({
+        ok: true,
+        skippedOverlap: Boolean(result.skippedOverlap),
+        ...result,
+        scheduler: getValidationDashboardSnapshot().scheduler,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Scheduled validation failed';
+      res.status(500).json({ ok: false, error: message });
+    }
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -302,6 +561,9 @@ export class ErrorOverlay extends BaseHTMLElement {}
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`BattleSpirits Wiki server running on http://0.0.0.0:${PORT}`);
+    if (process.env.DISABLE_VALIDATION_SCHEDULER !== '1') {
+      startManualValidationScheduler();
+    }
   });
 }
 

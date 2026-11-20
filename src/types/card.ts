@@ -186,4 +186,5 @@ export interface ProductSet {
   colors: CardColor[];
   totalCardsInSet: number;
   wikiUrl: string;
+  isNumberOnly?: boolean;
 }

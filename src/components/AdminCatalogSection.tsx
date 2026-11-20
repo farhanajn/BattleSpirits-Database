@@ -1,0 +1,1266 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CloudUpload,
+  Database,
+  ExternalLink,
+  Image as ImageIcon,
+  Loader2,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  ShieldCheck,
+  XCircle,
+} from 'lucide-react';
+import type { User } from 'firebase/auth';
+import type { BattleSpiritsCard, ProductSet } from '../types/card';
+import {
+  type ClientArtworkValidationRecord,
+  isVerifiedAdminUser,
+  publishCatalogAdditionsToFirestore,
+  syncValidationRecordsToFirestore,
+} from '../utils/catalogCloudSync';
+
+type AdminSubTab = 'overview' | 'review' | 'validation';
+
+interface CatalogOverview {
+  totalWikiSetsDiscovered: number;
+  totalSetsInSpiritsdex: number;
+  setsScanned: number;
+  setsPending: number;
+  setsFailed: number;
+  numberOnlySetsCount: number;
+  totalWikiCardsDiscovered: number;
+  existingCardsMatched: number;
+  missingCards: number;
+  updatedMetadataCards: number;
+  cardsPendingReview: number;
+  potentialDuplicates: number;
+  incompleteMetadataCards: number;
+  missingArtworkCards: number;
+  importedCardsCount: number;
+  jobStatus: string;
+  currentSetCode: string | null;
+  scannedSetsCount: number;
+  totalSetsToScan: number;
+  startedAt: string | null;
+  updatedAt: string | null;
+  completedAt: string | null;
+}
+
+interface DiscoveredSetRow extends ProductSet {
+  sources: string[];
+  isNumberOnly: boolean;
+  inSpiritsdex: boolean;
+  scanStatus: 'pending' | 'scanning' | 'completed' | 'failed';
+  lastScanAt: string | null;
+  lastError: string | null;
+  discoveredCount: number;
+  existingCount: number;
+  missingCount: number;
+  updatedCount: number;
+  uncertainCount: number;
+  duplicateCount: number;
+  incompleteCount: number;
+  missingArtworkCount: number;
+}
+
+interface DiscoveredCardRow {
+  discoveryKey: string;
+  card: BattleSpiritsCard;
+  sourceSetCode: string;
+  sourceWikiTitle: string;
+  hasArtworkHint: boolean;
+  incompleteFields: string[];
+  classification: 'matched' | 'missing' | 'uncertain' | 'potential_duplicate' | 'updated_metadata';
+  matchSignals: string[];
+  matchConfidence: number;
+  metadataDeltas: string[];
+  approvedForImport: boolean;
+  imported: boolean;
+}
+
+interface ValidationSummary {
+  total: number;
+  healthy: number;
+  broken: number;
+  redirected: number;
+  temporarily_unavailable: number;
+  unverified: number;
+}
+
+interface ValidationSchedulerInfo {
+  intervalHours: number;
+  inProcessTimerActive: boolean;
+  lastScheduledRunAt: string | null;
+  nextScheduledRunAt: string | null;
+  cloudRunExternalCronEndpoint: string;
+  cronSecretConfigured: boolean;
+}
+
+interface ImportValidationPreview {
+  valid: boolean;
+  willAddSets: number;
+  willAddCards: number;
+  willUpdateMetadata: number;
+  skippedUncertain: number;
+  skippedDuplicates: number;
+  skippedAlreadyImported: number;
+  manualMappingsProtected: number;
+  warnings: string[];
+}
+
+interface AdminCatalogSectionProps {
+  currentUser: User | null;
+  onCatalogImported?: (sets: ProductSet[], cards: BattleSpiritsCard[]) => void;
+  onNotify?: (message: string) => void;
+}
+
+function formatDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function renderStatusBadge(status: string) {
+  switch (status) {
+    case 'completed':
+    case 'healthy':
+    case 'matched':
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold">
+          <CheckCircle2 className="w-3 h-3" />
+          <span>{status}</span>
+        </span>
+      );
+    case 'redirected':
+    case 'updated_metadata':
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 border border-sky-200 text-sky-800 text-[11px] font-semibold">
+          <span>{status.replace('_', ' ')}</span>
+        </span>
+      );
+    case 'broken':
+    case 'failed':
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-50 border border-red-200 text-red-800 text-[11px] font-semibold">
+          <XCircle className="w-3 h-3" />
+          <span>{status}</span>
+        </span>
+      );
+    case 'temporarily_unavailable':
+    case 'uncertain':
+    case 'potential_duplicate':
+    case 'missing':
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-900 text-[11px] font-semibold">
+          <AlertTriangle className="w-3 h-3" />
+          <span>{status.replace(/_/g, ' ')}</span>
+        </span>
+      );
+    default:
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-700 text-[11px] font-semibold">
+          <span>{status}</span>
+        </span>
+      );
+  }
+}
+
+export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
+  currentUser,
+  onCatalogImported,
+  onNotify,
+}) => {
+  const [subTab, setSubTab] = useState<AdminSubTab>('overview');
+  const [expanded, setExpanded] = useState(false);
+  const [isAdminCloud, setIsAdminCloud] = useState(false);
+
+  // Catalog state
+  const [overview, setOverview] = useState<CatalogOverview | null>(null);
+  const [sets, setSets] = useState<DiscoveredSetRow[]>([]);
+  const [reviewCards, setReviewCards] = useState<DiscoveredCardRow[]>([]);
+  const [totalFilteredCards, setTotalFilteredCards] = useState(0);
+  const [errorLogs, setErrorLogs] = useState<
+    Array<{ setCode: string; page?: string; message: string; timestamp: string }>
+  >([]);
+  const [setFilter, setSetFilter] = useState('all');
+  const [cardClassification, setCardClassification] = useState('all');
+  const [selectedSetCodeFilter, setSelectedSetCodeFilter] = useState('');
+  const [onlyMissingArt, setOnlyMissingArt] = useState(false);
+  const [onlyIncompleteMeta, setOnlyIncompleteMeta] = useState(false);
+  const [validationPreview, setValidationPreview] = useState<ImportValidationPreview | null>(null);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [scanningSetCode, setScanningSetCode] = useState<string | null>(null);
+
+  // Validation state
+  const [valSummary, setValSummary] = useState<ValidationSummary | null>(null);
+  const [valRecords, setValRecords] = useState<ClientArtworkValidationRecord[]>([]);
+  const [valScheduler, setValScheduler] = useState<ValidationSchedulerInfo | null>(null);
+  const [valPendingCount, setValPendingCount] = useState(0);
+  const [deadLinkRecords, setDeadLinkRecords] = useState<ClientArtworkValidationRecord[]>([]);
+  const [valStatusFilter, setValStatusFilter] = useState('all');
+  const [valQuery, setValQuery] = useState('');
+  const [valBusy, setValBusy] = useState(false);
+  const [checkingKey, setCheckingKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void isVerifiedAdminUser(currentUser).then((ok) => {
+      if (active) setIsAdminCloud(ok);
+    });
+    return () => {
+      active = false;
+    };
+  }, [currentUser]);
+
+  const loadCatalogStatus = useCallback(async () => {
+    try {
+      const qs = new URLSearchParams();
+      if (setFilter !== 'all') qs.set('setFilter', setFilter);
+      if (cardClassification !== 'all') qs.set('classification', cardClassification);
+      if (selectedSetCodeFilter.trim()) qs.set('setCode', selectedSetCodeFilter.trim());
+      if (onlyMissingArt) qs.set('onlyMissingArtwork', 'true');
+      if (onlyIncompleteMeta) qs.set('onlyIncomplete', 'true');
+      qs.set('limit', '120');
+
+      const res = await fetch(`/api/admin/catalog/status?${qs.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setOverview(data.overview || null);
+      setSets(Array.isArray(data.sets) ? data.sets : []);
+      setReviewCards(Array.isArray(data.cards) ? data.cards : []);
+      setTotalFilteredCards(Number(data.totalFilteredCards || 0));
+      setErrorLogs(Array.isArray(data.errorLogs) ? data.errorLogs : []);
+    } catch {
+      // ignore transient network errors
+    }
+  }, [setFilter, cardClassification, selectedSetCodeFilter, onlyMissingArt, onlyIncompleteMeta]);
+
+  const loadBrokenHealthAlert = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/validation/status?status=broken');
+      if (!res.ok) return;
+      const data = await res.json();
+      setValSummary((prev) => data.summary || prev);
+      setValScheduler((prev) => data.scheduler || prev);
+      setDeadLinkRecords(Array.isArray(data.records) ? data.records : []);
+    } catch {
+      // ignore offline
+    }
+  }, []);
+
+  const loadValidationStatus = useCallback(async () => {
+    try {
+      const qs = new URLSearchParams();
+      if (valStatusFilter !== 'all') qs.set('status', valStatusFilter);
+      if (valQuery.trim()) qs.set('q', valQuery.trim());
+      const res = await fetch(`/api/admin/validation/status?${qs.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setValSummary(data.summary || null);
+      setValRecords(Array.isArray(data.records) ? data.records : []);
+      setValScheduler(data.scheduler || null);
+      setValPendingCount(Array.isArray(data.cycle?.pendingKeys) ? data.cycle.pendingKeys.length : 0);
+      if (valStatusFilter === 'all' && !valQuery.trim()) {
+        const brokenList = Array.isArray(data.records)
+          ? data.records.filter((r: ClientArtworkValidationRecord) => r.status === 'broken')
+          : [];
+        setDeadLinkRecords(brokenList);
+      } else {
+        void loadBrokenHealthAlert();
+      }
+    } catch {
+      // ignore
+    }
+  }, [valStatusFilter, valQuery, loadBrokenHealthAlert]);
+
+  useEffect(() => {
+    void loadBrokenHealthAlert();
+  }, [loadBrokenHealthAlert]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    void loadCatalogStatus();
+    void loadValidationStatus();
+  }, [expanded, loadCatalogStatus, loadValidationStatus]);
+
+  const handleDiscoverSets = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/discover-sets', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Discovery failed');
+      onNotify?.(
+        `Discovered ${data.totalDiscovered} Wiki sets (${data.addedCount} new, ${data.numberOnlyCount} number-only)`
+      );
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Wiki set discovery failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleScanBatch = async (mode: 'all' | 'resume' | 'retry_failed') => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, maxSetsPerRun: 12 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Scan failed');
+      const processed = Array.isArray(data.processedSets) ? data.processedSets.length : 0;
+      const failed = Array.isArray(data.failedSets) ? data.failedSets.length : 0;
+      onNotify?.(
+        `Scanned ${processed} set(s)${failed > 0 ? ` (${failed} failed)` : ''} · ${data.overview?.missingCards ?? 0} missing cards detected`
+      );
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Catalog scan failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleScanSingleSet = async (setCode: string) => {
+    setScanningSetCode(setCode);
+    try {
+      const res = await fetch('/api/admin/catalog/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ setCode }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed to scan ${setCode}`);
+      onNotify?.(`Scanned ${setCode}: ${data.discoveredCount} cards discovered`);
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : `Scan failed for ${setCode}`);
+    } finally {
+      setScanningSetCode(null);
+    }
+  };
+
+  const handleCompareCatalog = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/compare', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Compare failed');
+      onNotify?.(
+        `Compared ${data.totalCompared} cards · ${data.overview?.missingCards ?? 0} missing, ${data.overview?.cardsPendingReview ?? 0} pending review`
+      );
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Catalog comparison failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleToggleApproval = async (discoveryKey: string, approved: boolean) => {
+    try {
+      const res = await fetch('/api/admin/catalog/review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ discoveryKey, approved }),
+      });
+      if (!res.ok) return;
+      await loadCatalogStatus();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleValidateImport = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/validate-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeMissing: true, includeApprovedUpdates: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Validation failed');
+      setValidationPreview(data);
+      onNotify?.(
+        `Validation ready: +${data.willAddCards} cards, +${data.willAddSets} sets, ${data.skippedUncertain} uncertain skipped`
+      );
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Import validation failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleExecuteImport = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeMissing: true, includeApprovedUpdates: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Import failed');
+
+      const importedSets: ProductSet[] = Array.isArray(data.importedSets) ? data.importedSets : [];
+      const importedCards: BattleSpiritsCard[] = Array.isArray(data.importedCards)
+        ? data.importedCards
+        : [];
+
+      onCatalogImported?.(importedSets, importedCards);
+
+      let cloudMsg = '';
+      if (isAdminCloud && currentUser && (importedSets.length > 0 || importedCards.length > 0)) {
+        try {
+          const synced = await publishCatalogAdditionsToFirestore(
+            currentUser.uid,
+            importedSets,
+            importedCards
+          );
+          cloudMsg = ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud`;
+        } catch {
+          cloudMsg = ' (local import succeeded; Cloud sync skipped/failed)';
+        }
+      }
+
+      onNotify?.(
+        `Imported ${data.addedCardsCount} cards (${data.updatedMetadataCount} updated, ${data.addedSetsCount} sets)${cloudMsg}`
+      );
+      setValidationPreview(null);
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Catalog import failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleRunValidation = async (opts: {
+    retryFailedOnly?: boolean;
+    resumeInterrupted?: boolean;
+  }) => {
+    setValBusy(true);
+    try {
+      const res = await fetch('/api/admin/validation/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Validation run failed');
+      onNotify?.(
+        `Validation complete: ${data.summary?.healthy ?? 0} healthy, ${data.summary?.broken ?? 0} broken, ${data.summary?.redirected ?? 0} redirected`
+      );
+      if (isAdminCloud && Array.isArray(data.records) && data.records.length > 0) {
+        void syncValidationRecordsToFirestore(data.records).catch(() => {});
+      }
+      await loadValidationStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Manual URL validation failed');
+    } finally {
+      setValBusy(false);
+    }
+  };
+
+  const handleCheckSingleUrl = async (mappingKey: string) => {
+    setCheckingKey(mappingKey);
+    try {
+      const res = await fetch('/api/admin/validation/check-one', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mappingKey }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Single URL check failed');
+      if (isAdminCloud && data.record) {
+        void syncValidationRecordsToFirestore([data.record]).catch(() => {});
+      }
+      await loadValidationStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Single check failed');
+    } finally {
+      setCheckingKey(null);
+    }
+  };
+
+  const handleSyncValidationCloud = async () => {
+    if (!isAdminCloud || valRecords.length === 0) return;
+    setValBusy(true);
+    try {
+      const count = await syncValidationRecordsToFirestore(valRecords);
+      onNotify?.(`Synced ${count} validation status record(s) to Firestore`);
+    } catch {
+      onNotify?.('Failed to sync validation status to Firestore');
+    } finally {
+      setValBusy(false);
+    }
+  };
+
+  return (
+    <section className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-6 space-y-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="space-y-1">
+          <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-700">
+            <Database className="w-3.5 h-3.5" />
+            <span>Catalog Maintenance &amp; Artwork Link Health</span>
+          </div>
+          <h2 className="font-display text-lg font-bold text-slate-900">
+            Wiki Catalog Sync &amp; Manual Artwork Validation
+          </h2>
+          <p className="text-xs text-slate-500">
+            Discover Battle Spirits Wiki sets cleanly, compare missing cards without overwriting
+            existing records or ManualWikiMapping, and monitor manual artwork URL health.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="min-h-[40px] px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 cursor-pointer transition-colors"
+        >
+          {expanded ? 'Hide Admin Tools' : 'Open Admin Tools'}
+        </button>
+      </div>
+
+      {/* Prominent Dead-Link Alert in Settings whenever any manual artwork URL is broken */}
+      {((valSummary?.broken ?? 0) > 0 || deadLinkRecords.length > 0) && (
+        <div
+          role="alert"
+          className="p-4 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-950 space-y-2.5"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-red-900">
+                  Dead Manual Artwork Link Alert ({deadLinkRecords.length || valSummary?.broken || 0} broken)
+                </div>
+                <p className="text-[11px] text-red-800 mt-0.5">
+                  One or more manual artwork mappings failed validation with a permanent HTTP error or missing Wiki file. Original mappings remain preserved cleanly until updated.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={valBusy}
+                onClick={() => void handleRunValidation({ retryFailedOnly: true })}
+                className="min-h-[34px] px-3 rounded-xl bg-white border border-red-200 hover:bg-red-100 text-red-800 text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <RotateCcw className="w-3 h-3" />
+                <span>Retry Failed Links</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setExpanded(true);
+                  setSubTab('validation');
+                  setValStatusFilter('broken');
+                }}
+                className="min-h-[34px] px-3 rounded-xl bg-red-700 hover:bg-red-800 text-white text-[11px] font-semibold cursor-pointer"
+              >
+                Inspect Broken Links
+              </button>
+            </div>
+          </div>
+
+          {deadLinkRecords.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-1">
+              {deadLinkRecords.slice(0, 8).map((rec) => (
+                <span
+                  key={rec.mappingKey}
+                  className="px-2 py-1 rounded-lg bg-white border border-red-200 text-[11px] font-mono text-red-900"
+                >
+                  {rec.cardNumber || rec.cardName}
+                  {rec.httpStatus > 0 ? ` (HTTP ${rec.httpStatus})` : ''}
+                </span>
+              ))}
+              {deadLinkRecords.length > 8 && (
+                <span className="px-2 py-1 text-[11px] text-red-800 font-semibold">
+                  +{deadLinkRecords.length - 8} more
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {expanded && (
+        <div className="space-y-5 pt-3 border-t border-slate-100">
+          {/* Sub-tab navigation */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+              {(
+                [
+                  { id: 'overview', label: 'Overview & Sets' },
+                  { id: 'review', label: 'Review Queue' },
+                  { id: 'validation', label: 'Manual Artwork URLs' },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setSubTab(tab.id)}
+                  className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+                    subTab === tab.id
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2 text-[11px] text-slate-500">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
+              <span>
+                {isAdminCloud
+                  ? `Cloud Admin Verified (${currentUser?.email})`
+                  : 'Local Server Mode (sign in as verified Admin to also publish to Firestore)'}
+              </span>
+            </div>
+          </div>
+
+          {/* 1. OVERVIEW & SETS */}
+          {subTab === 'overview' && (
+            <div className="space-y-4">
+              {/* Metrics Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                {[
+                  { label: 'Wiki Sets Discovered', val: overview?.totalWikiSetsDiscovered ?? 0 },
+                  { label: 'Sets in Spiritsdex', val: overview?.totalSetsInSpiritsdex ?? 0 },
+                  { label: 'Sets Scanned', val: overview?.setsScanned ?? 0 },
+                  { label: 'Sets Pending', val: overview?.setsPending ?? 0 },
+                  { label: 'Sets Failed', val: overview?.setsFailed ?? 0 },
+                  { label: 'Number-Only Sets', val: overview?.numberOnlySetsCount ?? 0 },
+                  { label: 'Wiki Cards Found', val: overview?.totalWikiCardsDiscovered ?? 0 },
+                  { label: 'Existing Matched', val: overview?.existingCardsMatched ?? 0 },
+                  { label: 'Missing Cards', val: overview?.missingCards ?? 0 },
+                  { label: 'Pending Review', val: overview?.cardsPendingReview ?? 0 },
+                  { label: 'Potential Duplicates', val: overview?.potentialDuplicates ?? 0 },
+                  { label: 'Missing Artwork', val: overview?.missingArtworkCards ?? 0 },
+                ].map((m) => (
+                  <div
+                    key={m.label}
+                    className="p-3 rounded-2xl bg-slate-50 border border-slate-200/80"
+                  >
+                    <div className="font-mono text-lg font-bold text-slate-900 tabular-nums">
+                      {m.val}
+                    </div>
+                    <div className="text-[11px] font-medium text-slate-500 leading-tight mt-0.5">
+                      {m.label}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Action Bar */}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleDiscoverSets()}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {catalogBusy ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Search className="w-3.5 h-3.5" />
+                  )}
+                  <span>Discover Wiki Sets</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleScanBatch('all')}
+                  className="min-h-[38px] px-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>Scan Wiki</span>
+                </button>
+
+                {(overview?.setsPending ?? 0) > 0 && (
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleScanBatch('resume')}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Resume Scan ({overview?.setsPending})</span>
+                  </button>
+                )}
+
+                {(overview?.setsFailed ?? 0) > 0 && (
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleScanBatch('retry_failed')}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Retry Failed Scans ({overview?.setsFailed})</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleCompareCatalog()}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <span>Compare Catalog</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleValidateImport()}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <span>Validate Import</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={catalogBusy || (overview?.missingCards ?? 0) + (overview?.cardsPendingReview ?? 0) === 0}
+                  onClick={() => void handleExecuteImport()}
+                  className="min-h-[38px] px-3.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <CloudUpload className="w-3.5 h-3.5" />
+                  <span>Import Verified Cards</span>
+                </button>
+              </div>
+
+              {validationPreview && (
+                <div className="p-3.5 rounded-2xl bg-sky-50 border border-sky-200 text-xs text-sky-950 space-y-1">
+                  <div className="font-semibold">
+                    Import Dry-Run Validation: +{validationPreview.willAddCards} cards, +
+                    {validationPreview.willAddSets} sets, {validationPreview.willUpdateMetadata}{' '}
+                    metadata enrichments
+                  </div>
+                  <div className="text-[11px] text-sky-800">
+                    Protected: {validationPreview.manualMappingsProtected} ManualWikiMapping ·
+                    Skipped: {validationPreview.skippedUncertain} uncertain,{' '}
+                    {validationPreview.skippedDuplicates} duplicates,{' '}
+                    {validationPreview.skippedAlreadyImported} already imported
+                  </div>
+                </div>
+              )}
+
+              {/* Set Filters & Table */}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {[
+                    { id: 'all', label: 'All Sets' },
+                    { id: 'pending', label: 'Pending' },
+                    { id: 'completed', label: 'Scanned' },
+                    { id: 'failed', label: 'Failed' },
+                    { id: 'number_only', label: 'Number-Only' },
+                    { id: 'missing_from_db', label: 'Has Missing Cards' },
+                  ].map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setSetFilter(f.id)}
+                      className={`min-h-[30px] px-2.5 rounded-lg text-[11px] font-semibold border cursor-pointer ${
+                        setFilter === f.id
+                          ? 'bg-slate-900 border-slate-900 text-white'
+                          : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-[11px] font-mono text-slate-500">
+                  {sets.length} sets shown
+                </span>
+              </div>
+
+              <div className="overflow-x-auto rounded-2xl border border-slate-200 max-h-80">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-[11px] font-semibold text-slate-600 sticky top-0 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-3">Set</th>
+                      <th className="py-2.5 px-3">Sources</th>
+                      <th className="py-2.5 px-3 text-right">Discovered</th>
+                      <th className="py-2.5 px-3 text-right">Matched</th>
+                      <th className="py-2.5 px-3 text-right">Missing</th>
+                      <th className="py-2.5 px-3">Status</th>
+                      <th className="py-2.5 px-3">Last Scan</th>
+                      <th className="py-2.5 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {sets.slice(0, 120).map((s) => (
+                      <tr key={s.setCode} className="hover:bg-slate-50/70">
+                        <td className="py-2 px-3">
+                          <div className="font-mono font-bold text-slate-900 flex items-center gap-1.5">
+                            <span>{s.setCode}</span>
+                            {s.isNumberOnly && (
+                              <span className="px-1.5 py-0.2 rounded bg-slate-200 text-[10px] font-semibold text-slate-700">
+                                #
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-500 truncate max-w-[200px]">
+                            {s.name}
+                          </div>
+                          {s.lastError && (
+                            <div className="text-[10px] text-red-700 truncate max-w-[200px]">
+                              {s.lastError}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-[11px] text-slate-500 max-w-[160px] truncate">
+                          {(s.sources || []).join(', ')}
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono tabular-nums">
+                          {s.discoveredCount}
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono tabular-nums">
+                          {s.existingCount}
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono tabular-nums font-semibold text-amber-800">
+                          {s.missingCount}
+                        </td>
+                        <td className="py-2 px-3">{renderStatusBadge(s.scanStatus)}</td>
+                        <td className="py-2 px-3 text-[11px] text-slate-500 whitespace-nowrap">
+                          {formatDateTime(s.lastScanAt)}
+                        </td>
+                        <td className="py-2 px-3 text-right whitespace-nowrap space-x-1.5">
+                          <button
+                            type="button"
+                            disabled={scanningSetCode === s.setCode}
+                            onClick={() => void handleScanSingleSet(s.setCode)}
+                            className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-semibold text-slate-800 cursor-pointer disabled:opacity-50"
+                          >
+                            {scanningSetCode === s.setCode
+                              ? 'Scanning...'
+                              : s.scanStatus === 'failed'
+                              ? 'Retry'
+                              : 'Scan'}
+                          </button>
+                          {s.discoveredCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedSetCodeFilter(s.setCode);
+                                setSubTab('review');
+                              }}
+                              className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-[11px] font-semibold text-white cursor-pointer"
+                            >
+                              Inspect
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {errorLogs.length > 0 && (
+                <div className="p-3 rounded-2xl bg-red-50 border border-red-200 space-y-1">
+                  <div className="text-xs font-semibold text-red-900">
+                    Recent Scan Error Logs ({errorLogs.length})
+                  </div>
+                  <div className="max-h-28 overflow-y-auto space-y-1 text-[11px] text-red-800 font-mono">
+                    {errorLogs.slice(0, 15).map((log, i) => (
+                      <div key={`${log.setCode}-${i}`}>
+                        [{log.setCode}] {log.message}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 2. REVIEW QUEUE */}
+          {subTab === 'review' && (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    aria-label="Filter by comparison classification"
+                    value={cardClassification}
+                    onChange={(e) => setCardClassification(e.target.value)}
+                    className="min-h-[36px] px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-800"
+                  >
+                    <option value="all">All Classifications</option>
+                    <option value="missing">Missing</option>
+                    <option value="updated_metadata">Updated Metadata</option>
+                    <option value="uncertain">Uncertain</option>
+                    <option value="potential_duplicate">Potential Duplicate</option>
+                    <option value="matched">Matched</option>
+                  </select>
+
+                  <input
+                    type="text"
+                    value={selectedSetCodeFilter}
+                    onChange={(e) => setSelectedSetCodeFilter(e.target.value.toUpperCase())}
+                    placeholder="Filter Set (e.g. BS75)"
+                    className="min-h-[36px] w-36 px-3 rounded-xl border border-slate-200 bg-white text-xs text-slate-900"
+                  />
+
+                  <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={onlyMissingArt}
+                      onChange={(e) => setOnlyMissingArt(e.target.checked)}
+                    />
+                    <span>Missing Artwork Only</span>
+                  </label>
+
+                  <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={onlyIncompleteMeta}
+                      onChange={(e) => setOnlyIncompleteMeta(e.target.checked)}
+                    />
+                    <span>Incomplete Only</span>
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleValidateImport()}
+                    className="min-h-[36px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 cursor-pointer"
+                  >
+                    Validate Import
+                  </button>
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleExecuteImport()}
+                    className="min-h-[36px] px-3.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold cursor-pointer"
+                  >
+                    Import Verified Cards
+                  </button>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-slate-500 font-mono">
+                Showing {reviewCards.length} of {totalFilteredCards} discovered cards
+              </div>
+
+              <div className="overflow-x-auto rounded-2xl border border-slate-200 max-h-96">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-[11px] font-semibold text-slate-600 sticky top-0 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-3">Card</th>
+                      <th className="py-2.5 px-3">Set</th>
+                      <th className="py-2.5 px-3">Classification</th>
+                      <th className="py-2.5 px-3">Signals / Flags</th>
+                      <th className="py-2.5 px-3 text-right">Approval</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {reviewCards.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-slate-500">
+                          No discovered cards match current filters. Run &ldquo;Scan Wiki&rdquo; in
+                          Overview &amp; Sets first.
+                        </td>
+                      </tr>
+                    ) : (
+                      reviewCards.map((entry) => (
+                        <tr key={entry.discoveryKey} className="hover:bg-slate-50/70">
+                          <td className="py-2 px-3">
+                            <div className="font-semibold text-slate-900">
+                              {entry.card.name}
+                            </div>
+                            <div className="text-[11px] font-mono text-slate-500">
+                              {entry.card.cardNumber}
+                              {entry.card.jpName ? ` · ${entry.card.jpName}` : ''}
+                            </div>
+                          </td>
+                          <td className="py-2 px-3 font-mono text-slate-700">
+                            {entry.sourceSetCode}
+                          </td>
+                          <td className="py-2 px-3">
+                            {renderStatusBadge(entry.classification)}
+                          </td>
+                          <td className="py-2 px-3 text-[11px] text-slate-600 space-y-0.5">
+                            {entry.matchSignals.length > 0 && (
+                              <div>
+                                {entry.matchSignals.join(', ')} ({entry.matchConfidence}%)
+                              </div>
+                            )}
+                            {entry.metadataDeltas.length > 0 && (
+                              <div className="text-sky-700">
+                                Updates: {entry.metadataDeltas.join(', ')}
+                              </div>
+                            )}
+                            {!entry.hasArtworkHint && (
+                              <div className="text-amber-700">No artwork file detected yet</div>
+                            )}
+                            {entry.incompleteFields.length > 0 && (
+                              <div className="text-slate-500">
+                                Incomplete: {entry.incompleteFields.join(', ')}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right whitespace-nowrap">
+                            {entry.imported ? (
+                              <span className="text-[11px] font-semibold text-emerald-700">
+                                Imported
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleToggleApproval(
+                                    entry.discoveryKey,
+                                    !entry.approvedForImport
+                                  )
+                                }
+                                className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border cursor-pointer ${
+                                  entry.approvedForImport
+                                    ? 'bg-emerald-600 border-emerald-600 text-white'
+                                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100'
+                                }`}
+                              >
+                                {entry.approvedForImport ? 'Approved' : 'Approve'}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* 3. MANUAL ARTWORK URL VALIDATION */}
+          {subTab === 'validation' && (
+            <div className="space-y-4">
+              {/* Summary Counts */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                {[
+                  { label: 'Total Manual URLs', val: valSummary?.total ?? 0 },
+                  { label: 'Healthy', val: valSummary?.healthy ?? 0 },
+                  { label: 'Broken', val: valSummary?.broken ?? 0 },
+                  { label: 'Redirected', val: valSummary?.redirected ?? 0 },
+                  {
+                    label: 'Temp Unavailable',
+                    val: valSummary?.temporarily_unavailable ?? 0,
+                  },
+                  { label: 'Unverified', val: valSummary?.unverified ?? 0 },
+                ].map((m) => (
+                  <div
+                    key={m.label}
+                    className="p-3 rounded-2xl bg-slate-50 border border-slate-200/80"
+                  >
+                    <div className="font-mono text-lg font-bold text-slate-900 tabular-nums">
+                      {m.val}
+                    </div>
+                    <div className="text-[11px] font-medium text-slate-500 mt-0.5">
+                      {m.label}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Honest Scheduler Status */}
+              {valScheduler && (
+                <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 text-xs text-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <span className="font-semibold text-slate-900">
+                      Background Schedule: Every {valScheduler.intervalHours}h
+                    </span>{' '}
+                    ({valScheduler.inProcessTimerActive ? 'In-process timer active' : 'Timer inactive'}
+                    ). External GitHub Actions / cron webhook:{' '}
+                    <code className="font-mono text-[11px] bg-white px-1.5 py-0.5 rounded border border-slate-200">
+                      {valScheduler.cloudRunExternalCronEndpoint}
+                    </code>{' '}
+                    <span className="text-[11px] text-slate-500">
+                      ({valScheduler.cronSecretConfigured ? 'X-Validation-Cron-Secret enabled' : 'Secret not set on server'})
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 shrink-0">
+                    Last: {formatDateTime(valScheduler.lastScheduledRunAt)} · Next:{' '}
+                    {formatDateTime(valScheduler.nextScheduledRunAt)}
+                  </div>
+                </div>
+              )}
+
+              {/* Actions & Filters */}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={valBusy}
+                    onClick={() => void handleRunValidation({})}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    {valBusy ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <ImageIcon className="w-3.5 h-3.5" />
+                    )}
+                    <span>Run Validation Now</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={valBusy}
+                    onClick={() => void handleRunValidation({ retryFailedOnly: true })}
+                    className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Retry Failed Links</span>
+                  </button>
+
+                  {valPendingCount > 0 && (
+                    <button
+                      type="button"
+                      disabled={valBusy}
+                      onClick={() => void handleRunValidation({ resumeInterrupted: true })}
+                      className="min-h-[38px] px-3.5 rounded-xl bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <span>Resume Interrupted ({valPendingCount})</span>
+                    </button>
+                  )}
+
+                  {isAdminCloud && valRecords.length > 0 && (
+                    <button
+                      type="button"
+                      disabled={valBusy}
+                      onClick={() => void handleSyncValidationCloud()}
+                      className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <CloudUpload className="w-3.5 h-3.5" />
+                      <span>Sync to Firestore</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="search"
+                    value={valQuery}
+                    onChange={(e) => setValQuery(e.target.value)}
+                    placeholder="Filter name, number, set..."
+                    className="min-h-[36px] w-44 px-3 rounded-xl border border-slate-200 bg-white text-xs text-slate-900"
+                  />
+                  <select
+                    aria-label="Filter validation status"
+                    value={valStatusFilter}
+                    onChange={(e) => setValStatusFilter(e.target.value)}
+                    className="min-h-[36px] px-2.5 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-800"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="healthy">Healthy</option>
+                    <option value="broken">Broken</option>
+                    <option value="redirected">Redirected</option>
+                    <option value="temporarily_unavailable">Temp Unavailable</option>
+                    <option value="unverified">Unverified</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Validation Records Table */}
+              <div className="overflow-x-auto rounded-2xl border border-slate-200 max-h-96">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-[11px] font-semibold text-slate-600 sticky top-0 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-3">Card</th>
+                      <th className="py-2.5 px-3">Original Target</th>
+                      <th className="py-2.5 px-3">Status / HTTP</th>
+                      <th className="py-2.5 px-3">Final URL / Reason</th>
+                      <th className="py-2.5 px-3">Checked / Last OK</th>
+                      <th className="py-2.5 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {valRecords.map((rec) => (
+                      <tr key={rec.mappingKey} className="hover:bg-slate-50/70">
+                        <td className="py-2 px-3">
+                          <div className="font-semibold text-slate-900">{rec.cardName}</div>
+                          <div className="font-mono text-[11px] text-slate-500">
+                            {rec.cardNumber}
+                            {rec.setCode ? ` · ${rec.setCode}` : ''}
+                          </div>
+                        </td>
+                        <td className="py-2 px-3 max-w-[200px]">
+                          <div className="truncate font-mono text-[11px] text-slate-700">
+                            {rec.fileName || rec.wikiTitle || rec.originalUrl}
+                          </div>
+                          <div className="text-[10px] text-slate-400">{rec.mappingType}</div>
+                        </td>
+                        <td className="py-2 px-3 space-y-1">
+                          <div>{renderStatusBadge(rec.status)}</div>
+                          {rec.httpStatus > 0 && (
+                            <div className="font-mono text-[10px] text-slate-500">
+                              HTTP {rec.httpStatus}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 max-w-[220px] text-[11px]">
+                          {rec.finalUrl && (
+                            <div className="truncate font-mono text-slate-600">
+                              {rec.finalUrl}
+                            </div>
+                          )}
+                          {rec.failureReason && (
+                            <div className="truncate text-amber-800">{rec.failureReason}</div>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-[11px] text-slate-500 whitespace-nowrap">
+                          <div>Checked: {formatDateTime(rec.lastCheckedAt)}</div>
+                          <div>OK: {formatDateTime(rec.lastSuccessAt)}</div>
+                        </td>
+                        <td className="py-2 px-3 text-right whitespace-nowrap space-x-1.5">
+                          <button
+                            type="button"
+                            disabled={checkingKey === rec.mappingKey}
+                            onClick={() => void handleCheckSingleUrl(rec.mappingKey)}
+                            className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-semibold text-slate-800 cursor-pointer disabled:opacity-50"
+                          >
+                            {checkingKey === rec.mappingKey ? 'Checking...' : 'Validate'}
+                          </button>
+                          {rec.originalUrl && (
+                            <a
+                              href={rec.originalUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-semibold text-slate-700"
+                            >
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+};

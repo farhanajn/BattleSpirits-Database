@@ -1,0 +1,97 @@
+name: Validate Spiritsdex Manual Artwork URLs
+
+on:
+  schedule:
+    # Daily at 00:15 Asia/Jakarta time (WIB, UTC+7) -> 17:15 UTC
+    - cron: '15 17 * * *'
+  workflow_dispatch:
+
+# Prevent overlapping scheduled or manual validation runs
+concurrency:
+  group: spiritsdex-manual-artwork-validation
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  validate-manual-artwork:
+    name: Trigger Manual Artwork Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Trigger scheduled manual artwork validation on backend
+        env:
+          BASE_URL: ${{ vars.SPIRITSDEX_VALIDATION_URL }}
+          VALIDATION_CRON_SECRET: ${{ secrets.VALIDATION_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE_URL}" ]; then
+            echo "::error::Missing GitHub repository variable SPIRITSDEX_VALIDATION_URL."
+            exit 1
+          fi
+
+          if [ -z "${VALIDATION_CRON_SECRET}" ]; then
+            echo "::error::Missing GitHub repository secret VALIDATION_CRON_SECRET."
+            exit 1
+          fi
+
+          CLEAN_URL="${BASE_URL%/}"
+          case "${CLEAN_URL}" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::SPIRITSDEX_VALIDATION_URL must start with https:// or http://."
+              exit 1
+              ;;
+          esac
+
+          ENDPOINT="${CLEAN_URL}/api/admin/validation/scheduled"
+          RESP_FILE="$(mktemp)"
+          trap 'rm -f "${RESP_FILE}"' EXIT
+
+          HTTP_CODE="$(
+            curl -sS -X POST "${ENDPOINT}" \
+              --connect-timeout 20 \
+              --max-time 180 \
+              -H "Content-Type: application/json" \
+              -H "X-Validation-Cron-Secret: ${VALIDATION_CRON_SECRET}" \
+              -o "${RESP_FILE}" \
+              -w "%{http_code}"
+          )" || {
+            echo "::error::Request to scheduled validation endpoint failed or timed out."
+            exit 1
+          }
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "::error::Scheduled validation endpoint returned HTTP ${HTTP_CODE}."
+            if [ -s "${RESP_FILE}" ]; then
+              head -c 500 "${RESP_FILE}"
+              echo ""
+            fi
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const raw = fs.readFileSync(process.argv[1], "utf8");
+            const data = JSON.parse(raw);
+            if (!data || data.ok !== true) {
+              console.error("Unexpected response payload: missing ok=true");
+              process.exit(1);
+            }
+            const s = data.summary || {};
+            console.log("Validation summary:", JSON.stringify({
+              ok: data.ok,
+              skippedOverlap: Boolean(data.skippedOverlap),
+              total: s.total ?? 0,
+              healthy: s.healthy ?? 0,
+              broken: s.broken ?? 0,
+              redirected: s.redirected ?? 0,
+              temporarily_unavailable: s.temporarily_unavailable ?? 0,
+              unverified: s.unverified ?? 0
+            }));
+            if ((s.broken ?? 0) > 0) {
+              console.log(`::warning::Detected ${s.broken} broken manual artwork URL(s). Open Settings -> Manual Artwork URLs in Spiritsdex to inspect.`);
+            }
+          ' "${RESP_FILE}"

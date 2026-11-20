@@ -486,6 +486,124 @@
         }
       },
       "required": ["id", "postId", "authorUid", "authorName", "authorPhoto", "text", "createdAt"]
+    },
+    "CatalogSetRecord": {
+      "title": "CatalogSetRecord",
+      "description": "Synchronized Battle Spirits set metadata discovered from the Battle Spirits Wiki.",
+      "type": "object",
+      "properties": {
+        "setCode": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "wikiTitle": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "jpName": { "type": "string", "maxLength": 200 },
+        "category": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "productType": { "type": "string", "maxLength": 60 },
+        "releaseDate": { "type": "string", "maxLength": 80 },
+        "formats": { "type": "array" },
+        "blockLabel": { "type": "string", "maxLength": 80 },
+        "tagline": { "type": "string", "maxLength": 500 },
+        "featuredCardId": { "type": "string", "maxLength": 128 },
+        "colors": { "type": "array" },
+        "totalCardsInSet": { "type": "integer" },
+        "wikiUrl": { "type": "string", "maxLength": 500 },
+        "sources": { "type": "array" },
+        "isNumberOnly": { "type": "boolean" },
+        "scanStatus": { "type": "string", "enum": ["pending", "scanning", "completed", "failed"], "maxLength": 24 },
+        "discoveredCount": { "type": "integer" },
+        "existingCount": { "type": "integer" },
+        "missingCount": { "type": "integer" },
+        "lastScanAt": { "type": "string", "maxLength": 40 },
+        "isPublished": { "type": "boolean" },
+        "updatedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "setCode", "wikiTitle", "name", "jpName", "category", "productType",
+        "releaseDate", "formats", "blockLabel", "tagline", "featuredCardId",
+        "colors", "totalCardsInSet", "wikiUrl", "sources", "isNumberOnly",
+        "scanStatus", "discoveredCount", "existingCount", "missingCount",
+        "lastScanAt", "isPublished", "updatedByUid", "createdAt", "updatedAt"
+      ]
+    },
+    "CatalogCardRecord": {
+      "title": "CatalogCardRecord",
+      "description": "Safely verified Battle Spirits card record imported via admin catalog synchronization.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "cardNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "jpName": { "type": "string", "maxLength": 200 },
+        "color": { "type": "string", "enum": ["Red", "Purple", "White", "Yellow", "Green", "Blue"], "maxLength": 20 },
+        "secondaryColor": { "type": "string", "enum": ["", "Red", "Purple", "White", "Yellow", "Green", "Blue"], "maxLength": 20 },
+        "colors": { "type": "array" },
+        "type": { "type": "string", "enum": ["Spirit", "Ultimate", "Brave", "Nexus", "Magic"], "maxLength": 20 },
+        "subtypeLabel": { "type": "string", "maxLength": 80 },
+        "rarity": { "type": "string", "maxLength": 16 },
+        "setCode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "setName": { "type": "string", "maxLength": 200 },
+        "formats": { "type": "array" },
+        "blockIcon": { "type": "string", "maxLength": 64 },
+        "restriction": { "type": "string", "maxLength": 32 },
+        "isRevival": { "type": "boolean" },
+        "isToken": { "type": "boolean" },
+        "cost": { "type": "integer" },
+        "payloadJson": { "type": "string", "maxLength": 20000 },
+        "sourceTag": { "type": "string", "maxLength": 120 },
+        "missingArtwork": { "type": "boolean" },
+        "isPublished": { "type": "boolean" },
+        "importedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "cardNumber", "name", "jpName", "color", "secondaryColor", "colors",
+        "type", "subtypeLabel", "rarity", "setCode", "setName", "formats", "blockIcon",
+        "restriction", "isRevival", "isToken", "cost", "payloadJson", "sourceTag",
+        "missingArtwork", "isPublished", "importedByUid", "createdAt", "updatedAt"
+      ]
+    },
+    "ArtworkValidationRecord": {
+      "title": "ArtworkValidationRecord",
+      "description": "Server-validated health record for a manual artwork mapping stored separately from the mapping itself.",
+      "type": "object",
+      "properties": {
+        "mappingKey": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "cardId": { "type": "string", "maxLength": 128 },
+        "cardName": { "type": "string", "maxLength": 200 },
+        "cardNumber": { "type": "string", "maxLength": 64 },
+        "setCode": { "type": "string", "maxLength": 64 },
+        "mappingType": { "type": "string", "enum": ["direct_url", "wiki_file", "wiki_title"], "maxLength": 24 },
+        "originalUrl": { "type": "string", "maxLength": 1000 },
+        "wikiTitle": { "type": "string", "maxLength": 200 },
+        "fileName": { "type": "string", "maxLength": 250 },
+        "status": { "type": "string", "enum": ["healthy", "broken", "redirected", "unverified", "temporarily_unavailable"], "maxLength": 32 },
+        "httpStatus": { "type": "integer" },
+        "finalUrl": { "type": "string", "maxLength": 1000 },
+        "lastCheckedAt": { "type": "string", "maxLength": 40 },
+        "lastSuccessAt": { "type": "string", "maxLength": 40 },
+        "consecutiveFailures": { "type": "integer" },
+        "failureReason": { "type": "string", "maxLength": 500 },
+        "lastCycleId": { "type": "string", "maxLength": 80 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "mappingKey", "cardId", "cardName", "cardNumber", "setCode", "mappingType",
+        "originalUrl", "wikiTitle", "fileName", "status", "httpStatus", "finalUrl",
+        "lastCheckedAt", "lastSuccessAt", "consecutiveFailures", "failureReason",
+        "lastCycleId", "updatedAt"
+      ]
+    },
+    "AdminRoleRecord": {
+      "title": "AdminRoleRecord",
+      "description": "Read-only admin authorization marker.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["admin"], "maxLength": 16 }
+      },
+      "required": ["uid", "role"]
     }
   },
   "firestore": {
@@ -524,6 +642,22 @@
     "/posts/{postId}/comments/{commentId}": {
       "schema": { "$ref": "#/entities/PostComment" },
       "description": "Discussion comments on community posts."
+    },
+    "/catalogSets/{setCode}": {
+      "schema": { "$ref": "#/entities/CatalogSetRecord" },
+      "description": "Published Battle Spirits sets discovered via admin Wiki catalog sync."
+    },
+    "/catalogCards/{cardId}": {
+      "schema": { "$ref": "#/entities/CatalogCardRecord" },
+      "description": "Published Battle Spirits cards imported via admin Wiki catalog sync."
+    },
+    "/artworkValidations/{mappingKey}": {
+      "schema": { "$ref": "#/entities/ArtworkValidationRecord" },
+      "description": "Admin-only periodic validation records for manual artwork mappings."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRoleRecord" },
+      "description": "Immutable admin role lookup collection."
     }
   }
 }
