@@ -32,7 +32,7 @@ import {
   validateSingleMappingByKey,
   type ArtworkValidationRecord,
 } from './server/manualUrlValidator.ts';
-import { scheduledValidationHandler } from './server/api/validation/scheduled.ts';
+import { artworkValidationRouter } from './server/controllers/artworkValidationController.ts';
 import type { BattleSpiritsCard } from './src/types/card.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -472,10 +472,7 @@ async function startServer() {
     }
   });
 
-  app.post(
-    ['/api/admin/validation/scheduled', '/api/admin/validation/scheduled/'],
-    scheduledValidationHandler
-  );
+  app.use(artworkValidationRouter);
 
   // Return structured JSON 404 for unknown /api/* paths before SPA HTML fallback
   app.use('/api', (_req, res) => {

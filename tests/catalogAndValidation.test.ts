@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import express from 'express';
 import type { BattleSpiritsCard } from '../src/types/card.ts';
 import {
   getManualWikiMapping,
@@ -37,6 +38,7 @@ import {
   type ManualValidationDependencies,
 } from '../server/manualUrlValidator.ts';
 import { createScheduledValidationHandler } from '../server/api/validation/scheduled.ts';
+import { createArtworkValidationRouter } from '../server/controllers/artworkValidationController.ts';
 import { parseSetTableRows, enrichSetMetadata, type WikiPageBundle } from '../server/wikiService.ts';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spiritsdex-test-'));
@@ -883,5 +885,77 @@ describe('Manual Artwork URL Background & Manual Validation (All 13 Required Cas
     assert.equal(restoredState.records[freshKey]?.status, 'broken');
     assert.equal(restoredState.records[freshKey]?.httpStatus, 404);
   });
+
+  it('mounts createArtworkValidationRouter before catch-all 404 middleware and handles HTTP POST requests', async () => {
+    const routerStateFile = path.join(tmpDir, `router-${Date.now()}.json`);
+    const deps: ManualValidationDependencies = {
+      stateFilePath: routerStateFile,
+      mappingsProvider: () => [
+        {
+          cardId: 'rt-001',
+          cardNumber: 'RT-001',
+          name: 'Router Phoenix',
+          artworkUrl: 'https://cdn.example.com/rt-001.png',
+        },
+      ],
+      sleepFn: async () => {},
+      fetchFn: async () => new Response(null, { status: 200, headers: { 'content-type': 'image/png' } }),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createArtworkValidationRouter({
+        expectedSecret: 'router-cron-secret-999',
+        deps,
+      })
+    );
+    app.use('/api', (_req, res) => {
+      res.status(404).json({ ok: false, error: 'API route not found' });
+    });
+
+    const server = await new Promise<import('node:http').Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+
+    try {
+      const addr = server.address();
+      assert.ok(addr && typeof addr === 'object');
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      const unauthRes = await fetch(`${baseUrl}/api/admin/validation/scheduled`, {
+        method: 'POST',
+      });
+      assert.equal(unauthRes.status, 401);
+
+      const wrongRes = await fetch(`${baseUrl}/api/admin/validation/scheduled`, {
+        method: 'POST',
+        headers: { 'X-Validation-Cron-Secret': 'bad-secret' },
+      });
+      assert.equal(wrongRes.status, 401);
+
+      const okRes = await fetch(`${baseUrl}/api/admin/validation/scheduled`, {
+        method: 'POST',
+        headers: { 'X-Validation-Cron-Secret': 'router-cron-secret-999' },
+      });
+      assert.equal(okRes.status, 200);
+      const okJson = (await okRes.json()) as {
+        ok: boolean;
+        summary?: { total?: number; healthy?: number };
+      };
+      assert.equal(okJson.ok, true);
+      assert.equal(okJson.summary?.healthy, 1);
+
+      const notFoundRes = await fetch(`${baseUrl}/api/nonexistent-endpoint`, {
+        method: 'POST',
+      });
+      assert.equal(notFoundRes.status, 404);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
 });
+
 
