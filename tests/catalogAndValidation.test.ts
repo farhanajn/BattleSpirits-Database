@@ -15,7 +15,9 @@ import {
   discoverAllWikiSets,
   executeCatalogImport,
   getCatalogOverview,
+  normalizeSetCode,
   runCatalogScanBatch,
+  sanitizeSetCode,
   scanWikiSetByCode,
   setDiscoveredCardApproval,
   validateCatalogImport,
@@ -25,6 +27,7 @@ import {
   buildDeterministicMappingKey,
   getValidationDashboardSnapshot,
   loadValidationState,
+  mergeFirestoreValidationRecords,
   runManualValidationJob,
   saveValidationState,
   syncMappingsIntoValidationState,
@@ -33,7 +36,8 @@ import {
   verifyScheduledValidationAuth,
   type ManualValidationDependencies,
 } from '../server/manualUrlValidator.ts';
-import type { WikiPageBundle } from '../server/wikiService.ts';
+import { createScheduledValidationHandler } from '../server/api/validation/scheduled.ts';
+import { parseSetTableRows, enrichSetMetadata, type WikiPageBundle } from '../server/wikiService.ts';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spiritsdex-test-'));
 
@@ -350,6 +354,168 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     assert.deepEqual(retryRun.processedSets, ['BS78']);
     assert.equal(retryRun.overview.setsFailed, 0);
   });
+
+  it('normalizes set aliases (BS 23 -> BS23), parses 2-column & special card numbers, unblocks Revival vs Original comparisons, and outputs rejection diagnostics', async () => {
+    assert.equal(normalizeSetCode('BS 23'), 'BS23');
+    assert.equal(normalizeSetCode('bs-23'), 'BS23');
+    assert.equal(sanitizeSetCode('BS 23'), 'BS23');
+    assert.equal(sanitizeSetCode('26R SD 01'), '26RSD01');
+
+    // Verify 2-column table parsing, (A)/(B) card numbers, and {{Nihongo|...}} set title extraction
+    const twoColWikitext = `
+{{SetTable
+|title={{Nihongo|Starter Deck 2026|スタートデッキ}}
+|release=2026-04-25
+}}
+{| class="wikitable"
+! Card Number !! Card Name
+|-
+| 26RSD01-X01 || [[Solar Dragon]]
+|-
+| BS73-TCP01(A) || [[Tenkaku Dragon (Revival)]]
+|}
+`;
+    const dummySet = {
+      setCode: '26RSD01',
+      wikiTitle: '26RSD01',
+      category: 'Standard Starter' as const,
+      name: '26RSD01',
+      jpName: '',
+      productType: 'Starter Deck' as const,
+      releaseDate: '2026+',
+      formats: ['Standard' as const, 'Eternal' as const],
+      blockLabel: 'Standard',
+      tagline: 'Test',
+      featuredCardId: '26rsd01-001',
+      colors: ['Red' as const],
+      totalCardsInSet: 0,
+      wikiUrl: 'https://battle-spirits.fandom.com/wiki/26RSD01',
+    };
+    const parsedTwoCol = parseSetTableRows(twoColWikitext, dummySet);
+    assert.equal(parsedTwoCol.length, 2, 'Parses both 2-column table rows including (A) suffix');
+    assert.equal(parsedTwoCol[0].cardNumber, '26RSD01-X01');
+    assert.equal(parsedTwoCol[1].cardNumber, 'BS73-TCP01(A)');
+    const enrichedMeta = enrichSetMetadata(dummySet, twoColWikitext, parsedTwoCol);
+    assert.equal(enrichedMeta.name, 'Starter Deck 2026', 'Extracts English title cleanly from {{Nihongo|...}}');
+
+    // Verify Revival vs Original distinct printing comparison + alias set scanning ('BS 23')
+    const revivalDeps: CatalogDependencies = {
+      stateFilePath: path.join(tmpDir, `catalog-rv-${Date.now()}.json`),
+      existingCardsProvider: () => [
+        makeBaselineCard({
+          id: 'bs52-bs52-tx01',
+          cardNumber: 'BS52-TX01',
+          name: 'Tenkaku Dragon',
+          setCode: 'BS52',
+          isRevival: false,
+        }),
+        makeBaselineCard({
+          id: 'bs43-rv025',
+          cardNumber: 'BS43-RV025',
+          name: 'Ushiwaka',
+          setCode: 'BS43',
+          isRevival: true,
+        }),
+        makeBaselineCard({
+          id: 'bs01-002',
+          cardNumber: 'BS01-002',
+          name: 'Same Edition Guard',
+          setCode: 'BS01',
+          isRevival: false,
+        }),
+      ],
+      fetchWikiJsonFn: async (params) => {
+        if (params.list === 'categorymembers') {
+          if (params.cmtitle === 'Category:Booster Sets' && !params.cmcontinue) {
+            return {
+              query: {
+                categorymembers: [{ title: 'BS 23' }, { title: 'BS73' }],
+              },
+            };
+          }
+          return { query: { categorymembers: [] } };
+        }
+        if (params.list === 'allpages') return { query: { allpages: [] } };
+        if (params.prop === 'revisions') {
+          const t = String(params.titles || '');
+          if (t === 'BS23') {
+            return {
+              query: {
+                pages: {
+                  '201': {
+                    title: 'BS23',
+                    revisions: [
+                      {
+                        slots: {
+                          main: {
+                            '*': `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS23-X05 || [[Ushiwaka]]\n|}`,
+                          },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            };
+          }
+          if (t === 'BS73') {
+            return {
+              query: {
+                pages: {
+                  '202': {
+                    title: 'BS73',
+                    revisions: [
+                      {
+                        slots: {
+                          main: {
+                            '*': `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS73-TCP01(A) || [[Tenkaku Dragon (Revival)]]\n|-\n| BS73-099 || [[Same Edition Guard]]\n|}`,
+                          },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            };
+          }
+          return { query: { pages: { '-1': { title: t, missing: '' } } } };
+        }
+        return { query: {} };
+      },
+      batchFetchPagesFn: async (titles) => {
+        const out = new Map<string, WikiPageBundle>();
+        for (const t of titles) {
+          if (t.includes('Revival')) {
+            out.set(t, { wikitext: '{{CardTableV2|name=Tenkaku Dragon (Revival)|color=Red|cost=5}}', pageImages: [] });
+          } else {
+            out.set(t, { wikitext: `{{CardTableV2|name=${t}|color=Red|cost=4}}`, pageImages: [] });
+          }
+        }
+        return out;
+      },
+    };
+
+    await discoverAllWikiSets(revivalDeps);
+    const scan23 = await scanWikiSetByCode('BS 23', revivalDeps);
+    assert.equal(scan23.set.setCode, 'BS23', 'Spaced BS 23 resolves to canonical BS23 cleanly');
+    assert.equal(scan23.discoveredCount, 1);
+
+    await scanWikiSetByCode('BS73', revivalDeps);
+    const cmp = compareCatalogWithWiki(revivalDeps);
+    const tcpRevival = cmp.entries.find((e) => e.card.cardNumber === 'BS73-TCP01(A)');
+    const bs23Orig = cmp.entries.find((e) => e.card.cardNumber === 'BS23-X05');
+    const sameVerUncertain = cmp.entries.find((e) => e.card.cardNumber === 'BS73-099');
+
+    assert.equal(tcpRevival?.classification, 'missing', 'Revival TCP card compared against Original is missing (not uncertain)');
+    assert.equal(bs23Orig?.classification, 'missing', 'Original BS23 card compared against Revival is missing');
+    assert.equal(sameVerUncertain?.classification, 'uncertain', 'Same-version name collision on different set stays uncertain');
+
+    const validation = validateCatalogImport({}, revivalDeps);
+    assert.equal(validation.willAddCards, 2);
+    assert.equal(validation.skippedUncertain, 1);
+    assert.equal(validation.rejectedCards.length, 1, 'Rejection diagnostic emitted for skipped uncertain card');
+    assert.equal(validation.rejectedCards[0].cardNumber, 'BS73-099');
+  });
 });
 
 describe('Manual Artwork URL Background & Manual Validation (All 13 Required Cases)', () => {
@@ -619,6 +785,103 @@ describe('Manual Artwork URL Background & Manual Validation (All 13 Required Cas
     assert.equal(Boolean(firstResult.skippedOverlap), false);
     assert.equal(firstResult.summary.healthy, 1);
     assert.equal(probeCount, 1);
+  });
+
+  it('scheduled endpoint handler enforces VALIDATION_CRON_SECRET, returns structured 200 JSON, and rehydrates Firestore validation state', async () => {
+    const endpointStateFile = path.join(tmpDir, `endpoint-${Date.now()}.json`);
+    const deps: ManualValidationDependencies = {
+      stateFilePath: endpointStateFile,
+      mappingsProvider: () => [
+        {
+          cardId: 'ep-001',
+          cardNumber: 'EP-001',
+          name: 'Endpoint Wyvern',
+          artworkUrl: 'https://cdn.example.com/ep-001.png',
+        },
+      ],
+      sleepFn: async () => {},
+      fetchFn: async () => new Response(null, { status: 200, headers: { 'content-type': 'image/png' } }),
+    };
+
+    const callHandler = async (
+      handler: ReturnType<typeof createScheduledValidationHandler>,
+      headers: Record<string, string | string[] | undefined>
+    ) => {
+      let statusCode = 0;
+      let jsonBody: unknown = null;
+      const req = {
+        headers,
+        setTimeout: () => {},
+      } as unknown as Parameters<typeof handler>[0];
+      const res = {
+        setTimeout: () => {},
+        status(code: number) {
+          statusCode = code;
+          return this;
+        },
+        json(payload: unknown) {
+          jsonBody = payload;
+          return this;
+        },
+      } as unknown as Parameters<typeof handler>[1];
+      await handler(req, res);
+      return { statusCode, jsonBody: jsonBody as Record<string, unknown> };
+    };
+
+    // 1. Fails with 401 when server secret is unconfigured
+    const unconfiguredHandler = createScheduledValidationHandler({ expectedSecret: '', deps });
+    const unconfiguredRes = await callHandler(unconfiguredHandler, {});
+    assert.equal(unconfiguredRes.statusCode, 401);
+    assert.equal(unconfiguredRes.jsonBody.ok, false);
+
+    // 2. Fails with 401 when header missing or mismatched
+    const securedHandler = createScheduledValidationHandler({
+      expectedSecret: 'prod-cron-secret-123',
+      deps,
+    });
+    const missingHdrRes = await callHandler(securedHandler, {});
+    assert.equal(missingHdrRes.statusCode, 401);
+    const wrongHdrRes = await callHandler(securedHandler, {
+      'x-validation-cron-secret': 'wrong-secret',
+    });
+    assert.equal(wrongHdrRes.statusCode, 401);
+
+    // 3. Succeeds with 200 + structured summary when X-Validation-Cron-Secret matches
+    const validRes = await callHandler(securedHandler, {
+      'x-validation-cron-secret': 'prod-cron-secret-123',
+    });
+    assert.equal(validRes.statusCode, 200);
+    assert.equal(validRes.jsonBody.ok, true);
+    assert.equal(
+      (validRes.jsonBody.summary as { healthy?: number })?.healthy,
+      1
+    );
+
+    // 4. Rehydrates Firestore records onto fresh server state without overwriting newer timestamps
+    const freshRecord = loadValidationState(endpointStateFile).records[
+      Object.keys(loadValidationState(endpointStateFile).records)[0]
+    ];
+    const freshKey = freshRecord.mappingKey;
+    const rehydrateResult = mergeFirestoreValidationRecords(
+      [
+        {
+          ...freshRecord,
+          mappingKey: freshKey,
+          status: 'broken',
+          httpStatus: 404,
+          lastCheckedAt: '2099-01-01T00:00:00.000Z',
+          lastSuccessAt: '',
+          consecutiveFailures: 2,
+          failureReason: 'HTTP 404 from previous Cloud Run cycle',
+          lastCycleId: 'val-cloud',
+        },
+      ],
+      deps
+    );
+    assert.equal(rehydrateResult.mergedCount, 1);
+    const restoredState = loadValidationState(endpointStateFile);
+    assert.equal(restoredState.records[freshKey]?.status, 'broken');
+    assert.equal(restoredState.records[freshKey]?.httpStatus, 404);
   });
 });
 

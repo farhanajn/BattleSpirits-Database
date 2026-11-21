@@ -26,12 +26,13 @@ import {
 } from './server/catalogSyncService.ts';
 import {
   getValidationDashboardSnapshot,
+  mergeFirestoreValidationRecords,
   runManualValidationJob,
   startManualValidationScheduler,
-  triggerScheduledValidation,
   validateSingleMappingByKey,
-  verifyScheduledValidationAuth,
+  type ArtworkValidationRecord,
 } from './server/manualUrlValidator.ts';
+import { scheduledValidationHandler } from './server/api/validation/scheduled.ts';
 import type { BattleSpiritsCard } from './src/types/card.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,6 +43,10 @@ const PORT = Number(process.env.PORT || 3000);
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  app.get('/api/health', (_req, res) => {
+    res.status(200).json({ ok: true, service: 'spiritsdex', timestamp: new Date().toISOString() });
+  });
 
   app.get('/api/wiki/directory', (_req, res) => {
     const { sets, syncedAt } = getSyncedWikiDirectory();
@@ -357,8 +362,12 @@ async function startServer() {
       const discoveryKeys = Array.isArray(req.body?.discoveryKeys)
         ? req.body.discoveryKeys.map((k: unknown) => String(k))
         : undefined;
+      const setCodes = Array.isArray(req.body?.setCodes)
+        ? req.body.setCodes.map((s: unknown) => String(s))
+        : undefined;
       const report = validateCatalogImport({
         discoveryKeys,
+        setCodes,
         includeMissing: req.body?.includeMissing !== false,
         includeApprovedUpdates: req.body?.includeApprovedUpdates !== false,
       });
@@ -374,8 +383,12 @@ async function startServer() {
       const discoveryKeys = Array.isArray(req.body?.discoveryKeys)
         ? req.body.discoveryKeys.map((k: unknown) => String(k))
         : undefined;
+      const setCodes = Array.isArray(req.body?.setCodes)
+        ? req.body.setCodes.map((s: unknown) => String(s))
+        : undefined;
       const result = executeCatalogImport({
         discoveryKeys,
+        setCodes,
         includeMissing: req.body?.includeMissing !== false,
         includeApprovedUpdates: req.body?.includeApprovedUpdates !== false,
       });
@@ -446,28 +459,27 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/validation/scheduled', async (req, res) => {
-    const authCheck = verifyScheduledValidationAuth(req.headers);
-    if (!authCheck.authorized) {
-      res.status(401).json({ ok: false, error: 'Invalid or missing scheduler secret' });
-      return;
-    }
-
-    req.setTimeout(240_000);
-    res.setTimeout(240_000);
-
+  app.post('/api/admin/validation/rehydrate', (req, res) => {
     try {
-      const result = await triggerScheduledValidation();
-      res.status(200).json({
-        ok: true,
-        skippedOverlap: Boolean(result.skippedOverlap),
-        ...result,
-        scheduler: getValidationDashboardSnapshot().scheduler,
-      });
+      const records = Array.isArray(req.body?.records)
+        ? (req.body.records as ArtworkValidationRecord[])
+        : [];
+      const result = mergeFirestoreValidationRecords(records);
+      res.json({ ok: true, ...result });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Scheduled validation failed';
+      const message = err instanceof Error ? err.message : 'Failed to rehydrate validation state';
       res.status(500).json({ ok: false, error: message });
     }
+  });
+
+  app.post(
+    ['/api/admin/validation/scheduled', '/api/admin/validation/scheduled/'],
+    scheduledValidationHandler
+  );
+
+  // Return structured JSON 404 for unknown /api/* paths before SPA HTML fallback
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ ok: false, error: 'API route not found' });
   });
 
   if (process.env.NODE_ENV !== 'production') {

@@ -129,13 +129,18 @@ function extractHeaderValue(val: string | string[] | undefined): string {
 
 export function verifyScheduledValidationAuth(
   headers: Record<string, string | string[] | undefined>,
-  expectedSecretInput = process.env.VALIDATION_CRON_SECRET
+  expectedSecretInput = process.env.VALIDATION_CRON_SECRET,
+  options?: { requireSecret?: boolean }
 ): {
   authorized: boolean;
   method: 'none' | 'x-validation-cron-secret' | 'bearer' | 'rejected';
+  reason?: 'secret_not_configured' | 'mismatch';
 } {
   const expected = (expectedSecretInput || '').trim();
   if (!expected) {
+    if (options?.requireSecret) {
+      return { authorized: false, method: 'rejected', reason: 'secret_not_configured' };
+    }
     return { authorized: true, method: 'none' };
   }
 
@@ -152,7 +157,7 @@ export function verifyScheduledValidationAuth(
     }
   }
 
-  return { authorized: false, method: 'rejected' };
+  return { authorized: false, method: 'rejected', reason: 'mismatch' };
 }
 
 function ensureDir(filePath: string): void {
@@ -331,6 +336,65 @@ export function syncMappingsIntoValidationState(
   }
 
   return { state, entriesByKey };
+}
+
+/**
+ * Rehydrates server validation state from durable Firestore artworkValidations records
+ * after Cloud Run cold starts/restarts without touching ManualWikiMapping.
+ */
+export function mergeFirestoreValidationRecords(
+  incomingRecords: ArtworkValidationRecord[],
+  deps?: ManualValidationDependencies
+): { mergedCount: number; summary: ManualValidationSummary } {
+  const filePath = deps?.stateFilePath || DEFAULT_VALIDATION_STATE_FILE;
+  const { state } = syncMappingsIntoValidationState(deps);
+  let mergedCount = 0;
+
+  for (const incoming of incomingRecords) {
+    if (!incoming || !incoming.mappingKey) continue;
+    const local = state.records[incoming.mappingKey];
+    if (!local) continue;
+
+    // Only apply Firestore record if it has the same target URL and is newer (or local is unverified)
+    const sameTarget =
+      !local.originalUrl ||
+      !incoming.originalUrl ||
+      local.originalUrl === incoming.originalUrl;
+    if (!sameTarget) continue;
+
+    const localCheckedMs = local.lastCheckedAt ? Date.parse(local.lastCheckedAt) : 0;
+    const incomingCheckedMs = incoming.lastCheckedAt ? Date.parse(incoming.lastCheckedAt) : 0;
+    if (local.status === 'unverified' || incomingCheckedMs > localCheckedMs) {
+      state.records[incoming.mappingKey] = {
+        ...local,
+        status: incoming.status || local.status,
+        httpStatus: Number(incoming.httpStatus) || 0,
+        finalUrl: incoming.finalUrl || local.finalUrl,
+        redirectedFrom: incoming.redirectedFrom || local.redirectedFrom,
+        lastCheckedAt: incoming.lastCheckedAt || local.lastCheckedAt,
+        lastSuccessAt: incoming.lastSuccessAt || local.lastSuccessAt,
+        consecutiveFailures: Math.max(0, Number(incoming.consecutiveFailures) || 0),
+        failureReason: incoming.failureReason || '',
+        lastCycleId: incoming.lastCycleId || local.lastCycleId,
+      };
+      if (incoming.lastCheckedAt) {
+        const prevSchedMs = state.lastScheduledRunAt ? Date.parse(state.lastScheduledRunAt) : 0;
+        if (incomingCheckedMs > prevSchedMs) {
+          state.lastScheduledRunAt = incoming.lastCheckedAt;
+        }
+      }
+      mergedCount++;
+    }
+  }
+
+  if (mergedCount > 0) {
+    saveValidationState(state, filePath);
+  }
+
+  return {
+    mergedCount,
+    summary: summarizeValidationRecords(Object.values(state.records)),
+  };
 }
 
 function isTransientHttpStatus(status: number): boolean {

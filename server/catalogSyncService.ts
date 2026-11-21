@@ -40,6 +40,7 @@ export type ComparisonClassification =
 
 export interface DiscoveredSetRecord extends ProductSet {
   sources: string[];
+  aliases?: string[];
   isNumberOnly: boolean;
   inSpiritsdex: boolean;
   scanStatus: SetScanStatus;
@@ -59,6 +60,7 @@ export interface DiscoveredCardEntry {
   discoveryKey: string;
   card: BattleSpiritsCard;
   sourceSetCode: string;
+  originalSetCode?: string;
   sourceWikiTitle: string;
   alternateNames: string[];
   rawArtworkFile: string;
@@ -130,6 +132,19 @@ export interface CatalogOverviewSummary {
   completedAt: string | null;
 }
 
+export interface RejectedCatalogCard {
+  discoveryKey: string;
+  cardNumber: string;
+  name: string;
+  wikiTitle: string;
+  originalSetCode: string;
+  normalizedSetCode: string;
+  reason: string;
+  missingFields: string[];
+  duplicateMatch?: string;
+  classification: ComparisonClassification;
+}
+
 export interface ImportValidationReport {
   valid: boolean;
   willAddSets: number;
@@ -138,9 +153,11 @@ export interface ImportValidationReport {
   skippedUncertain: number;
   skippedDuplicates: number;
   skippedAlreadyImported: number;
+  skippedInvalid: number;
   manualMappingsProtected: number;
   warnings: string[];
   selectedKeys: string[];
+  rejectedCards: RejectedCatalogCard[];
 }
 
 export interface ImportExecutionResult {
@@ -150,6 +167,8 @@ export interface ImportExecutionResult {
   skippedCount: number;
   importedCards: BattleSpiritsCard[];
   importedSets: ProductSet[];
+  rejectedCards: RejectedCatalogCard[];
+  failedImports: Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }>;
 }
 
 const DEFAULT_RUNTIME_DIR =
@@ -196,6 +215,35 @@ export function normalizeCardNumForCompare(raw?: string): string {
     .replace(/\s+/g, '');
 }
 
+const CANONICAL_SET_CODE_RE =
+  /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3}|RP\d{2}-STD|PX\d{2}-STD|TOKENS|REVIVAL|\d{1,4})$/i;
+
+/**
+ * Normalizes spacing/hyphenation/casing variants of set identifiers (e.g. "BS 23", "bs-23" -> "BS23",
+ * "26R SD 01" -> "26RSD01") without collapsing distinct sets ("BS01" vs "SD01" vs "01").
+ */
+export function normalizeSetCode(rawCode: string): string {
+  const cleaned = String(rawCode || '')
+    .trim()
+    .replace(/^Category:/i, '')
+    .replace(/^Standard Promo Cards\//i, 'STD-PROMO-')
+    .replace(/^Promo Cards\//i, 'PROMO-');
+
+  if (!cleaned) return '';
+
+  const compact = cleaned.replace(/[\s_-]+/g, '').toUpperCase();
+  if (
+    compact &&
+    /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
+      compact
+    )
+  ) {
+    return compact;
+  }
+
+  return cleaned.toUpperCase();
+}
+
 export function sanitizeSetCode(rawTitle: string): string {
   const cleaned = rawTitle
     .trim()
@@ -203,19 +251,25 @@ export function sanitizeSetCode(rawTitle: string): string {
     .replace(/^Standard Promo Cards\//i, 'STD-PROMO-')
     .replace(/^Promo Cards\//i, 'PROMO-');
 
-  const directCode = cleaned.match(
-    /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|HK[A-Z]{2}\d{1,3}|RP\d{2}-STD|PX\d{2}-STD|TOKENS|REVIVAL|\d{1,4})$/i
-  );
+  const compactUpper = cleaned.replace(/[\s_-]+/g, '').toUpperCase();
+  if (
+    /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
+      compactUpper
+    )
+  ) {
+    return compactUpper;
+  }
+
+  const directCode = cleaned.match(CANONICAL_SET_CODE_RE);
   if (directCode) {
-    const code = directCode[0].toUpperCase();
-    return code;
+    return directCode[0].toUpperCase();
   }
 
   const embedded = cleaned.match(
-    /\b(26R[A-Z]{2,4}\d{1,3}|BS\d{2,3}|SD\d{2,3}|CBX?\d{2,3}|BSC\d{2,3}|PB\d{2,3}|PC\d{2,3}|HK(?:BP|SP)\d+)\b/i
+    /\b(26R[A-Z]{2,4}\d{1,3}|BS\s*\d{2,3}|SD\s*\d{2,3}|CBX?\s*\d{2,3}|BSC\s*\d{2,3}|PB\s*\d{2,3}|PC\s*\d{2,3}|HK(?:BP|SP)\d+)\b/i
   );
   if (embedded) {
-    return embedded[1].toUpperCase();
+    return normalizeSetCode(embedded[1]);
   }
 
   const slug = cleaned
@@ -386,10 +440,12 @@ export function saveCatalogScanState(
 }
 
 let inMemoryState: CatalogScanState | null = null;
+let inMemoryStatePath: string | null = null;
 
 export function getActiveCatalogState(stateFilePath = DEFAULT_STATE_FILE): CatalogScanState {
-  if (!inMemoryState) {
+  if (!inMemoryState || inMemoryStatePath !== stateFilePath) {
     inMemoryState = loadCatalogScanState(stateFilePath);
+    inMemoryStatePath = stateFilePath;
     // Register any previously imported/discovered sets in active wikiService directory
     for (const s of Object.values(inMemoryState.sets)) {
       if (s.inSpiritsdex || s.discoveredCount > 0) {
@@ -402,6 +458,7 @@ export function getActiveCatalogState(stateFilePath = DEFAULT_STATE_FILE): Catal
 
 export function resetCachedStateForTests(stateFilePath?: string): void {
   inMemoryState = stateFilePath ? loadCatalogScanState(stateFilePath) : null;
+  inMemoryStatePath = stateFilePath ?? null;
   scanMutex = false;
 }
 
@@ -888,15 +945,17 @@ export async function discoverAllWikiSets(
  */
 export function parseUnusualSetListings(
   wikitext: string,
-  setMeta: ProductSet
+  setMeta: ProductSet,
+  options?: { strictNumberOnly?: boolean }
 ): Array<{ card: BattleSpiritsCard; parseWarning?: string }> {
   const results: Array<{ card: BattleSpiritsCard; parseWarning?: string }> = [];
   const seen = new Set<string>();
+  const strictNumberOnly = Boolean(options?.strictNumberOnly);
 
   const addEntry = (rawNum: string, rawTitle: string, displayNameRaw?: string, warning?: string) => {
     const wikiTitle = rawTitle.trim();
     if (!wikiTitle || /^(?:File|Image|Category|Template|Special):/i.test(wikiTitle)) return;
-    const cleanNum = rawNum.trim().replace(/\s+/g, '') || `${setMeta.setCode}-WIKI`;
+    const cleanNum = rawNum.trim().replace(/[\u2010-\u2015]/g, '-').replace(/\s+/g, '') || `${setMeta.setCode}-WIKI`;
     const isRevival =
       /\(revival\)/i.test(displayNameRaw || '') ||
       /\(revival\)/i.test(wikiTitle) ||
@@ -949,18 +1008,19 @@ export function parseUnusualSetListings(
 
   for (const rawLine of wikitext.split('\n')) {
     const line = rawLine.trim();
-    // Bullet / numbered list patterns: `* BS01-001 [[Card]]`, `* [[Card]] (P20-01)`, `* [[Card]]`
+    // Bullet / numbered list patterns: `* BS01-001 [[Card]]`, `* BS73-TCP01(A) [[Card]]`, `* [[Card]] (P20-01)`
     if (/^[*#]/.test(line) && line.includes('[[')) {
       const linkM = line.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
       if (!linkM) continue;
       const before = cleanWikitextInline(line.slice(1, linkM.index)).trim();
       const after = cleanWikitextInline(line.slice((linkM.index || 0) + linkM[0].length)).trim();
       const numMatch =
-        before.match(/\b([A-Z0-9]{1,8}-[A-Z0-9]{1,8}|\d{1,3})\b/i) ||
-        after.match(/\b([A-Z0-9]{1,8}-[A-Z0-9]{1,8})\b/i);
+        before.match(/\b([A-Z0-9]{1,10}\s*-[A-Z0-9]{1,10}(?:\([AB]\))?|\d{1,3})\b/i) ||
+        after.match(/\b([A-Z0-9]{1,10}\s*-[A-Z0-9]{1,10}(?:\([AB]\))?)\b/i);
+      if (strictNumberOnly && !numMatch) continue;
       const cardNumber = numMatch
         ? numMatch[1].includes('-')
-          ? numMatch[1].toUpperCase()
+          ? numMatch[1].replace(/\s+/g, '').toUpperCase()
           : `${setMeta.setCode}-${numMatch[1]}`
         : `${setMeta.setCode}-${String(results.length + 1).padStart(3, '0')}`;
       addEntry(cardNumber, linkM[1], linkM[2] || linkM[1], 'Parsed from bullet/list structure');
@@ -977,10 +1037,10 @@ export function parseUnusualSetListings(
       continue;
     }
 
-    // Gallery entries inside <gallery>: `BS01-001.jpg|[[Card Name]]`
-    if (/^[A-Z0-9_-]+\.(?:png|jpe?g|webp|gif)\|/i.test(line) && line.includes('[[')) {
+    // Gallery entries inside <gallery>: `BS01-001.jpg|[[Card Name]]` or `26RSD01-X01.png|[[Card]]`
+    if (/^[A-Z0-9_() -]+\.(?:png|jpe?g|webp|gif)\|/i.test(line) && line.includes('[[')) {
       const linkM = line.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
-      const numM = line.match(/^([A-Z0-9]+-[A-Z0-9]+)/i);
+      const numM = line.match(/^([A-Z0-9]+-[A-Z0-9]+(?:\([AB]\))?)/i);
       if (linkM && numM) {
         addEntry(numM[1].toUpperCase(), linkM[1], linkM[2] || linkM[1], 'Parsed from gallery block');
       }
@@ -1089,8 +1149,15 @@ export function classifyDiscoveredCard(
     }
   };
 
-  // Signal 1: Exact card number / identifier
+  const normSetKey = normalizeSetCode(setKey);
+  const isPromoSetPair = (a: string, b: string) =>
+    (a.startsWith('PROMO') && b.startsWith('PROMO')) || a === 'PROMO' || b === 'PROMO';
+
+  // Signal 1: Exact card number / identifier (scoped to same canonical set or promo group)
   for (const c of index.byNumber.get(numKey) || []) {
+    const cSetNorm = normalizeSetCode(c.setCode || '');
+    const sameSet = !cSetNorm || !normSetKey || cSetNorm === normSetKey || isPromoSetPair(cSetNorm, normSetKey);
+    if (!sameSet) continue;
     if (Boolean(c.isRevival) === Boolean(card.isRevival)) {
       addCandidate(c, 'cardNumber', 55);
     } else {
@@ -1114,7 +1181,7 @@ export function classifyDiscoveredCard(
   // Signal 4: Set code + Signal 5: Normalized compact name
   for (const c of index.byCompactName.get(compactKey) || []) {
     addCandidate(c, 'normalizedName', 20);
-    if ((c.setCode || '').trim().toUpperCase() === setKey) {
+    if (normalizeSetCode(c.setCode || '') === normSetKey) {
       addCandidate(c, 'setCode', 20);
     }
   }
@@ -1163,13 +1230,47 @@ export function classifyDiscoveredCard(
 
   // Partial or ambiguous match (e.g., same cardNumber without name confirmation OR same name in different set without cardNumber match)
   const hasStrongNumber = top.signals.includes('cardNumber');
-  const hasStrongName =
+  const hasAnyNumberMatchInSet = (index.byNumber.get(numKey) || []).some((c) => {
+    const cSetNorm = normalizeSetCode(c.setCode || '');
+    return !cSetNorm || !normSetKey || cSetNorm === normSetKey || isPromoSetPair(cSetNorm, normSetKey);
+  });
+
+  if (!(hasStrongNumber && (
     top.signals.includes('officialName') ||
     top.signals.includes('wikiTitle') ||
     top.signals.includes('jpName') ||
-    top.signals.includes('alternateName');
+    top.signals.includes('alternateName') ||
+    normalizeSetCode(top.card.setCode || '') === normSetKey
+  ))) {
+    // Distinct Revival vs Original counterpart (or cross-set reprint whose cardNumber is not in this set)
+    if (
+      !hasStrongNumber &&
+      !hasAnyNumberMatchInSet &&
+      Boolean(top.card.isRevival) !== Boolean(card.isRevival) &&
+      top.signals.includes('officialName_version_mismatch')
+    ) {
+      return {
+        classification: 'missing',
+        matchSignals: [],
+        matchConfidence: 0,
+        metadataDeltas: [],
+      };
+    }
 
-  if (!(hasStrongNumber && (hasStrongName || top.card.setCode.toUpperCase() === setKey))) {
+    // Cross-set exact cardNumber reprint not yet in this scanned set (e.g. BS67-XV04 in BS70)
+    const crossSetNumberMatch = (index.byNumber.get(numKey) || []).some((c) => {
+      const cSetNorm = normalizeSetCode(c.setCode || '');
+      return Boolean(cSetNorm && normSetKey && cSetNorm !== normSetKey && !isPromoSetPair(cSetNorm, normSetKey));
+    });
+    if (!hasStrongNumber && !hasAnyNumberMatchInSet && crossSetNumberMatch) {
+      return {
+        classification: 'missing',
+        matchSignals: [],
+        matchConfidence: 0,
+        metadataDeltas: [],
+      };
+    }
+
     if (hasStrongNumber || top.score >= 30) {
       return {
         classification: 'uncertain',
@@ -1296,21 +1397,36 @@ export async function scanWikiSetByCode(
   const fetchFn = deps?.fetchWikiJsonFn || fetchWikiJson;
   const batchFetchFn = deps?.batchFetchPagesFn || batchFetchWikiPages;
   const state = getActiveCatalogState(deps?.stateFilePath);
-  const code = setCodeInput.trim().toUpperCase();
+  const rawSetInput = setCodeInput.trim().toUpperCase();
+  const code = normalizeSetCode(setCodeInput);
 
-  if (!state.sets[code]) {
+  const findSetRecord = () =>
+    state.sets[code] ||
+    state.sets[rawSetInput] ||
+    Object.values(state.sets).find(
+      (s) =>
+        normalizeSetCode(s.setCode) === code ||
+        normalizeSetCode(s.wikiTitle || '') === code ||
+        (s.aliases || []).some((a) => normalizeSetCode(a) === code)
+    );
+
+  if (!findSetRecord()) {
     await discoverAllWikiSets(deps);
   }
-  const setRec = state.sets[code];
+  const setRec = findSetRecord();
   if (!setRec) {
     throw new Error(`Unknown set code: ${setCodeInput}`);
+  }
+  const canonicalCode = setRec.setCode;
+  if (rawSetInput && rawSetInput !== canonicalCode) {
+    setRec.aliases = Array.from(new Set([...(setRec.aliases || []), rawSetInput]));
   }
 
   await ensureBanListLoaded().catch(() => null);
 
   setRec.scanStatus = 'scanning';
   setRec.lastError = null;
-  state.currentSetCode = code;
+  state.currentSetCode = canonicalCode;
   saveCatalogScanState(state, deps?.stateFilePath);
 
   const warnings: string[] = [];
@@ -1318,41 +1434,51 @@ export async function scanWikiSetByCode(
   try {
     const rawCardsMap = new Map<string, { card: BattleSpiritsCard; warning?: string }>();
     const addRaw = (c: BattleSpiritsCard, warning?: string) => {
-      const dedupeKey = `${c.cardNumber.toUpperCase()}|${(c.wikiTitle || c.name).toLowerCase()}|${c.isRevival ? 'rv' : 'orig'}`;
+      const normalizedCardNum = normalizeCardNumForCompare(c.cardNumber);
+      const dedupeKey = `${normalizedCardNum}|${(c.wikiTitle || c.name).toLowerCase()}|${c.isRevival ? 'rv' : 'orig'}`;
       if (!rawCardsMap.has(dedupeKey)) {
         rawCardsMap.set(dedupeKey, { card: c, warning });
       }
     };
 
-    const wikiTitle = setRec.wikiTitle || setRec.setCode;
+    const candidateTitles = Array.from(
+      new Set([setRec.wikiTitle || canonicalCode, canonicalCode, rawSetInput].filter(Boolean))
+    );
     let wikitext = '';
-
-    const pageRes = (await fetchFn({
-      action: 'query',
-      titles: wikiTitle,
-      prop: 'revisions',
-      rvprop: 'content',
-      rvslots: 'main',
-      redirects: '1',
-    })) as {
-      query?: {
-        pages?: Record<
-          string,
-          { missing?: string; revisions?: { slots?: { main?: { '*'?: string } } }[] }
-        >;
+    for (const titleCandidate of candidateTitles) {
+      const pageRes = (await fetchFn({
+        action: 'query',
+        titles: titleCandidate,
+        prop: 'revisions',
+        rvprop: 'content',
+        rvslots: 'main',
+        redirects: '1',
+      })) as {
+        query?: {
+          pages?: Record<
+            string,
+            { missing?: string; title?: string; revisions?: { slots?: { main?: { '*'?: string } } }[] }
+          >;
+        };
       };
-    };
-    const pageObj = Object.values(pageRes.query?.pages || {})[0];
-    wikitext = pageObj?.revisions?.[0]?.slots?.main?.['*'] || '';
+      const pageObj = Object.values(pageRes.query?.pages || {})[0];
+      const fetchedWt = pageObj?.revisions?.[0]?.slots?.main?.['*'] || '';
+      if (fetchedWt) {
+        wikitext = fetchedWt;
+        break;
+      }
+    }
 
+    const wikiTitle = setRec.wikiTitle || canonicalCode;
     if (wikitext) {
       for (const rowCard of parseSetTableRows(wikitext, setRec)) {
         addRaw(rowCard);
       }
-      if (rawCardsMap.size === 0) {
-        for (const loose of parseUnusualSetListings(wikitext, setRec)) {
-          addRaw(loose.card, loose.parseWarning);
-        }
+      // Run supplemental parsers EVEN when tables exist so numbered bullets, SetRow, and gallery cards never get missed
+      for (const loose of parseUnusualSetListings(wikitext, setRec, {
+        strictNumberOnly: rawCardsMap.size > 0,
+      })) {
+        addRaw(loose.card, loose.parseWarning);
       }
       const enriched = enrichSetMetadata(setRec, wikitext, Array.from(rawCardsMap.values()).map((v) => v.card));
       setRec.name = enriched.name || setRec.name;
@@ -1363,35 +1489,35 @@ export async function scanWikiSetByCode(
     }
 
     // Fallback/supplemental category enumeration (`Category:<SetCode>` or `Category:<WikiTitle>`) with FULL pagination
-    if (rawCardsMap.size === 0 || code === 'TOKENS' || code === 'REVIVAL') {
+    if (rawCardsMap.size === 0 || canonicalCode === 'TOKENS' || canonicalCode === 'REVIVAL') {
       const catCandidates =
-        code === 'REVIVAL'
+        canonicalCode === 'REVIVAL'
           ? ['Category:Revival Cards']
-          : code === 'TOKENS'
+          : canonicalCode === 'TOKENS'
           ? ['Category:Token Cards', "Category:Can't put in deck"]
-          : [`Category:${code}`, `Category:${wikiTitle}`];
+          : Array.from(new Set([`Category:${canonicalCode}`, `Category:${wikiTitle}`]));
 
       for (const catName of catCandidates) {
         try {
           const catMembers = await fetchPaginatedCategoryMembers(catName, fetchFn, '0');
           for (const title of catMembers) {
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-            const isRev = code === 'REVIVAL' || /\(revival\)/i.test(title);
+            const isRev = canonicalCode === 'REVIVAL' || /\(revival\)/i.test(title);
             const fallbackCard: BattleSpiritsCard = {
-              id: `${code.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
-              cardNumber: `${code}-${slug.slice(0, 8).toUpperCase()}`,
+              id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
+              cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
               name: title.replace(/\s*\([^)]+\)\s*$/, ''),
               jpName: '',
               color: setRec.colors?.[0] || 'Red',
               type: 'Spirit',
               rarity: setRec.category === 'Promo' ? 'P' : 'C',
-              setCode: code,
-              setName: setRec.name || code,
+              setCode: canonicalCode,
+              setName: setRec.name || canonicalCode,
               formats: setRec.formats?.length ? setRec.formats : ['Eternal'],
               blockIcon: setRec.blockLabel || 'Wiki',
               restriction: 'Unlimited',
               isRevival: isRev,
-              isToken: code === 'TOKENS',
+              isToken: canonicalCode === 'TOKENS',
               cost: 0,
               reduction: {},
               symbols: {},
@@ -1430,7 +1556,7 @@ export async function scanWikiSetByCode(
 
     // Remove previous entries belonging exclusively to this scanned set before storing fresh scan entries
     for (const [k, existingEntry] of Object.entries(state.discoveredCards)) {
-      if (existingEntry.sourceSetCode === code && !existingEntry.imported) {
+      if (existingEntry.sourceSetCode === canonicalCode && !existingEntry.imported) {
         delete state.discoveredCards[k];
       }
     }
@@ -1488,13 +1614,14 @@ export async function scanWikiSetByCode(
       }
 
       const incompleteFields = evaluateIncompleteMetadata(hydrated, rawArtFile);
-      const discoveryKey = `${code}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${(hydrated.wikiTitle || hydrated.name).toLowerCase().replace(/[^a-z0-9\p{L}\p{N}]+/gu, '-')}`;
+      const discoveryKey = `${canonicalCode}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${(hydrated.wikiTitle || hydrated.name).toLowerCase().replace(/[^a-z0-9\p{L}\p{N}]+/gu, '-')}`;
       const existingEntry = state.discoveredCards[discoveryKey];
 
       state.discoveredCards[discoveryKey] = {
         discoveryKey,
         card: hydrated,
-        sourceSetCode: code,
+        sourceSetCode: canonicalCode,
+        originalSetCode: rawSetInput || canonicalCode,
         sourceWikiTitle: hydrated.wikiTitle || hydrated.name,
         alternateNames: Array.from(new Set(altNames)),
         rawArtworkFile: rawArtFile,
@@ -1516,13 +1643,13 @@ export async function scanWikiSetByCode(
     setRec.lastScanAt = new Date().toISOString();
     setRec.lastError = null;
     setRec.totalCardsInSet = Math.max(setRec.totalCardsInSet || 0, rawList.length);
-    state.failedSetCodes = state.failedSetCodes.filter((c) => c !== code);
-    state.pendingSetCodes = state.pendingSetCodes.filter((c) => c !== code);
+    state.failedSetCodes = state.failedSetCodes.filter((c) => c !== canonicalCode);
+    state.pendingSetCodes = state.pendingSetCodes.filter((c) => c !== canonicalCode);
     upsertStoredSetMetadata(setRec);
 
     compareCatalogWithWiki(deps);
     return {
-      set: state.sets[code],
+      set: state.sets[canonicalCode],
       discoveredCount: rawList.length,
       warnings,
     };
@@ -1531,12 +1658,12 @@ export async function scanWikiSetByCode(
     setRec.scanStatus = 'failed';
     setRec.lastScanAt = new Date().toISOString();
     setRec.lastError = msg;
-    state.pendingSetCodes = state.pendingSetCodes.filter((c) => c !== code);
-    if (!state.failedSetCodes.includes(code)) {
-      state.failedSetCodes.push(code);
+    state.pendingSetCodes = state.pendingSetCodes.filter((c) => c !== canonicalCode);
+    if (!state.failedSetCodes.includes(canonicalCode)) {
+      state.failedSetCodes.push(canonicalCode);
     }
     state.errorLogs.push({
-      setCode: code,
+      setCode: canonicalCode,
       page: setRec.wikiTitle,
       message: msg,
       timestamp: new Date().toISOString(),
@@ -1659,6 +1786,7 @@ export function setDiscoveredCardApproval(
 export function validateCatalogImport(
   options?: {
     discoveryKeys?: string[];
+    setCodes?: string[];
     includeMissing?: boolean;
     includeApprovedUpdates?: boolean;
   },
@@ -1667,21 +1795,30 @@ export function validateCatalogImport(
   const state = getActiveCatalogState(deps?.stateFilePath);
   const includeMissing = options?.includeMissing ?? true;
   const includeApprovedUpdates = options?.includeApprovedUpdates ?? true;
+  const scopedSetCodes = options?.setCodes?.length
+    ? new Set(options.setCodes.map((s) => normalizeSetCode(s)))
+    : null;
 
-  const candidates = options?.discoveryKeys?.length
+  let candidates = options?.discoveryKeys?.length
     ? options.discoveryKeys
         .map((k) => state.discoveredCards[k])
         .filter((e): e is DiscoveredCardEntry => Boolean(e))
     : Object.values(state.discoveredCards);
 
+  if (scopedSetCodes) {
+    candidates = candidates.filter((e) => scopedSetCodes.has(normalizeSetCode(e.sourceSetCode)));
+  }
+
   const selectedKeys: string[] = [];
   const selectedSetCodes = new Set<string>();
   const warnings: string[] = [];
+  const rejectedCards: RejectedCatalogCard[] = [];
   let willAddCards = 0;
   let willUpdateMetadata = 0;
   let skippedUncertain = 0;
   let skippedDuplicates = 0;
   let skippedAlreadyImported = 0;
+  let skippedInvalid = 0;
   let manualMappingsProtected = 0;
 
   for (const entry of candidates) {
@@ -1694,19 +1831,50 @@ export function validateCatalogImport(
     const hasManualMapping = Boolean(getManualWikiMapping(entry.card));
     if (hasManualMapping) manualMappingsProtected++;
 
+    const buildRejection = (reason: string, missingFields: string[] = []): RejectedCatalogCard => ({
+      discoveryKey: entry.discoveryKey,
+      cardNumber: entry.card.cardNumber,
+      name: entry.card.name,
+      wikiTitle: entry.sourceWikiTitle,
+      originalSetCode: entry.originalSetCode || entry.sourceSetCode,
+      normalizedSetCode: normalizeSetCode(entry.card.setCode || entry.sourceSetCode),
+      reason,
+      missingFields,
+      duplicateMatch: entry.matchedExistingId,
+      classification: entry.classification,
+    });
+
     if (entry.classification === 'potential_duplicate' && !entry.approvedForImport) {
       skippedDuplicates++;
+      rejectedCards.push(
+        buildRejection(
+          `Potential duplicate (${entry.matchSignals.join(', ') || 'ambiguous match'}) — approve in Review Queue to force import`
+        )
+      );
       continue;
     }
     if (entry.classification === 'uncertain' && !entry.approvedForImport) {
       skippedUncertain++;
+      rejectedCards.push(
+        buildRejection(
+          `Uncertain match (${entry.matchSignals.join(', ') || 'name collision'}, confidence ${entry.matchConfidence}%) — approve in Review Queue to import`
+        )
+      );
       continue;
     }
 
     if (entry.classification === 'missing') {
       if (!includeMissing && !explicitListProvided && !entry.approvedForImport) continue;
-      if (!entry.card.id || !entry.card.cardNumber || !entry.card.name || !entry.card.setCode) {
-        warnings.push(`Skipped invalid card missing required identifier: ${entry.discoveryKey}`);
+      const missingReq: string[] = [];
+      if (!entry.card.id) missingReq.push('id');
+      if (!entry.card.cardNumber) missingReq.push('cardNumber');
+      if (!entry.card.name) missingReq.push('name');
+      if (!entry.card.setCode) missingReq.push('setCode');
+      if (missingReq.length > 0) {
+        skippedInvalid++;
+        const msg = `Skipped invalid card missing required identifier(s) [${missingReq.join(', ')}]: ${entry.discoveryKey}`;
+        warnings.push(msg);
+        rejectedCards.push(buildRejection('Missing required identifier fields', missingReq));
         continue;
       }
       willAddCards++;
@@ -1739,9 +1907,11 @@ export function validateCatalogImport(
     skippedUncertain,
     skippedDuplicates,
     skippedAlreadyImported,
+    skippedInvalid,
     manualMappingsProtected,
     warnings,
     selectedKeys,
+    rejectedCards,
   };
 }
 
@@ -1752,6 +1922,7 @@ export function validateCatalogImport(
 export function executeCatalogImport(
   options?: {
     discoveryKeys?: string[];
+    setCodes?: string[];
     includeMissing?: boolean;
     includeApprovedUpdates?: boolean;
   },
@@ -1767,6 +1938,7 @@ export function executeCatalogImport(
   let updatedMetadataCount = 0;
   const importedCards: BattleSpiritsCard[] = [];
   const importedSets: ProductSet[] = [];
+  const failedImports: Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }> = [];
   const touchedSets = new Set<string>();
   const nowIso = new Date().toISOString();
 
@@ -1778,43 +1950,57 @@ export function executeCatalogImport(
     const manual = getManualWikiMapping(entry.card);
     if (entry.classification === 'updated_metadata' && entry.matchedExistingId) {
       const targetExisting = existingById.get(entry.matchedExistingId) || state.importedCards[entry.matchedExistingId];
-      if (targetExisting) {
-        const enriched: BattleSpiritsCard = {
-          ...targetExisting,
-          jpName: targetExisting.jpName || entry.card.jpName || '',
-          illustrator: targetExisting.illustrator || entry.card.illustrator || '',
-          flavorText: targetExisting.flavorText || entry.card.flavorText || '',
-          families:
-            targetExisting.families?.length > 0 ? targetExisting.families : entry.card.families || [],
-          effects:
-            targetExisting.effects?.length > 0 ? targetExisting.effects : entry.card.effects || [],
-          cost: targetExisting.cost > 0 ? targetExisting.cost : entry.card.cost ?? 0,
-          // Always preserve manual mapping artwork or existing verified artwork
-          artworkImage: manual ? targetExisting.artworkImage : targetExisting.artworkImage || entry.card.artworkImage,
-          wikiTitle: manual?.wikiTitle || targetExisting.wikiTitle || entry.card.wikiTitle,
-        };
-        state.importedCards[enriched.id] = enriched;
-        existingById.set(enriched.id, enriched);
-        importedCards.push(enriched);
-        updatedMetadataCount++;
+      if (!targetExisting) {
+        failedImports.push({
+          discoveryKey: entry.discoveryKey,
+          cardNumber: entry.card.cardNumber,
+          name: entry.card.name,
+          reason: `Matched card "${entry.matchedExistingId}" was not found for enrichment`,
+        });
+        continue;
       }
+      const enriched: BattleSpiritsCard = {
+        ...targetExisting,
+        jpName: targetExisting.jpName || entry.card.jpName || '',
+        illustrator: targetExisting.illustrator || entry.card.illustrator || '',
+        flavorText: targetExisting.flavorText || entry.card.flavorText || '',
+        families:
+          targetExisting.families?.length > 0 ? targetExisting.families : entry.card.families || [],
+        effects:
+          targetExisting.effects?.length > 0 ? targetExisting.effects : entry.card.effects || [],
+        cost: targetExisting.cost > 0 ? targetExisting.cost : entry.card.cost ?? 0,
+        // Always preserve manual mapping artwork or existing verified artwork
+        artworkImage: manual ? targetExisting.artworkImage : targetExisting.artworkImage || entry.card.artworkImage,
+        wikiTitle: manual?.wikiTitle || targetExisting.wikiTitle || entry.card.wikiTitle,
+      };
+      state.importedCards[enriched.id] = enriched;
+      existingById.set(enriched.id, enriched);
+      importedCards.push(enriched);
+      updatedMetadataCount++;
     } else {
       // Safe insert missing card without overwriting existing id
       let candidateId = entry.card.id;
       if (existingById.has(candidateId) && entry.classification !== 'matched') {
         candidateId = `${candidateId}-${crypto.createHash('sha1').update(entry.discoveryKey).digest('hex').slice(0, 6)}`;
       }
-      if (!existingById.has(candidateId) && !state.importedCards[candidateId]) {
-        const finalCard: BattleSpiritsCard = {
-          ...entry.card,
-          id: candidateId,
-          wikiTitle: manual?.wikiTitle || entry.card.wikiTitle,
-        };
-        state.importedCards[finalCard.id] = finalCard;
-        existingById.set(finalCard.id, finalCard);
-        importedCards.push(finalCard);
-        addedCardsCount++;
+      if (existingById.has(candidateId) || state.importedCards[candidateId]) {
+        failedImports.push({
+          discoveryKey: entry.discoveryKey,
+          cardNumber: entry.card.cardNumber,
+          name: entry.card.name,
+          reason: `ID collision on "${candidateId}" prevented safe non-destructive insert`,
+        });
+        continue;
       }
+      const finalCard: BattleSpiritsCard = {
+        ...entry.card,
+        id: candidateId,
+        wikiTitle: manual?.wikiTitle || entry.card.wikiTitle,
+      };
+      state.importedCards[finalCard.id] = finalCard;
+      existingById.set(finalCard.id, finalCard);
+      importedCards.push(finalCard);
+      addedCardsCount++;
     }
 
     entry.imported = true;
@@ -1839,9 +2025,15 @@ export function executeCatalogImport(
     addedSetsCount,
     addedCardsCount,
     updatedMetadataCount,
-    skippedCount: validation.skippedUncertain + validation.skippedDuplicates + validation.skippedAlreadyImported,
+    skippedCount:
+      validation.skippedUncertain +
+      validation.skippedDuplicates +
+      validation.skippedAlreadyImported +
+      validation.skippedInvalid,
     importedCards,
     importedSets,
+    rejectedCards: validation.rejectedCards,
+    failedImports,
   };
 }
 
@@ -1911,8 +2103,13 @@ export function getCatalogDashboardSnapshot(
 
   let entries = Object.values(state.discoveredCards);
   if (options?.setCode) {
-    const sc = options.setCode.trim().toUpperCase();
-    entries = entries.filter((e) => e.sourceSetCode === sc);
+    const sc = normalizeSetCode(options.setCode);
+    const scUpper = options.setCode.trim().toUpperCase();
+    entries = entries.filter(
+      (e) =>
+        normalizeSetCode(e.sourceSetCode) === sc ||
+        e.sourceSetCode.toUpperCase() === scUpper
+    );
   }
   if (options?.classification && options.classification !== 'all') {
     entries = entries.filter((e) => e.classification === options.classification);

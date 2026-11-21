@@ -183,6 +183,14 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
     });
   }, [formatFilteredSets, setCategory, setQuery, setTokensByCode]);
 
+  const normalizeSetKey = (raw: string) =>
+    (raw || '')
+      .trim()
+      .toUpperCase()
+      .replace(/\s+/g, '')
+      .replace(/^(26R)-(BS|SD|EB|DB|CB)(\d+)$/, '$1$2$3')
+      .replace(/([A-Z])[-]+(\d)/g, '$1$2');
+
   // Single O(N) pass to compute available cards per set for the active format
   const cardCountsBySet = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -202,7 +210,11 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
 
       if (!formatMatches) continue;
       const code = c.setCode;
+      const normCode = normalizeSetKey(code);
       counts[code] = (counts[code] || 0) + 1;
+      if (normCode && normCode !== code) {
+        counts[normCode] = (counts[normCode] || 0) + 1;
+      }
     }
 
     counts.TOKENS = tokenCount;
@@ -568,7 +580,8 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
 
             <div className="divide-y divide-slate-100">
               {displayedSets.map((set) => {
-                const dbCount = cardCountsBySet[set.setCode] || 0;
+                const dbCount =
+                  cardCountsBySet[set.setCode] || cardCountsBySet[normalizeSetKey(set.setCode)] || 0;
                 const hasStandard = set.formats.includes('Standard');
                 return (
                   <button
@@ -647,7 +660,8 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
             {displayedSets.map((set) => {
-              const dbCount = cardCountsBySet[set.setCode] || 0;
+              const dbCount =
+                cardCountsBySet[set.setCode] || cardCountsBySet[normalizeSetKey(set.setCode)] || 0;
               const hasStandard = set.formats.includes('Standard');
               return (
                 <button

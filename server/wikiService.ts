@@ -1244,6 +1244,7 @@ export function cleanWikitextInline(raw: string): string {
       }
       return `[${key}]`;
     })
+    .replace(/\{\{Nihongo\|([^|}]+)(?:\|[^}]*)?\}\}/gi, (_m, eng: string) => eng.trim())
     .replace(/\[\[([^|\]]+)\|([^\]]+)\]\]/g, '$2')
     .replace(/\[\[([^\]]+)\]\]/g, '$1')
     .replace(/'''?/g, '')
@@ -2302,7 +2303,7 @@ export function parseSetTableRows(
         .map((l) => l.trim())
         .filter((l) => l.startsWith('|') && !l.startsWith('|-') && !l.startsWith('|}'));
 
-      if (normalizedRow.length < 3) continue;
+      if (normalizedRow.length < 2) continue;
 
       const cells = normalizedRow.map((c) => {
         const stripped = c.slice(1).trim();
@@ -2323,11 +2324,13 @@ export function parseSetTableRows(
 
       const numberIdx =
         colIdxMap.number !== undefined ? colIdxMap.number : detectedNameIdx - 1;
-      const numRaw = cleanWikitextInline(cells[numberIdx] || '').replace(/\s+/g, '');
-      if (!numRaw || numRaw.length > 24 || /number/i.test(numRaw)) continue;
+      const numRaw = cleanWikitextInline(cells[numberIdx] || '')
+        .replace(/[\u2010-\u2015]/g, '-')
+        .replace(/\s+/g, '');
+      if (!numRaw || numRaw.length > 28 || /^(?:card)?number$/i.test(numRaw)) continue;
 
       const nameCellRaw = cells[detectedNameIdx] || '';
-      const linkMatch = nameCellRaw.match(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/);
+      const linkMatch = nameCellRaw.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
       if (!linkMatch) continue;
 
       const wikiTitle = linkMatch[1].trim();
@@ -2447,8 +2450,8 @@ export function enrichSetMetadata(base: ProductSet, wikitext: string, parsedCard
   const introMatch = wikitext.match(/(?:Introduction|Overview)\s*\n\|-\s*\n\|\s*colspan="[^"]+"\s*\|\s*([\s\S]*?)(?=\n\|-|$)/i);
   const introRaw = introMatch ? cleanWikitextInline(introMatch[1]) : '';
 
-  const infoboxNameMatch = wikitext.match(/^\|\s*(?:name|title|en_?name)\s*=\s*([^\n|}]+)/im);
-  const infoboxDateMatch = wikitext.match(/^\|\s*(?:release(?:d|_?date)?|jp_?release)\s*=\s*([^\n|}]+)/im);
+  const infoboxNameMatch = wikitext.match(/^\|\s*(?:name|title|en_?name)\s*=\s*([^\n]+)/im);
+  const infoboxDateMatch = wikitext.match(/^\|\s*(?:release(?:d|_?date)?|jp_?release)\s*=\s*([^\n]+)/im);
 
   let name = base.name;
   const isGenericBase =

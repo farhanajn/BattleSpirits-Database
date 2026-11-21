@@ -2,8 +2,8 @@ name: Validate Spiritsdex Manual Artwork URLs
 
 on:
   schedule:
-    # Daily at 00:15 Asia/Jakarta time (WIB, UTC+7) -> 17:15 UTC
-    - cron: '15 17 * * *'
+    # Daily at 00:00 Asia/Jakarta time (WIB, UTC+7) -> 17:00 UTC
+    - cron: '0 17 * * *'
   workflow_dispatch:
 
 # Prevent overlapping scheduled or manual validation runs
@@ -39,9 +39,9 @@ jobs:
 
           CLEAN_URL="${BASE_URL%/}"
           case "${CLEAN_URL}" in
-            http://*|https://*) ;;
+            https://*) ;;
             *)
-              echo "::error::SPIRITSDEX_VALIDATION_URL must start with https:// or http://."
+              echo "::error::SPIRITSDEX_VALIDATION_URL must start with https://."
               exit 1
               ;;
           esac

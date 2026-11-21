@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -12,12 +12,14 @@ import {
   RotateCcw,
   Search,
   ShieldCheck,
+  Square,
   XCircle,
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import type { BattleSpiritsCard, ProductSet } from '../types/card';
 import {
   type ClientArtworkValidationRecord,
+  fetchValidationRecordsFromFirestore,
   isVerifiedAdminUser,
   publishCatalogAdditionsToFirestore,
   syncValidationRecordsToFirestore,
@@ -52,6 +54,7 @@ interface CatalogOverview {
 
 interface DiscoveredSetRow extends ProductSet {
   sources: string[];
+  aliases?: string[];
   isNumberOnly: boolean;
   inSpiritsdex: boolean;
   scanStatus: 'pending' | 'scanning' | 'completed' | 'failed';
@@ -100,6 +103,19 @@ interface ValidationSchedulerInfo {
   cronSecretConfigured: boolean;
 }
 
+interface RejectedCatalogCardRow {
+  discoveryKey: string;
+  cardNumber: string;
+  name: string;
+  wikiTitle: string;
+  originalSetCode: string;
+  normalizedSetCode: string;
+  reason: string;
+  missingFields: string[];
+  duplicateMatch?: string;
+  classification: string;
+}
+
 interface ImportValidationPreview {
   valid: boolean;
   willAddSets: number;
@@ -108,8 +124,10 @@ interface ImportValidationPreview {
   skippedUncertain: number;
   skippedDuplicates: number;
   skippedAlreadyImported: number;
+  skippedInvalid?: number;
   manualMappingsProtected: number;
   warnings: string[];
+  rejectedCards?: RejectedCatalogCardRow[];
 }
 
 interface AdminCatalogSectionProps {
@@ -193,13 +211,27 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     Array<{ setCode: string; page?: string; message: string; timestamp: string }>
   >([]);
   const [setFilter, setSetFilter] = useState('all');
+  const [setSearchQuery, setSetSearchQuery] = useState('');
+  const [showAllSets, setShowAllSets] = useState(false);
   const [cardClassification, setCardClassification] = useState('all');
   const [selectedSetCodeFilter, setSelectedSetCodeFilter] = useState('');
   const [onlyMissingArt, setOnlyMissingArt] = useState(false);
   const [onlyIncompleteMeta, setOnlyIncompleteMeta] = useState(false);
   const [validationPreview, setValidationPreview] = useState<ImportValidationPreview | null>(null);
+  const [rejectedCards, setRejectedCards] = useState<RejectedCatalogCardRow[]>([]);
+  const [failedImports, setFailedImports] = useState<
+    Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }>
+  >([]);
+  const [cloudSyncFailures, setCloudSyncFailures] = useState<{
+    sets: Array<{ setCode: string; error: string }>;
+    cards: Array<{ cardId: string; error: string }>;
+  } | null>(null);
   const [catalogBusy, setCatalogBusy] = useState(false);
+  const [autoScanning, setAutoScanning] = useState(false);
+  const [importingSetCode, setImportingSetCode] = useState<string | null>(null);
   const [scanningSetCode, setScanningSetCode] = useState<string | null>(null);
+  const stopAutoScanRef = useRef(false);
+  const rehydratedValidationRef = useRef(false);
 
   // Validation state
   const [valSummary, setValSummary] = useState<ValidationSummary | null>(null);
@@ -293,6 +325,47 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     void loadValidationStatus();
   }, [expanded, loadCatalogStatus, loadValidationStatus]);
 
+  // Rehydrate Firestore validation records into server state on admin open
+  useEffect(() => {
+    if (!expanded || !isAdminCloud || rehydratedValidationRef.current) return;
+    rehydratedValidationRef.current = true;
+    void fetchValidationRecordsFromFirestore().then(async (cloudRecords) => {
+      if (!cloudRecords.length) return;
+      try {
+        await fetch('/api/admin/validation/rehydrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ records: cloudRecords }),
+        });
+        await loadValidationStatus();
+      } catch {
+        // non-fatal
+      }
+    });
+  }, [expanded, isAdminCloud, loadValidationStatus]);
+
+  const filteredSets = useMemo(() => {
+    const q = setSearchQuery.trim().toLowerCase();
+    if (!q) return sets;
+    const qCompact = q.replace(/[\s-]+/g, '');
+    return sets.filter((s) => {
+      const code = (s.setCode || '').toLowerCase();
+      const name = (s.name || '').toLowerCase();
+      const jpName = (s.jpName || '').toLowerCase();
+      const aliases = (s.aliases || []).join(' ').toLowerCase();
+      const hay = `${code} ${name} ${jpName} ${aliases}`;
+      const hayCompact = hay.replace(/[\s-]+/g, '');
+      return hay.includes(q) || (qCompact.length >= 2 && hayCompact.includes(qCompact));
+    });
+  }, [sets, setSearchQuery]);
+
+  const displayedSets = useMemo(() => {
+    if (showAllSets || setSearchQuery.trim()) {
+      return filteredSets;
+    }
+    return filteredSets.slice(0, 120);
+  }, [filteredSets, showAllSets, setSearchQuery]);
+
   const handleDiscoverSets = async () => {
     setCatalogBusy(true);
     try {
@@ -352,6 +425,54 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     }
   };
 
+  const handleScanAllAuto = async () => {
+    stopAutoScanRef.current = false;
+    setAutoScanning(true);
+    setCatalogBusy(true);
+    let totalProcessed = 0;
+    let totalFailed = 0;
+    try {
+      let nextMode: 'all' | 'resume' =
+        (overview?.setsPending ?? 0) > 0 && (overview?.setsScanned ?? 0) > 0 ? 'resume' : 'all';
+
+      for (let round = 0; round < 60; round++) {
+        if (stopAutoScanRef.current) {
+          onNotify?.(`Auto-scan paused after ${totalProcessed} set(s). Click Resume Scan to continue.`);
+          break;
+        }
+        const res = await fetch('/api/admin/catalog/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: nextMode, maxSetsPerRun: 12 }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Auto-scan failed');
+        const processed = Array.isArray(data.processedSets) ? data.processedSets.length : 0;
+        const failed = Array.isArray(data.failedSets) ? data.failedSets.length : 0;
+        totalProcessed += processed;
+        totalFailed += failed;
+        await loadCatalogStatus();
+        const pendingLeft = Number(data.overview?.setsPending ?? 0);
+        if (pendingLeft === 0 || (processed === 0 && failed === 0)) {
+          onNotify?.(
+            `Auto-scan finished: ${totalProcessed} set(s) scanned${totalFailed > 0 ? `, ${totalFailed} failed` : ''} · ${data.overview?.missingCards ?? 0} missing cards detected`
+          );
+          break;
+        }
+        nextMode = 'resume';
+      }
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Auto-scan failed');
+    } finally {
+      setAutoScanning(false);
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleStopAutoScan = () => {
+    stopAutoScanRef.current = true;
+  };
+
   const handleCompareCatalog = async () => {
     setCatalogBusy(true);
     try {
@@ -394,6 +515,8 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Validation failed');
       setValidationPreview(data);
+      setRejectedCards(Array.isArray(data.rejectedCards) ? data.rejectedCards : []);
+      setFailedImports([]);
       onNotify?.(
         `Validation ready: +${data.willAddCards} cards, +${data.willAddSets} sets, ${data.skippedUncertain} uncertain skipped`
       );
@@ -404,13 +527,42 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     }
   };
 
-  const handleExecuteImport = async () => {
+  const syncAdditionsWithCloud = async (
+    importedSets: ProductSet[],
+    importedCards: BattleSpiritsCard[]
+  ): Promise<string> => {
+    if (!isAdminCloud || !currentUser || (importedSets.length === 0 && importedCards.length === 0)) {
+      return '';
+    }
+    try {
+      const synced = await publishCatalogAdditionsToFirestore(
+        currentUser.uid,
+        importedSets,
+        importedCards
+      );
+      if (synced.failedSets.length > 0 || synced.failedCards.length > 0) {
+        setCloudSyncFailures({ sets: synced.failedSets, cards: synced.failedCards });
+        return ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud (${synced.failedCards.length} card / ${synced.failedSets.length} set failures)`;
+      }
+      setCloudSyncFailures(null);
+      return ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud`;
+    } catch {
+      return ' (local import succeeded; Cloud sync skipped/failed)';
+    }
+  };
+
+  const handleExecuteImport = async (setCodes?: string[]) => {
     setCatalogBusy(true);
+    if (setCodes?.length === 1) setImportingSetCode(setCodes[0]);
     try {
       const res = await fetch('/api/admin/catalog/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ includeMissing: true, includeApprovedUpdates: true }),
+        body: JSON.stringify({
+          includeMissing: true,
+          includeApprovedUpdates: true,
+          ...(setCodes && setCodes.length > 0 ? { setCodes } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Import failed');
@@ -421,20 +573,10 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
         : [];
 
       onCatalogImported?.(importedSets, importedCards);
+      setRejectedCards(Array.isArray(data.rejectedCards) ? data.rejectedCards : []);
+      setFailedImports(Array.isArray(data.failedImports) ? data.failedImports : []);
 
-      let cloudMsg = '';
-      if (isAdminCloud && currentUser && (importedSets.length > 0 || importedCards.length > 0)) {
-        try {
-          const synced = await publishCatalogAdditionsToFirestore(
-            currentUser.uid,
-            importedSets,
-            importedCards
-          );
-          cloudMsg = ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud`;
-        } catch {
-          cloudMsg = ' (local import succeeded; Cloud sync skipped/failed)';
-        }
-      }
+      const cloudMsg = await syncAdditionsWithCloud(importedSets, importedCards);
 
       onNotify?.(
         `Imported ${data.addedCardsCount} cards (${data.updatedMetadataCount} updated, ${data.addedSetsCount} sets)${cloudMsg}`
@@ -443,6 +585,41 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       await loadCatalogStatus();
     } catch (err) {
       onNotify?.(err instanceof Error ? err.message : 'Catalog import failed');
+    } finally {
+      setCatalogBusy(false);
+      setImportingSetCode(null);
+    }
+  };
+
+  const handleSyncAllImportedToCloud = async () => {
+    if (!isAdminCloud || !currentUser) return;
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/catalog/imported');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to read imported catalog');
+      const importedSets: ProductSet[] = Array.isArray(data.sets) ? data.sets : [];
+      const importedCards: BattleSpiritsCard[] = Array.isArray(data.cards) ? data.cards : [];
+      if (importedSets.length === 0 && importedCards.length === 0) {
+        onNotify?.('No imported sets or cards yet to sync to Firestore');
+        return;
+      }
+      const synced = await publishCatalogAdditionsToFirestore(
+        currentUser.uid,
+        importedSets,
+        importedCards
+      );
+      if (synced.failedSets.length > 0 || synced.failedCards.length > 0) {
+        setCloudSyncFailures({ sets: synced.failedSets, cards: synced.failedCards });
+        onNotify?.(
+          `Synced ${synced.pushedCards} cards / ${synced.pushedSets} sets (${synced.failedCards.length} card / ${synced.failedSets.length} set failures)`
+        );
+      } else {
+        setCloudSyncFailures(null);
+        onNotify?.(`Synced all ${synced.pushedCards} cards & ${synced.pushedSets} sets to Firestore`);
+      }
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Cloud sync failed');
     } finally {
       setCatalogBusy(false);
     }
@@ -500,8 +677,12 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     if (!isAdminCloud || valRecords.length === 0) return;
     setValBusy(true);
     try {
-      const count = await syncValidationRecordsToFirestore(valRecords);
-      onNotify?.(`Synced ${count} validation status record(s) to Firestore`);
+      const res = await syncValidationRecordsToFirestore(valRecords);
+      onNotify?.(
+        res.failedKeys.length > 0
+          ? `Synced ${res.syncedCount} validation record(s) (${res.failedKeys.length} failed)`
+          : `Synced ${res.syncedCount} validation status record(s) to Firestore`
+      );
     } catch {
       onNotify?.('Failed to sync validation status to Firestore');
     } finally {
@@ -691,8 +872,29 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                   className="min-h-[38px] px-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                 >
                   <Play className="w-3.5 h-3.5" />
-                  <span>Scan Wiki</span>
+                  <span>Scan Batch (12)</span>
                 </button>
+
+                {autoScanning ? (
+                  <button
+                    type="button"
+                    onClick={handleStopAutoScan}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Square className="w-3.5 h-3.5" />
+                    <span>Stop Auto-Scan</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleScanAllAuto()}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    <span>Scan All Sets</span>
+                  </button>
+                )}
 
                 {(overview?.setsPending ?? 0) > 0 && (
                   <button
@@ -745,7 +947,46 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                   <CloudUpload className="w-3.5 h-3.5" />
                   <span>Import Verified Cards</span>
                 </button>
+
+                {isAdminCloud && (
+                  <button
+                    type="button"
+                    disabled={catalogBusy}
+                    onClick={() => void handleSyncAllImportedToCloud()}
+                    className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <CloudUpload className="w-3.5 h-3.5" />
+                    <span>Sync Imported to Cloud</span>
+                  </button>
+                )}
               </div>
+
+              {autoScanning && overview && overview.totalSetsToScan > 0 && (
+                <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 space-y-1.5">
+                  <div className="flex items-center justify-between font-semibold">
+                    <span>
+                      Auto-scanning all discovered sets ({overview.setsScanned}/
+                      {overview.totalWikiSetsDiscovered})
+                    </span>
+                    <span className="font-mono">{overview.setsPending} pending</span>
+                  </div>
+                  <div className="h-2 rounded-full bg-emerald-200 overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-700 transition-all"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.round(
+                            (overview.setsScanned /
+                              Math.max(1, overview.totalWikiSetsDiscovered)) *
+                              100
+                          )
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
 
               {validationPreview && (
                 <div className="p-3.5 rounded-2xl bg-sky-50 border border-sky-200 text-xs text-sky-950 space-y-1">
@@ -759,6 +1000,102 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     Skipped: {validationPreview.skippedUncertain} uncertain,{' '}
                     {validationPreview.skippedDuplicates} duplicates,{' '}
                     {validationPreview.skippedAlreadyImported} already imported
+                    {validationPreview.skippedInvalid ? `, ${validationPreview.skippedInvalid} invalid` : ''}
+                  </div>
+                </div>
+              )}
+
+              {cloudSyncFailures &&
+                (cloudSyncFailures.sets.length > 0 || cloudSyncFailures.cards.length > 0) && (
+                  <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold">
+                        Partial Cloud Sync Failures ({cloudSyncFailures.sets.length} sets,{' '}
+                        {cloudSyncFailures.cards.length} cards)
+                      </span>
+                      <button
+                        type="button"
+                        disabled={catalogBusy}
+                        onClick={() => void handleSyncAllImportedToCloud()}
+                        className="px-2.5 py-1 rounded-lg bg-amber-700 text-white text-[11px] font-semibold cursor-pointer"
+                      >
+                        Retry Cloud Sync
+                      </button>
+                    </div>
+                    <div className="max-h-24 overflow-y-auto font-mono text-[11px] space-y-0.5">
+                      {cloudSyncFailures.sets.slice(0, 10).map((f) => (
+                        <div key={`fs-${f.setCode}`}>
+                          [SET {f.setCode}] {f.error}
+                        </div>
+                      ))}
+                      {cloudSyncFailures.cards.slice(0, 15).map((f) => (
+                        <div key={`fc-${f.cardId}`}>
+                          [CARD {f.cardId}] {f.error}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+              {(rejectedCards.length > 0 || failedImports.length > 0) && (
+                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold">
+                      Skipped / Rejected Card Diagnostics ({rejectedCards.length + failedImports.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRejectedCards([]);
+                        setFailedImports([]);
+                      }}
+                      className="text-[11px] underline text-amber-800 cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto divide-y divide-amber-200/70">
+                    {failedImports.map((f) => (
+                      <div key={`fi-${f.discoveryKey}`} className="py-1.5 text-[11px]">
+                        <span className="font-mono font-bold">{f.cardNumber}</span> {f.name} —{' '}
+                        <span className="text-red-800">{f.reason}</span>
+                      </div>
+                    ))}
+                    {rejectedCards.slice(0, 60).map((r) => (
+                      <div
+                        key={`rc-${r.discoveryKey}`}
+                        className="py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                      >
+                        <div className="min-w-0">
+                          <span className="font-mono font-bold">{r.cardNumber || '—'}</span>{' '}
+                          <span className="font-semibold">{r.name || r.wikiTitle}</span>{' '}
+                          <span className="text-slate-600">
+                            ({r.originalSetCode}
+                            {r.normalizedSetCode && r.normalizedSetCode !== r.originalSetCode
+                              ? ` -> ${r.normalizedSetCode}`
+                              : ''}
+                            )
+                          </span>
+                          <div className="text-amber-900">
+                            {r.reason}
+                            {r.missingFields.length > 0
+                              ? ` [missing: ${r.missingFields.join(', ')}]`
+                              : ''}
+                            {r.duplicateMatch ? ` [match: ${r.duplicateMatch}]` : ''}
+                          </div>
+                        </div>
+                        {(r.classification === 'uncertain' ||
+                          r.classification === 'potential_duplicate') && (
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleApproval(r.discoveryKey, true)}
+                            className="px-2 py-1 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 text-[11px] font-semibold text-amber-950 cursor-pointer shrink-0"
+                          >
+                            Approve
+                          </button>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -788,9 +1125,27 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     </button>
                   ))}
                 </div>
-                <span className="text-[11px] font-mono text-slate-500">
-                  {sets.length} sets shown
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="search"
+                    value={setSearchQuery}
+                    onChange={(e) => setSetSearchQuery(e.target.value)}
+                    placeholder="Find set (e.g. BS23, 26RSD01)..."
+                    className="min-h-[32px] w-48 px-2.5 rounded-xl border border-slate-200 bg-white text-xs text-slate-900"
+                  />
+                  {filteredSets.length > 120 && !setSearchQuery.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllSets((v) => !v)}
+                      className="min-h-[30px] px-2.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 cursor-pointer"
+                    >
+                      {showAllSets ? 'Collapse (120)' : `Show All (${filteredSets.length})`}
+                    </button>
+                  )}
+                  <span className="text-[11px] font-mono text-slate-500">
+                    {displayedSets.length}/{filteredSets.length} sets shown
+                  </span>
+                </div>
               </div>
 
               <div className="overflow-x-auto rounded-2xl border border-slate-200 max-h-80">
@@ -808,7 +1163,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {sets.slice(0, 120).map((s) => (
+                    {displayedSets.map((s) => (
                       <tr key={s.setCode} className="hover:bg-slate-50/70">
                         <td className="py-2 px-3">
                           <div className="font-mono font-bold text-slate-900 flex items-center gap-1.5">
@@ -857,6 +1212,16 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                               ? 'Retry'
                               : 'Scan'}
                           </button>
+                          {s.missingCount > 0 && (
+                            <button
+                              type="button"
+                              disabled={catalogBusy || importingSetCode === s.setCode}
+                              onClick={() => void handleExecuteImport([s.setCode])}
+                              className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-[11px] font-semibold text-white cursor-pointer disabled:opacity-50"
+                            >
+                              {importingSetCode === s.setCode ? 'Importing...' : `Import (${s.missingCount})`}
+                            </button>
+                          )}
                           {s.discoveredCount > 0 && (
                             <button
                               type="button"
@@ -1088,10 +1453,10 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                 <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 text-xs text-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                   <div>
                     <span className="font-semibold text-slate-900">
-                      Background Schedule: Every {valScheduler.intervalHours}h
+                      Scheduled Validation: Daily at 00:00 WIB (17:00 UTC) via GitHub Actions
                     </span>{' '}
-                    ({valScheduler.inProcessTimerActive ? 'In-process timer active' : 'Timer inactive'}
-                    ). External GitHub Actions / cron webhook:{' '}
+                    (In-process timer: every {valScheduler.intervalHours}h,{' '}
+                    {valScheduler.inProcessTimerActive ? 'active' : 'inactive'}). Webhook:{' '}
                     <code className="font-mono text-[11px] bg-white px-1.5 py-0.5 rounded border border-slate-200">
                       {valScheduler.cloudRunExternalCronEndpoint}
                     </code>{' '}

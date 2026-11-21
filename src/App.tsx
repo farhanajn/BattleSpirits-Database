@@ -290,9 +290,17 @@ function resolveSearchSetIntent(
   return null;
 }
 
+export function normalizeSetCodeForClient(rawCode: string): string {
+  const upper = (rawCode || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!upper) return '';
+  return upper
+    .replace(/^(26R)-(BS|SD|EB|DB|CB)(\d+)$/, '$1$2$3')
+    .replace(/([A-Z])[-]+(\d)/g, '$1$2');
+}
+
 function getCardNumberPrefix(cardNumber: string): string {
   const m = (cardNumber || '').trim().match(/^([A-Z0-9]+)-/i);
-  return m ? m[1].toUpperCase() : '';
+  return m ? normalizeSetCodeForClient(m[1]) : '';
 }
 
 function parseStateFromUrl(): {
@@ -464,26 +472,38 @@ export function mergeCardsIntoMap(
     forceRevival?: boolean;
     forceToken?: boolean;
     preferExisting?: boolean;
+    preserveSetCode?: boolean;
   }
 ): { next: Record<string, BattleSpiritsCard>; addedCount: number } {
   const next = { ...prev };
   const keyToId = new Map<string, string>();
-  const productSetByCode = new Map(PRODUCT_SETS.map((s) => [s.setCode.toUpperCase(), s]));
+  const productSetByCode = new Map(
+    PRODUCT_SETS.map((s) => [normalizeSetCodeForClient(s.setCode), s])
+  );
 
   const indexCard = (c: BattleSpiritsCard) => {
     const ver = c.isRevival ? 'rv' : 'orig';
     const normNum = normalizeCardNumber(c.cardNumber || '');
+    const normSet = normalizeSetCodeForClient(c.setCode || '');
     if (normNum && normNum !== 'WIKI') {
+      if (normSet) {
+        const setNumKey = `num:${normNum}|${normSet}|${ver}`;
+        if (!keyToId.has(setNumKey)) keyToId.set(setNumKey, c.id);
+      }
       const nk = `num:${normNum}|${ver}`;
       if (!keyToId.has(nk)) keyToId.set(nk, c.id);
     }
     const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
     if (cleanName) {
+      if (normSet) {
+        const setNmKey = `name:${cleanName}|${normSet}|${ver}`;
+        if (!keyToId.has(setNmKey)) keyToId.set(setNmKey, c.id);
+      }
       const nmKey = `name:${cleanName}|${ver}`;
       if (!keyToId.has(nmKey)) keyToId.set(nmKey, c.id);
     }
     if (!c.isRevival && c.wikiTitle) {
-      const wkKey = `wiki:${c.wikiTitle.trim().toLowerCase()}|orig`;
+      const wkKey = `wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet || '*'}|orig`;
       if (!keyToId.has(wkKey)) keyToId.set(wkKey, c.id);
     }
   };
@@ -499,11 +519,20 @@ export function mergeCardsIntoMap(
     const ver = isRev ? 'rv' : 'orig';
     const normNum = normalizeCardNumber(c.cardNumber || '');
     const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
+    let normSet = normalizeSetCodeForClient(c.setCode || '');
 
-    // Self-heal cross-set Booster reprint attribution if incoming cache had misattributed setCode
+    // Self-heal cross-set Booster reprint attribution ONLY when not explicitly keyed/imported into its set
     const prefix = getCardNumberPrefix(c.cardNumber || '');
-    if (prefix && prefix !== (c.setCode || '').toUpperCase() && !isRev) {
-      const curSet = productSetByCode.get((c.setCode || '').toUpperCase());
+    const cardIdEncodesSet =
+      Boolean(normSet) && (c.id || '').toUpperCase().startsWith(`${normSet}-`);
+    if (
+      !options?.preserveSetCode &&
+      !cardIdEncodesSet &&
+      prefix &&
+      prefix !== normSet &&
+      !isRev
+    ) {
+      const curSet = productSetByCode.get(normSet);
       const prefixSet = productSetByCode.get(prefix);
       if (
         prefixSet &&
@@ -519,17 +548,32 @@ export function mergeCardsIntoMap(
           blockIcon: prefixSet.blockLabel || c.blockIcon,
           formats: prefixSet.formats.length > 0 ? prefixSet.formats : c.formats,
         };
+        normSet = normalizeSetCodeForClient(prefixSet.setCode);
       }
     }
 
     let targetId = next[c.id] ? c.id : undefined;
     if (!targetId && normNum && normNum !== 'WIKI') {
-      targetId = keyToId.get(`num:${normNum}|${ver}`);
+      targetId =
+        (normSet ? keyToId.get(`num:${normNum}|${normSet}|${ver}`) : undefined) ||
+        undefined;
+      if (!targetId) {
+        const genericNumTarget = keyToId.get(`num:${normNum}|${ver}`);
+        if (genericNumTarget) {
+          const existingSet = normalizeSetCodeForClient(next[genericNumTarget]?.setCode || '');
+          if (!normSet || !existingSet || existingSet === normSet) {
+            targetId = genericNumTarget;
+          }
+        }
+      }
     }
     if (!targetId && !isRev && c.wikiTitle) {
-      targetId = keyToId.get(`wiki:${c.wikiTitle.trim().toLowerCase()}|orig`);
+      targetId = keyToId.get(`wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet || '*'}|orig`);
     }
-    if (!targetId && !isRev && cleanName) {
+    if (!targetId && !isRev && cleanName && normSet) {
+      targetId = keyToId.get(`name:${cleanName}|${normSet}|orig`);
+    }
+    if (!targetId && !isRev && cleanName && (!normNum || normNum === 'WIKI')) {
       targetId = keyToId.get(`name:${cleanName}|orig`);
     }
     if (!targetId) targetId = c.id;
@@ -1051,6 +1095,7 @@ export default function App() {
           const { next } = mergeCardsIntoMap(prev, incomingCards, {
             banList,
             preferExisting: true,
+            preserveSetCode: true,
           });
           return next;
         });
@@ -1192,7 +1237,9 @@ export default function App() {
       if (next.format !== filters.format) {
         let resolvedSetCode = next.setCode;
         if (resolvedSetCode !== 'All') {
-          const matchedSet = indexedSetDirectory.byCode.get(resolvedSetCode.toUpperCase());
+          const matchedSet =
+            indexedSetDirectory.byCode.get(resolvedSetCode.toUpperCase()) ||
+            indexedSetDirectory.byCode.get(normalizeSetCodeForClient(resolvedSetCode));
           if (!matchedSet || !matchesFormatFilter(matchedSet.formats, next.format)) {
             resolvedSetCode = 'All';
           }
@@ -1249,12 +1296,13 @@ export default function App() {
     );
 
     const matchesSetIntent = (card: BattleSpiritsCard, intent: SearchSetIntent) => {
-      const cardSetUpper = card.setCode.toUpperCase();
+      const cardSetUpper = normalizeSetCodeForClient(card.setCode);
       const cardPrefix = getCardNumberPrefix(card.cardNumber);
       if (intent.exactSetCode) {
-        if (intent.exactSetCode === 'TOKENS') return Boolean(card.isToken);
-        if (intent.exactSetCode === 'REVIVAL') return Boolean(card.isRevival);
-        if (cardSetUpper === intent.exactSetCode || cardPrefix === intent.exactSetCode) {
+        const normIntent = normalizeSetCodeForClient(intent.exactSetCode);
+        if (normIntent === 'TOKENS') return Boolean(card.isToken);
+        if (normIntent === 'REVIVAL') return Boolean(card.isRevival);
+        if (cardSetUpper === normIntent || cardPrefix === normIntent) {
           return true;
         }
       }
@@ -1279,11 +1327,12 @@ export default function App() {
       if (filters.version === 'Revival' && !card.isRevival) return false;
 
       if (filters.setCode !== 'All') {
-        if (filters.setCode.toUpperCase() === 'TOKENS') {
+        const targetSetNorm = normalizeSetCodeForClient(filters.setCode);
+        if (targetSetNorm === 'TOKENS') {
           if (!card.isToken) return false;
-        } else if (filters.setCode.toUpperCase() === 'REVIVAL') {
+        } else if (targetSetNorm === 'REVIVAL') {
           if (!card.isRevival) return false;
-        } else if (card.setCode.toUpperCase() !== filters.setCode.toUpperCase()) {
+        } else if (normalizeSetCodeForClient(card.setCode) !== targetSetNorm) {
           return false;
         }
       }
