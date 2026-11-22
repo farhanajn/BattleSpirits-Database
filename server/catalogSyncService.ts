@@ -169,6 +169,17 @@ export interface CatalogOverviewSummary {
   completedAt: string | null;
 }
 
+export type RejectionDiagnosticCategory =
+  | 'confirmed_duplicate'
+  | 'invalid_or_unsafe'
+  | 'insufficient_identifying_info'
+  | 'unsupported_identifier'
+  | 'wiki_extraction_error'
+  | 'database_write_failure'
+  | 'permission_failure'
+  | 'temporary_retryable'
+  | 'unexpected_error';
+
 export interface RejectedCatalogCard {
   discoveryKey: string;
   cardNumber: string;
@@ -177,6 +188,9 @@ export interface RejectedCatalogCard {
   originalSetCode: string;
   normalizedSetCode: string;
   reason: string;
+  diagnosticCategory: RejectionDiagnosticCategory;
+  recoverable: boolean;
+  recommendedAction: string;
   missingFields: string[];
   duplicateMatch?: string;
   classification: ComparisonClassification;
@@ -190,6 +204,7 @@ export interface ImportValidationReport {
   skippedUncertain: number;
   skippedDuplicates: number;
   skippedAlreadyImported: number;
+  confirmedDuplicatesCount: number;
   skippedInvalid: number;
   manualMappingsProtected: number;
   warnings: string[];
@@ -197,15 +212,26 @@ export interface ImportValidationReport {
   rejectedCards: RejectedCatalogCard[];
 }
 
+export interface FailedImportRecord {
+  discoveryKey: string;
+  cardNumber: string;
+  name: string;
+  reason: string;
+  diagnosticCategory?: RejectionDiagnosticCategory;
+  recoverable?: boolean;
+  recommendedAction?: string;
+}
+
 export interface ImportExecutionResult {
   addedSetsCount: number;
   addedCardsCount: number;
   updatedMetadataCount: number;
   skippedCount: number;
+  confirmedDuplicatesCount: number;
   importedCards: BattleSpiritsCard[];
   importedSets: ProductSet[];
   rejectedCards: RejectedCatalogCard[];
-  failedImports: Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }>;
+  failedImports: FailedImportRecord[];
 }
 
 const DEFAULT_RUNTIME_DIR =
@@ -219,6 +245,16 @@ const CARD_SETS_IGNORE_TITLES = new Set([
   'Battle Spirits Wiki',
   'Main Page',
   'Special:Search',
+]);
+const GENERIC_PROMO_HUB_CODES = new Set([
+  'PROMO',
+  'PROMO-PX',
+  'PROMO-REG',
+  'PROMO-CMP',
+  'PROMO-LIM',
+  'PROMO-JMP',
+  'PROMO-ANM',
+  'PROMO-X',
 ]);
 
 let scanMutex = false;
@@ -248,8 +284,192 @@ export function normalizeCardNumForCompare(raw?: string): string {
   return (raw || '')
     .trim()
     .toUpperCase()
-    .replace(/[\u2010-\u2015]/g, '-')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
     .replace(/\s+/g, '');
+}
+
+/**
+ * Generates equivalent normalized comparison keys for a card number
+ * (handling hyphenation & zero-padding differences such as SD57-06 vs SD57-006 or PX01 vs PX-01).
+ */
+export function buildCardNumberCompareKeys(raw?: string, setCodeHint?: string): string[] {
+  const base = normalizeCardNumForCompare(raw);
+  if (!base || base === 'WIKI') return [];
+  const keys = new Set<string>([base]);
+
+  const addWithSideVariants = (num: string) => {
+    keys.add(num);
+    // Double-sided (A)/(B) equivalents: BS73-TCP01(A) <-> BS73-TCP01A <-> BS73-TCP01, BS73-TCP02(B) <-> BS73-TCP02B
+    const parenSide = num.match(/^(.*)\(([AB])\)$/);
+    if (parenSide) {
+      const [, stem, side] = parenSide;
+      keys.add(`${stem}${side}`);
+      if (side === 'A') keys.add(stem);
+      return;
+    }
+    const bareSide = num.match(/^([A-Z0-9]+-(?:TCP|TX|TW|TM|T)[0-9]+)([AB])$/);
+    if (bareSide) {
+      const [, stem, side] = bareSide;
+      keys.add(`${stem}(${side})`);
+      return;
+    }
+    if (/^[A-Z0-9]+-(?:TCP|TX|TW|TM)\d+$/.test(num)) {
+      keys.add(`${num}(A)`);
+      keys.add(`${num}A`);
+    }
+  };
+
+  addWithSideVariants(base);
+
+  const expandNumber = (candidate: string) => {
+    addWithSideVariants(candidate);
+    const padMatch = candidate.match(/^([A-Z0-9]+)-([A-Z]*)(\d+)([A-Z]*(?:\([AB]\))?)$/);
+    if (padMatch) {
+      const [, prefix, midAlpha, digits, suffix] = padMatch;
+      const unpadded = String(Number(digits));
+      if (unpadded && unpadded !== 'NaN') {
+        addWithSideVariants(`${prefix}-${midAlpha}${unpadded}${suffix}`);
+        addWithSideVariants(`${prefix}-${midAlpha}${unpadded.padStart(2, '0')}${suffix}`);
+        addWithSideVariants(`${prefix}-${midAlpha}${unpadded.padStart(3, '0')}${suffix}`);
+      }
+      if (!midAlpha && /^(?:PX|P|X)\d+/.test(prefix)) {
+        addWithSideVariants(`${prefix}${digits}${suffix}`);
+      }
+    } else {
+      const unhyphenPromo = candidate.match(/^(PX|P|X)(\d{1,3})([A-Z]*)$/);
+      if (unhyphenPromo) {
+        const [, pfx, digits, sfx] = unhyphenPromo;
+        const numStr = String(Number(digits));
+        addWithSideVariants(`${pfx}-${digits}${sfx}`);
+        addWithSideVariants(`${pfx}${numStr.padStart(2, '0')}${sfx}`);
+        addWithSideVariants(`${pfx}-${numStr.padStart(2, '0')}${sfx}`);
+      }
+    }
+  };
+
+  expandNumber(base);
+
+  // Prefixless DB/Wiki numbers scoped by setCode (e.g., CP02 inside BS45 -> BS45-CP02)
+  const normSet = setCodeHint ? normalizeSetCode(setCodeHint) : '';
+  if (normSet && !base.includes('-') && !base.startsWith(normSet)) {
+    expandNumber(`${normSet}-${base}`);
+  }
+
+  return Array.from(keys);
+}
+
+/**
+ * Produces a deterministic Firestore-safe document ID matching ^[a-zA-Z0-9_-]{1,128}$.
+ * Preserves readable ASCII slugs and attaches a short SHA-1 hash whenever characters were stripped or truncated.
+ */
+export function sanitizeCatalogDocumentId(
+  rawId: string,
+  fallbackSeed = 'card',
+  maxLen = 128
+): string {
+  const trimmed = String(rawId || '').trim();
+  const safeAscii = trimmed
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  const hashSuffix = crypto
+    .createHash('sha1')
+    .update(trimmed || fallbackSeed)
+    .digest('hex')
+    .slice(0, 8);
+
+  if (!safeAscii) {
+    const fb = String(fallbackSeed || 'card')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, Math.max(8, maxLen - 10));
+    return `${fb || 'card'}-${hashSuffix}`.slice(0, maxLen);
+  }
+
+  const normalizedOrig = trimmed.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const normalizedSafe = safeAscii.replace(/[^a-z0-9_-]/g, '');
+  const lostNonAsciiOrTooLong =
+    safeAscii.length > maxLen ||
+    (trimmed.length > 0 && normalizedSafe.length < normalizedOrig.length) ||
+    /[^\x20-\x7E]/.test(trimmed);
+
+  if (!lostNonAsciiOrTooLong && safeAscii.length <= maxLen && /^[a-zA-Z0-9_-]+$/.test(safeAscii)) {
+    return safeAscii;
+  }
+
+  const head = safeAscii.slice(0, Math.max(1, maxLen - 9)).replace(/-+$/g, '');
+  return `${head || 'card'}-${hashSuffix}`.slice(0, maxLen);
+}
+
+export function isSyntheticCardNumber(cardNumber?: string): boolean {
+  const upper = normalizeCardNumForCompare(cardNumber);
+  if (!upper || upper === 'WIKI') return true;
+  return (
+    /-CAT-[A-F0-9]{8}$/i.test(upper) ||
+    /-ARCHIVE-/i.test(upper) ||
+    /^(?:TOKENS|REVIVAL)-/i.test(upper) ||
+    /-WIKI$/i.test(upper)
+  );
+}
+
+/**
+ * Extracts canonical Battle Spirits card numbers from Wiki CardTable image filenames or set fields
+ * (e.g. "P23-05.png" -> "P23-05", "SD37-012-OG.jpg" -> "SD37-012", "PX26-06.png" -> "PX26-06", "BS73-T001.png" -> "BS73-T001").
+ */
+export function extractCardNumberFromImageField(rawImage?: string): string | null {
+  const cleaned = cleanWikitextInline(String(rawImage || ''))
+    .replace(/^(?:File|Image):/i, '')
+    .trim();
+  if (!cleaned) return null;
+
+  const withoutExt = cleaned.replace(/\.[a-z0-9]{2,5}$/i, '').trim();
+  const hyphenatedMatch = withoutExt.match(
+    /^((?:26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}[A-Z]?|EX\d{1,3}|CP\d{1,3}|RPX?\d{2}|PX\d{1,3}|P\d{2,3}|SJ\d{1,3}|KA\d{1,3}|HK[A-Z]{2}\d{1,3}|X|GX|KF)-[A-Z]{0,4}\d{1,4}[A-Z]?(?:\([AB]\))?)(?=(?:-(?:OG|RV|ALT|SEC|SP|REVIVAL|BSC\d+|LM\d+|SD\d+|BS\d+|CP\d+|PX\d+|P\d+)|[_\s]|$))/i
+  );
+  if (hyphenatedMatch) {
+    return hyphenatedMatch[1].toUpperCase();
+  }
+
+  const standalonePromoMatch = withoutExt.match(/^((?:PX\d{1,3}|EX\d{1,3})[A-Z]?)(?=[_\s-]|$)/i);
+  if (standalonePromoMatch) {
+    return standalonePromoMatch[1].toUpperCase();
+  }
+
+  return null;
+}
+
+export function inferCanonicalSetCodeFromCardNumber(
+  cardNumber: string,
+  fallbackSetCode: string,
+  rawSetField?: string
+): string {
+  const numUpper = normalizeCardNumForCompare(cardNumber);
+  const subPromo = resolvePromoSubSeriesSetCode(numUpper, rawSetField || '', fallbackSetCode);
+  if (subPromo && subPromo !== fallbackSetCode && !subPromo.endsWith('-ARCHIVE') && subPromo !== 'PROMO') {
+    return normalizeSetCode(subPromo) || subPromo;
+  }
+
+  const prefixMatch = numUpper.match(
+    /^(26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}[A-Z]?|EX\d{1,3}|CP\d{1,3}|PX\d{1,3}|P\d{2,3}|SJ\d{1,3}|KA\d{1,3}|HK[A-Z]{2}\d{1,3})-/i
+  );
+  if (prefixMatch) {
+    return normalizeSetCode(prefixMatch[1]) || prefixMatch[1].toUpperCase();
+  }
+
+  const cleanFieldSet = normalizeSetCode(cleanWikitextInline(rawSetField || ''));
+  if (
+    cleanFieldSet &&
+    CANONICAL_SET_CODE_RE.test(cleanFieldSet) &&
+    !cleanFieldSet.endsWith('-ARCHIVE')
+  ) {
+    return cleanFieldSet;
+  }
+
+  return normalizeSetCode(fallbackSetCode) || fallbackSetCode;
 }
 
 const CANONICAL_SET_CODE_RE =
@@ -1404,8 +1624,9 @@ function buildComparisonIndex(existingCards: BattleSpiritsCard[]) {
   };
 
   for (const c of existingCards) {
-    const numKey = normalizeCardNumForCompare(c.cardNumber);
-    if (numKey && numKey !== 'WIKI') pushMap(byNumber, numKey, c);
+    for (const numKey of buildCardNumberCompareKeys(c.cardNumber, c.setCode)) {
+      pushMap(byNumber, numKey, c);
+    }
 
     const nmKey = normalizeCompareText(c.name.replace(/\s*\(revival\)\s*$/i, ''));
     pushMap(byName, nmKey, c);
@@ -1418,6 +1639,15 @@ function buildComparisonIndex(existingCards: BattleSpiritsCard[]) {
   }
 
   return { byNumber, byName, byCompactName, byJpName, byWikiTitle };
+}
+
+function buildDiscoveryScanDupSignature(
+  entry: Pick<DiscoveredCardEntry, 'sourceSetCode' | 'sourceWikiTitle' | 'card'>
+): string {
+  const setPart = normalizeSetCode(entry.sourceSetCode || entry.card.setCode || '') || 'UNKNOWN';
+  const numPart = normalizeCardNumForCompare(entry.card.cardNumber);
+  const titlePart = normalizeCompareText(entry.card.wikiTitle || entry.sourceWikiTitle || entry.card.name);
+  return `${setPart}|${numPart}|${Boolean(entry.card.isRevival)}|${titlePart}`;
 }
 
 export function classifyDiscoveredCard(
@@ -1440,23 +1670,14 @@ export function classifyDiscoveredCard(
   metadataDeltas: string[];
 } {
   const card = entry.card;
-  const numKey = normalizeCardNumForCompare(card.cardNumber);
+  const numKeys = buildCardNumberCompareKeys(card.cardNumber, card.setCode || entry.sourceSetCode);
+  const numKey = numKeys[0] || normalizeCardNumForCompare(card.cardNumber);
+  const syntheticNumber = isSyntheticCardNumber(card.cardNumber);
   const nameKey = normalizeCompareText(card.name.replace(/\s*\(revival\)\s*$/i, ''));
   const compactKey = normalizeCompareCompact(card.name.replace(/\s*\(revival\)\s*$/i, ''));
   const jpKey = normalizeCompareCompact(card.jpName);
   const wikiKey = normalizeCompareText(card.wikiTitle || entry.sourceWikiTitle);
   const setKey = (card.setCode || '').trim().toUpperCase();
-
-  // Check duplicate signal among discovered entries first
-  const dupSignature = `${numKey}|${Boolean(card.isRevival)}`;
-  if ((seenDiscoveryKeysInSet.get(dupSignature) || 0) > 1) {
-    return {
-      classification: 'potential_duplicate',
-      matchSignals: ['duplicate_card_number_in_scan'],
-      matchConfidence: 50,
-      metadataDeltas: [],
-    };
-  }
 
   const candidateScores = new Map<string, { card: BattleSpiritsCard; signals: string[]; score: number }>();
   const addCandidate = (c: BattleSpiritsCard, signal: string, weight: number) => {
@@ -1470,20 +1691,36 @@ export function classifyDiscoveredCard(
   };
 
   const normSetKey = normalizeSetCode(setKey);
-  const isPromoSetPair = (a: string, b: string) =>
-    (a.startsWith('PROMO') && b.startsWith('PROMO')) || a === 'PROMO' || b === 'PROMO';
+  const isEquivalentCollectionPair = (a: string, b: string, existingCard?: BattleSpiritsCard) =>
+    (a.startsWith('PROMO') && b.startsWith('PROMO')) ||
+    a === 'PROMO' ||
+    b === 'PROMO' ||
+    (a === 'TOKENS' && Boolean(existingCard?.isToken)) ||
+    (a === 'REVIVAL' && Boolean(existingCard?.isRevival));
 
-  // Signal 1: Exact card number / identifier (scoped to same canonical set or promo group)
-  for (const c of index.byNumber.get(numKey) || []) {
-    const cSetNorm = normalizeSetCode(c.setCode || '');
-    const sameSet = !cSetNorm || !normSetKey || cSetNorm === normSetKey || isPromoSetPair(cSetNorm, normSetKey);
-    if (!sameSet) continue;
-    if (Boolean(c.isRevival) === Boolean(card.isRevival)) {
-      addCandidate(c, 'cardNumber', 55);
-    } else {
-      addCandidate(c, 'cardNumber_version_mismatch', 20);
+  // Signal 1: Exact or zero-padding-equivalent card number (scoped to same canonical set or virtual collection)
+  if (!syntheticNumber) {
+    const matchedByNumberIds = new Set<string>();
+    for (const k of numKeys) {
+      for (const c of index.byNumber.get(k) || []) {
+        if (matchedByNumberIds.has(c.id)) continue;
+        const cSetNorm = normalizeSetCode(c.setCode || '');
+        const sameSet =
+          !cSetNorm ||
+          !normSetKey ||
+          cSetNorm === normSetKey ||
+          isEquivalentCollectionPair(normSetKey, cSetNorm, c);
+        if (!sameSet) continue;
+        matchedByNumberIds.add(c.id);
+        if (Boolean(c.isRevival) === Boolean(card.isRevival)) {
+          addCandidate(c, 'cardNumber', 55);
+        } else {
+          addCandidate(c, 'cardNumber_version_mismatch', 20);
+        }
+      }
     }
   }
+
   // Signal 2: Exact official / normalized name
   for (const c of index.byName.get(nameKey) || []) {
     if (Boolean(c.isRevival) === Boolean(card.isRevival)) {
@@ -1520,7 +1757,76 @@ export function classifyDiscoveredCard(
   }
 
   const ranked = Array.from(candidateScores.values()).sort((a, b) => b.score - a.score);
-  if (ranked.length === 0) {
+  const top = ranked[0];
+  const second = ranked[1];
+
+  // Check if this card already matches an existing DB record cleanly BEFORE evaluating scan-internal duplicate noise
+  const buildMatchedOrDeltaResult = (matched: { card: BattleSpiritsCard; signals: string[]; score: number }) => {
+    const deltas: string[] = [];
+    if (!matched.card.jpName?.trim() && card.jpName?.trim()) deltas.push('jpName');
+    if (!matched.card.illustrator?.trim() && card.illustrator?.trim()) deltas.push('illustrator');
+    if (!matched.card.flavorText?.trim() && card.flavorText?.trim()) deltas.push('flavorText');
+    if (
+      (!matched.card.effects || matched.card.effects.length === 0) &&
+      card.effects &&
+      card.effects.length > 0 &&
+      card.effects[0]?.text !== 'No English effect text listed on this card.'
+    ) {
+      deltas.push('effects');
+    }
+    if ((!matched.card.families || matched.card.families.length === 0) && card.families?.length > 0) {
+      deltas.push('families');
+    }
+    if ((matched.card.cost === 0 || matched.card.cost === undefined) && card.cost > 0) {
+      deltas.push('cost');
+    }
+
+    return {
+      classification: (deltas.length > 0 ? 'updated_metadata' : 'matched') as ComparisonClassification,
+      matchedExistingId: matched.card.id,
+      matchSignals: matched.signals,
+      matchConfidence: Math.min(100, matched.score),
+      metadataDeltas: deltas,
+    };
+  };
+
+  if (top) {
+    const hasStrongNumber = top.signals.includes('cardNumber');
+    const hasNameConfirmation =
+      top.signals.includes('officialName') ||
+      top.signals.includes('wikiTitle') ||
+      top.signals.includes('jpName') ||
+      top.signals.includes('alternateName') ||
+      normalizeSetCode(top.card.setCode || '') === normSetKey;
+
+    if (hasStrongNumber && hasNameConfirmation) {
+      return buildMatchedOrDeltaResult(top);
+    }
+
+    // Archive / virtual category entries that couldn't extract a set number still match existing DB cards on strong name+jp/wikiTitle+revival
+    if (
+      syntheticNumber &&
+      Boolean(top.card.isRevival) === Boolean(card.isRevival) &&
+      top.signals.includes('officialName') &&
+      (top.signals.includes('jpName') || top.signals.includes('wikiTitle')) &&
+      top.score >= 70
+    ) {
+      return buildMatchedOrDeltaResult(top);
+    }
+  }
+
+  // Scoped scan-internal duplicate detection (exact same setCode + cardNumber + revival + wikiTitle)
+  const dupSignature = buildDiscoveryScanDupSignature(entry);
+  if ((seenDiscoveryKeysInSet.get(dupSignature) || 0) > 1) {
+    return {
+      classification: 'potential_duplicate',
+      matchSignals: ['duplicate_card_number_in_scan'],
+      matchConfidence: 50,
+      metadataDeltas: [],
+    };
+  }
+
+  if (!top) {
     return {
       classification: 'missing',
       matchSignals: [],
@@ -1529,10 +1835,48 @@ export function classifyDiscoveredCard(
     };
   }
 
-  const top = ranked[0];
-  const second = ranked[1];
+  const hasStrongNumber = top.signals.includes('cardNumber');
+  const hasSameVersionNumberMatchInSet = numKeys.some((k) =>
+    (index.byNumber.get(k) || []).some((c) => {
+      if (Boolean(c.isRevival) !== Boolean(card.isRevival)) return false;
+      const cSetNorm = normalizeSetCode(c.setCode || '');
+      return !cSetNorm || !normSetKey || cSetNorm === normSetKey || isEquivalentCollectionPair(normSetKey, cSetNorm, c);
+    })
+  );
 
-  // Multiple existing cards with nearly tied non-exact scores -> potential_duplicate
+  // Distinct Revival vs Original counterpart (including reprints that share the exact same cardNumber, e.g. BS12-X01 vs BS12-X01 (Revival))
+  if (
+    !hasStrongNumber &&
+    !hasSameVersionNumberMatchInSet &&
+    Boolean(top.card.isRevival) !== Boolean(card.isRevival) &&
+    (top.signals.includes('officialName_version_mismatch') || top.signals.includes('cardNumber_version_mismatch'))
+  ) {
+    return {
+      classification: 'missing',
+      matchSignals: [],
+      matchConfidence: 0,
+      metadataDeltas: [],
+    };
+  }
+
+  // Distinct printing / reprint in a different canonical set with its own non-synthetic cardNumber
+  // (e.g. PX01 vs RPX26-01, BS60-CP03 vs SD01-039, BS62-CP02 vs BS12-X04, 26RBS01 vs BS01, BS78-002 vs BS01-002)
+  // Same-set name collisions with different card numbers intentionally remain flagged for review.
+  if (!syntheticNumber && !hasStrongNumber && !hasSameVersionNumberMatchInSet) {
+    const topSetNorm = normalizeSetCode(top.card.setCode || '');
+    const distinctSet =
+      Boolean(topSetNorm && normSetKey && topSetNorm !== normSetKey && !isEquivalentCollectionPair(normSetKey, topSetNorm, top.card));
+    if (distinctSet) {
+      return {
+        classification: 'missing',
+        matchSignals: [],
+        matchConfidence: 0,
+        metadataDeltas: [],
+      };
+    }
+  }
+
+  // Multiple existing cards in the SAME set/series with nearly tied non-exact scores -> potential_duplicate
   if (
     second &&
     Math.abs(top.score - second.score) <= 10 &&
@@ -1548,92 +1892,21 @@ export function classifyDiscoveredCard(
     };
   }
 
-  // Partial or ambiguous match (e.g., same cardNumber without name confirmation OR same name in different set without cardNumber match)
-  const hasStrongNumber = top.signals.includes('cardNumber');
-  const hasAnyNumberMatchInSet = (index.byNumber.get(numKey) || []).some((c) => {
-    const cSetNorm = normalizeSetCode(c.setCode || '');
-    return !cSetNorm || !normSetKey || cSetNorm === normSetKey || isPromoSetPair(cSetNorm, normSetKey);
-  });
-
-  if (!(hasStrongNumber && (
-    top.signals.includes('officialName') ||
-    top.signals.includes('wikiTitle') ||
-    top.signals.includes('jpName') ||
-    top.signals.includes('alternateName') ||
-    normalizeSetCode(top.card.setCode || '') === normSetKey
-  ))) {
-    // Distinct Revival vs Original counterpart (or cross-set reprint whose cardNumber is not in this set)
-    if (
-      !hasStrongNumber &&
-      !hasAnyNumberMatchInSet &&
-      Boolean(top.card.isRevival) !== Boolean(card.isRevival) &&
-      top.signals.includes('officialName_version_mismatch')
-    ) {
-      return {
-        classification: 'missing',
-        matchSignals: [],
-        matchConfidence: 0,
-        metadataDeltas: [],
-      };
-    }
-
-    // Cross-set exact cardNumber reprint not yet in this scanned set (e.g. BS67-XV04 in BS70)
-    const crossSetNumberMatch = (index.byNumber.get(numKey) || []).some((c) => {
-      const cSetNorm = normalizeSetCode(c.setCode || '');
-      return Boolean(cSetNorm && normSetKey && cSetNorm !== normSetKey && !isPromoSetPair(cSetNorm, normSetKey));
-    });
-    if (!hasStrongNumber && !hasAnyNumberMatchInSet && crossSetNumberMatch) {
-      return {
-        classification: 'missing',
-        matchSignals: [],
-        matchConfidence: 0,
-        metadataDeltas: [],
-      };
-    }
-
-    if (hasStrongNumber || top.score >= 30) {
-      return {
-        classification: 'uncertain',
-        matchedExistingId: top.card.id,
-        matchSignals: top.signals,
-        matchConfidence: Math.min(95, top.score),
-        metadataDeltas: [],
-      };
-    }
+  if (hasStrongNumber || top.score >= 30) {
     return {
-      classification: 'missing',
-      matchSignals: [],
-      matchConfidence: 0,
+      classification: 'uncertain',
+      matchedExistingId: top.card.id,
+      matchSignals: top.signals,
+      matchConfidence: Math.min(95, top.score),
       metadataDeltas: [],
     };
   }
 
-  // Matched existing card: detect non-destructive metadata enrichments
-  const deltas: string[] = [];
-  if (!top.card.jpName?.trim() && card.jpName?.trim()) deltas.push('jpName');
-  if (!top.card.illustrator?.trim() && card.illustrator?.trim()) deltas.push('illustrator');
-  if (!top.card.flavorText?.trim() && card.flavorText?.trim()) deltas.push('flavorText');
-  if (
-    (!top.card.effects || top.card.effects.length === 0) &&
-    card.effects &&
-    card.effects.length > 0 &&
-    card.effects[0]?.text !== 'No English effect text listed on this card.'
-  ) {
-    deltas.push('effects');
-  }
-  if ((!top.card.families || top.card.families.length === 0) && card.families?.length > 0) {
-    deltas.push('families');
-  }
-  if ((top.card.cost === 0 || top.card.cost === undefined) && card.cost > 0) {
-    deltas.push('cost');
-  }
-
   return {
-    classification: deltas.length > 0 ? 'updated_metadata' : 'matched',
-    matchedExistingId: top.card.id,
-    matchSignals: top.signals,
-    matchConfidence: Math.min(100, top.score),
-    metadataDeltas: deltas,
+    classification: 'missing',
+    matchSignals: [],
+    matchConfidence: 0,
+    metadataDeltas: [],
   };
 }
 
@@ -1651,7 +1924,7 @@ export function compareCatalogWithWiki(deps?: CatalogDependencies): {
 
   const dupCounts = new Map<string, number>();
   for (const entry of Object.values(state.discoveredCards)) {
-    const sig = `${normalizeCardNumForCompare(entry.card.cardNumber)}|${Boolean(entry.card.isRevival)}`;
+    const sig = buildDiscoveryScanDupSignature(entry);
     dupCounts.set(sig, (dupCounts.get(sig) || 0) + 1);
   }
 
@@ -1774,12 +2047,21 @@ export async function scanWikiSetByCode(
 
     if (setRec.categorySweepTitles && setRec.categorySweepTitles.length > 0) {
       for (const title of setRec.categorySweepTitles) {
-        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        const titleHash = crypto
+          .createHash('sha1')
+          .update(`${canonicalCode}|${title}`)
+          .digest('hex')
+          .slice(0, 8)
+          .toUpperCase();
         const isRev = /\(revival\)/i.test(title);
+        const safeId = sanitizeCatalogDocumentId(
+          `${canonicalCode}-${title}${isRev ? '-rv' : ''}`,
+          `${canonicalCode}-${titleHash}`
+        );
         addRaw(
           {
-            id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
-            cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
+            id: safeId,
+            cardNumber: `${canonicalCode}-CAT-${titleHash}`,
             name: title.replace(/\s*\([^)]+\)\s*$/, ''),
             jpName: '',
             color: setRec.colors?.[0] || 'Red',
@@ -1882,11 +2164,20 @@ export async function scanWikiSetByCode(
           try {
             const catMembers = await fetchPaginatedCategoryMembers(catName, fetchFn, '0');
             for (const title of catMembers) {
-              const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              const titleHash = crypto
+                .createHash('sha1')
+                .update(`${canonicalCode}|${title}`)
+                .digest('hex')
+                .slice(0, 8)
+                .toUpperCase();
               const isRev = canonicalCode === 'REVIVAL' || /\(revival\)/i.test(title);
+              const safeId = sanitizeCatalogDocumentId(
+                `${canonicalCode}-${title}${isRev ? '-rv' : ''}`,
+                `${canonicalCode}-${titleHash}`
+              );
               const fallbackCard: BattleSpiritsCard = {
-                id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
-                cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
+                id: safeId,
+                cardNumber: `${canonicalCode}-CAT-${titleHash}`,
                 name: title.replace(/\s*\([^)]+\)\s*$/, ''),
                 jpName: '',
                 color: setRec.colors?.[0] || 'Red',
@@ -1959,43 +2250,66 @@ export async function scanWikiSetByCode(
             bundle.pageImages || []
           );
           const blocks = extractTaggedCardTableBlocks(bundle.wikitext);
-          if (blocks[0]) {
-            const fields = parseTemplateFields(blocks[0].block);
+          const chosenBlock =
+            (hydrated.isRevival ? blocks.find((b) => b.isRevival) : blocks.find((b) => !b.isRevival)) ||
+            blocks[0];
+          if (chosenBlock) {
+            const fields = parseTemplateFields(chosenBlock.block);
             const rawImg = cleanWikitextInline(fields.image || '').trim();
             if (rawImg && /\.(?:png|jpe?g|webp|gif)/i.test(rawImg)) {
               rawArtFile = rawImg;
             }
-            const fieldCardNum = cleanWikitextInline(
+            const explicitFieldNum = cleanWikitextInline(
               fields.cardnum || fields.number || fields.cardno || fields.cardnumber || fields.num || ''
             )
               .replace(/\s+/g, '')
               .trim();
-            const isSyntheticNum =
-              setRec.categorySweepTitles?.length ||
-              !hydrated.cardNumber ||
-              hydrated.cardNumber.startsWith(`${canonicalCode}-`) && hydrated.cardNumber.includes('ARCHIVE');
-            if (fieldCardNum && (isSyntheticNum || hydrated.cardNumber === 'WIKI')) {
-              const cleanedNum = fieldCardNum.toUpperCase();
-              const subSet = resolvePromoSubSeriesSetCode(
+            const imageDerivedNum =
+              extractCardNumberFromImageField(fields.image) ||
+              extractCardNumberFromImageField(fields.bimage) ||
+              (bundle.pageImages || [])
+                .map((p) => extractCardNumberFromImageField(p))
+                .find((n): n is string => Boolean(n)) ||
+              '';
+            const extractedCardNum = explicitFieldNum || imageDerivedNum;
+            const hasSyntheticNum =
+              Boolean(setRec.categorySweepTitles?.length) || isSyntheticCardNumber(hydrated.cardNumber);
+
+            const rawRarityField = fields.rarity1 || fields.rarity || '';
+            const nextRarity = rawRarityField
+              ? normalizeRarity(cleanWikitextInline(rawRarityField))
+              : hydrated.rarity;
+
+            if (extractedCardNum && hasSyntheticNum) {
+              const cleanedNum = normalizeCardNumForCompare(extractedCardNum);
+              const subSet = inferCanonicalSetCodeFromCardNumber(
                 cleanedNum,
-                cleanWikitextInline(fields.set1 || fields.set || ''),
-                hydrated.setCode || canonicalCode
+                hydrated.setCode || canonicalCode,
+                cleanWikitextInline(fields.set1 || fields.set || '')
               );
-              const nextRarity = fields.rarity
-                ? normalizeRarity(cleanWikitextInline(fields.rarity))
-                : hydrated.rarity;
-              const slug = cleanedNum.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              const finalSet = subSet || hydrated.setCode || canonicalCode;
               hydrated = {
                 ...hydrated,
                 cardNumber: cleanedNum,
                 rarity: nextRarity,
-                setCode: subSet || hydrated.setCode,
-                id: `${(subSet || hydrated.setCode).toLowerCase()}-${slug}${hydrated.isRevival ? '-rv' : ''}`,
+                setCode: finalSet,
+                id: sanitizeCatalogDocumentId(
+                  `${finalSet}-${cleanedNum}${hydrated.isRevival ? '-rv' : ''}`,
+                  `${finalSet}-${cleanedNum}`
+                ),
               };
-            } else if (fields.rarity) {
+            } else {
+              const fallbackSet = hasSyntheticNum
+                ? inferCanonicalSetCodeFromCardNumber(
+                    hydrated.cardNumber,
+                    hydrated.setCode || canonicalCode,
+                    cleanWikitextInline(fields.set1 || fields.set || '')
+                  )
+                : normalizeSetCode(hydrated.setCode || canonicalCode) || canonicalCode;
               hydrated = {
                 ...hydrated,
-                rarity: normalizeRarity(cleanWikitextInline(fields.rarity)),
+                rarity: nextRarity,
+                setCode: fallbackSet,
               };
             }
             for (const altKey of ['altname', 'alt', 'othername', 'engname', 'name']) {
@@ -2017,39 +2331,61 @@ export async function scanWikiSetByCode(
         hydrated = { ...hydrated, name: hydrated.jpName.trim() };
       }
 
-      // If this scan came from a virtual category-archive sweep or umbrella promo hub, route the card cleanly to its canonical sub-series setCode
+      // Normalize setCode and guarantee Firestore-safe deterministic ID
+      const normalizedHydratedSet = normalizeSetCode(hydrated.setCode || canonicalCode) || canonicalCode;
+      hydrated = {
+        ...hydrated,
+        setCode: normalizedHydratedSet,
+        id: sanitizeCatalogDocumentId(
+          hydrated.id || `${normalizedHydratedSet}-${hydrated.cardNumber}${hydrated.isRevival ? '-rv' : ''}`,
+          `${normalizedHydratedSet}-${hydrated.wikiTitle || hydrated.name}`
+        ),
+      };
+
+      // If this scan came from a virtual category-archive sweep or umbrella promo hub, route the card cleanly to its canonical setCode
       let effectiveSourceSet = canonicalCode;
-      if (setRec.categorySweepTitles?.length || isUmbrellaPromoHub) {
-        const subSet = resolvePromoSubSeriesSetCode(
+      const isVirtualArchive =
+        Boolean(setRec.categorySweepTitles?.length) ||
+        isUmbrellaPromoHub ||
+        canonicalCode === 'TOKENS' ||
+        canonicalCode === 'REVIVAL';
+      if (isVirtualArchive) {
+        const subSet = inferCanonicalSetCodeFromCardNumber(
           hydrated.cardNumber,
-          hydrated.setCode,
-          hydrated.setCode || canonicalCode
+          hydrated.setCode || canonicalCode,
+          hydrated.setCode
         );
-        if (subSet && subSet !== canonicalCode && !subSet.endsWith('-ARCHIVE')) {
+        if (
+          subSet &&
+          subSet !== canonicalCode &&
+          !subSet.endsWith('-ARCHIVE') &&
+          !GENERIC_PROMO_HUB_CODES.has(subSet)
+        ) {
           effectiveSourceSet = normalizeSetCode(subSet) || subSet;
           if (!state.sets[effectiveSourceSet]) {
+            const inferredMeta = inferSetCategoryAndFormats('', effectiveSourceSet, effectiveSourceSet);
             state.sets[effectiveSourceSet] = {
               setCode: effectiveSourceSet,
               wikiTitle: setRec.wikiTitle || effectiveSourceSet,
-              category: 'Promo',
+              category: inferredMeta.category,
               name: effectiveSourceSet,
               jpName: '',
-              productType: 'Promo Set',
+              productType: inferredMeta.productType,
               releaseDate: hydrated.formats?.includes('Standard') ? '2026+' : 'All Eras',
-              formats: hydrated.formats?.length ? hydrated.formats : ['Eternal'],
-              blockLabel: hydrated.formats?.includes('Standard') ? 'Standard Promo' : 'Eternal Promo',
+              formats: hydrated.formats?.length ? hydrated.formats : inferredMeta.formats,
+              blockLabel: inferredMeta.blockLabel,
               tagline: `${effectiveSourceSet} — Discovered from Battle Spirits Wiki.`,
-              featuredCardId: `${effectiveSourceSet.toLowerCase()}-01`,
+              featuredCardId: `${effectiveSourceSet.toLowerCase()}-001`,
               colors: ALL_COLORS,
               totalCardsInSet: 0,
               wikiUrl: `${WIKI_BASE}${encodeURIComponent(setRec.wikiTitle || effectiveSourceSet)}`,
               sources: [setRec.wikiTitle || `hub:${canonicalCode}`],
               sourceCollectionType: classifySetSourceCollection({
                 setCode: effectiveSourceSet,
-                category: 'Promo',
+                category: inferredMeta.category,
                 wikiTitle: setRec.wikiTitle,
               }),
-              isNumberOnly: false,
+              isNumberOnly: isNumberOnlySetIdentifier(effectiveSourceSet, effectiveSourceSet),
               inSpiritsdex: false,
               scanStatus: 'completed',
               lastScanAt: new Date().toISOString(),
@@ -2094,7 +2430,7 @@ export async function scanWikiSetByCode(
       }
 
       const incompleteFields = evaluateIncompleteMetadata(hydrated, rawArtFile);
-      const discoveryKey = `${effectiveSourceSet}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${(hydrated.wikiTitle || hydrated.name).toLowerCase().replace(/[^a-z0-9\p{L}\p{N}]+/gu, '-')}`;
+      const discoveryKey = `${effectiveSourceSet}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${sanitizeCatalogDocumentId(hydrated.wikiTitle || hydrated.name, hydrated.cardNumber, 64)}`;
       const existingEntry = state.discoveredCards[discoveryKey];
 
       state.discoveredCards[discoveryKey] = {
@@ -2369,12 +2705,14 @@ export function validateCatalogImport(
   let skippedUncertain = 0;
   let skippedDuplicates = 0;
   let skippedAlreadyImported = 0;
+  let confirmedDuplicatesCount = 0;
   let skippedInvalid = 0;
   let manualMappingsProtected = 0;
 
   for (const entry of candidates) {
     if (entry.imported) {
       skippedAlreadyImported++;
+      confirmedDuplicatesCount++;
       continue;
     }
 
@@ -2382,7 +2720,13 @@ export function validateCatalogImport(
     const hasManualMapping = Boolean(getManualWikiMapping(entry.card));
     if (hasManualMapping) manualMappingsProtected++;
 
-    const buildRejection = (reason: string, missingFields: string[] = []): RejectedCatalogCard => ({
+    const buildRejection = (
+      reason: string,
+      diagnosticCategory: RejectionDiagnosticCategory,
+      recoverable: boolean,
+      recommendedAction: string,
+      missingFields: string[] = []
+    ): RejectedCatalogCard => ({
       discoveryKey: entry.discoveryKey,
       cardNumber: entry.card.cardNumber,
       name: entry.card.name,
@@ -2390,16 +2734,32 @@ export function validateCatalogImport(
       originalSetCode: entry.originalSetCode || entry.sourceSetCode,
       normalizedSetCode: normalizeSetCode(entry.card.setCode || entry.sourceSetCode),
       reason,
+      diagnosticCategory,
+      recoverable,
+      recommendedAction,
       missingFields,
       duplicateMatch: entry.matchedExistingId,
       classification: entry.classification,
     });
 
+    if (entry.classification === 'matched') {
+      confirmedDuplicatesCount++;
+      if (!explicitListProvided && !entry.approvedForImport) {
+        continue;
+      }
+    }
+
     if (entry.classification === 'potential_duplicate' && !entry.approvedForImport) {
       skippedDuplicates++;
+      const hasMatchedExisting = Boolean(entry.matchedExistingId);
       rejectedCards.push(
         buildRejection(
-          `Potential duplicate (${entry.matchSignals.join(', ') || 'ambiguous match'}) — approve in Review Queue to force import`
+          `Potential duplicate (${entry.matchSignals.join(', ') || 'ambiguous match'})`,
+          hasMatchedExisting ? 'confirmed_duplicate' : 'insufficient_identifying_info',
+          true,
+          hasMatchedExisting
+            ? 'Already matches existing card candidate; approve in Review Queue only if this is a distinct printing.'
+            : 'Review duplicate card number collision in Review Queue and approve or reprocess with updated rules.'
         )
       );
       continue;
@@ -2408,24 +2768,58 @@ export function validateCatalogImport(
       skippedUncertain++;
       rejectedCards.push(
         buildRejection(
-          `Uncertain match (${entry.matchSignals.join(', ') || 'name collision'}, confidence ${entry.matchConfidence}%) — approve in Review Queue to import`
+          `Uncertain match (${entry.matchSignals.join(', ') || 'name collision'}, confidence ${entry.matchConfidence}%)`,
+          'insufficient_identifying_info',
+          true,
+          'Verify identity in Review Queue and approve to import, or click Reprocess Recoverable Cards.'
         )
       );
       continue;
     }
 
+    const checkEntrySafety = (): RejectedCatalogCard | null => {
+      const missingReq: string[] = [];
+      if (!entry.card.id?.trim()) missingReq.push('id');
+      if (!entry.card.cardNumber?.trim()) missingReq.push('cardNumber');
+      if (!entry.card.name?.trim() && !entry.card.jpName?.trim()) missingReq.push('name');
+      if (!entry.card.setCode?.trim()) missingReq.push('setCode');
+      if (missingReq.length > 0) {
+        return buildRejection(
+          `Missing required identifier field(s): ${missingReq.join(', ')}`,
+          'insufficient_identifying_info',
+          false,
+          'Verify card page on Battle Spirits Wiki has name, card number, and set.',
+          missingReq
+        );
+      }
+
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(entry.card.id)) {
+        return buildRejection(
+          `Unsupported or unsafe document ID "${entry.card.id}"`,
+          'unsupported_identifier',
+          true,
+          'Click Reprocess & Retry Recoverable Cards to regenerate a normalized document ID.'
+        );
+      }
+
+      if (entry.card.name.trim().length > 160) {
+        return buildRejection(
+          'Card name exceeds maximum allowed length (160 chars)',
+          'invalid_or_unsafe',
+          true,
+          'Reprocess to sanitize oversized title metadata.'
+        );
+      }
+      return null;
+    };
+
     if (entry.classification === 'missing') {
       if (!includeMissing && !explicitListProvided && !entry.approvedForImport) continue;
-      const missingReq: string[] = [];
-      if (!entry.card.id) missingReq.push('id');
-      if (!entry.card.cardNumber) missingReq.push('cardNumber');
-      if (!entry.card.name) missingReq.push('name');
-      if (!entry.card.setCode) missingReq.push('setCode');
-      if (missingReq.length > 0) {
+      const rejection = checkEntrySafety();
+      if (rejection) {
         skippedInvalid++;
-        const msg = `Skipped invalid card missing required identifier(s) [${missingReq.join(', ')}]: ${entry.discoveryKey}`;
-        warnings.push(msg);
-        rejectedCards.push(buildRejection('Missing required identifier fields', missingReq));
+        warnings.push(`${rejection.reason}: ${entry.discoveryKey}`);
+        rejectedCards.push(rejection);
         continue;
       }
       willAddCards++;
@@ -2438,6 +2832,13 @@ export function validateCatalogImport(
         selectedSetCodes.add(entry.sourceSetCode);
       }
     } else if (entry.approvedForImport) {
+      const rejection = checkEntrySafety();
+      if (rejection) {
+        skippedInvalid++;
+        warnings.push(`${rejection.reason}: ${entry.discoveryKey}`);
+        rejectedCards.push(rejection);
+        continue;
+      }
       willAddCards++;
       selectedKeys.push(entry.discoveryKey);
       selectedSetCodes.add(entry.sourceSetCode);
@@ -2458,6 +2859,7 @@ export function validateCatalogImport(
     skippedUncertain,
     skippedDuplicates,
     skippedAlreadyImported,
+    confirmedDuplicatesCount,
     skippedInvalid,
     manualMappingsProtected,
     warnings,
@@ -2489,7 +2891,7 @@ export function executeCatalogImport(
   let updatedMetadataCount = 0;
   const importedCards: BattleSpiritsCard[] = [];
   const importedSets: ProductSet[] = [];
-  const failedImports: Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }> = [];
+  const failedImports: FailedImportRecord[] = [];
   const touchedSets = new Set<string>();
   const nowIso = new Date().toISOString();
 
@@ -2499,14 +2901,21 @@ export function executeCatalogImport(
 
     // Protect existing verified records & manual mappings
     const manual = getManualWikiMapping(entry.card);
-    if (entry.classification === 'updated_metadata' && entry.matchedExistingId) {
-      const targetExisting = existingById.get(entry.matchedExistingId) || state.importedCards[entry.matchedExistingId];
+    if (
+      (entry.classification === 'updated_metadata' || entry.classification === 'matched') &&
+      entry.matchedExistingId
+    ) {
+      const targetExisting =
+        existingById.get(entry.matchedExistingId) || state.importedCards[entry.matchedExistingId];
       if (!targetExisting) {
         failedImports.push({
           discoveryKey: entry.discoveryKey,
           cardNumber: entry.card.cardNumber,
           name: entry.card.name,
           reason: `Matched card "${entry.matchedExistingId}" was not found for enrichment`,
+          diagnosticCategory: 'database_write_failure',
+          recoverable: true,
+          recommendedAction: 'Reprocess catalog entries and retry import.',
         });
         continue;
       }
@@ -2521,7 +2930,9 @@ export function executeCatalogImport(
           targetExisting.effects?.length > 0 ? targetExisting.effects : entry.card.effects || [],
         cost: targetExisting.cost > 0 ? targetExisting.cost : entry.card.cost ?? 0,
         // Always preserve manual mapping artwork or existing verified artwork
-        artworkImage: manual ? targetExisting.artworkImage : targetExisting.artworkImage || entry.card.artworkImage,
+        artworkImage: manual
+          ? targetExisting.artworkImage
+          : targetExisting.artworkImage || entry.card.artworkImage,
         wikiTitle: manual?.wikiTitle || targetExisting.wikiTitle || entry.card.wikiTitle,
       };
       state.importedCards[enriched.id] = enriched;
@@ -2529,10 +2940,18 @@ export function executeCatalogImport(
       importedCards.push(enriched);
       updatedMetadataCount++;
     } else {
-      // Safe insert missing card without overwriting existing id
-      let candidateId = entry.card.id;
-      if (existingById.has(candidateId) && entry.classification !== 'matched') {
-        candidateId = `${candidateId}-${crypto.createHash('sha1').update(entry.discoveryKey).digest('hex').slice(0, 6)}`;
+      // Safe insert missing/approved card with guaranteed unique Firestore-safe ID
+      let candidateId = sanitizeCatalogDocumentId(
+        entry.card.id || `${entry.card.setCode}-${entry.card.cardNumber}`,
+        entry.discoveryKey
+      );
+      if (existingById.has(candidateId) || state.importedCards[candidateId]) {
+        const suffix = crypto
+          .createHash('sha1')
+          .update(entry.discoveryKey)
+          .digest('hex')
+          .slice(0, 6);
+        candidateId = sanitizeCatalogDocumentId(`${candidateId}-${suffix}`, entry.discoveryKey);
       }
       if (existingById.has(candidateId) || state.importedCards[candidateId]) {
         failedImports.push({
@@ -2540,12 +2959,18 @@ export function executeCatalogImport(
           cardNumber: entry.card.cardNumber,
           name: entry.card.name,
           reason: `ID collision on "${candidateId}" prevented safe non-destructive insert`,
+          diagnosticCategory: 'confirmed_duplicate',
+          recoverable: true,
+          recommendedAction: 'Reprocess catalog state to assign a unique variant ID or skip if already present.',
         });
         continue;
       }
       const finalCard: BattleSpiritsCard = {
         ...entry.card,
         id: candidateId,
+        name: (entry.card.name || entry.card.jpName || entry.card.cardNumber).trim().slice(0, 160),
+        setCode: normalizeSetCode(entry.card.setCode || entry.sourceSetCode) || entry.sourceSetCode,
+        rarity: (entry.card.rarity || 'C').slice(0, 16) as BattleSpiritsCard['rarity'],
         wikiTitle: manual?.wikiTitle || entry.card.wikiTitle,
       };
       state.importedCards[finalCard.id] = finalCard;
@@ -2559,7 +2984,7 @@ export function executeCatalogImport(
     entry.classification = 'matched';
     touchedSets.add(entry.sourceSetCode);
     if (entry.card.setCode) {
-      touchedSets.add(entry.card.setCode.trim().toUpperCase());
+      touchedSets.add(normalizeSetCode(entry.card.setCode) || entry.card.setCode.trim().toUpperCase());
     }
   }
 
@@ -2584,11 +3009,263 @@ export function executeCatalogImport(
       validation.skippedDuplicates +
       validation.skippedAlreadyImported +
       validation.skippedInvalid,
+    confirmedDuplicatesCount: validation.confirmedDuplicatesCount,
     importedCards,
     importedSets,
     rejectedCards: validation.rejectedCards,
     failedImports,
   };
+}
+
+/**
+ * Re-normalizes and re-validates all cached discovered cards & sets using updated rules
+ * without requiring a full Wiki re-scan, recovering stale rejections and optionally importing ready cards.
+ */
+export function reprocessCachedCatalogEntries(
+  options?: {
+    setCodes?: string[];
+    autoImport?: boolean;
+  },
+  deps?: CatalogDependencies
+): {
+  reprocessedCount: number;
+  recoveredToReadyCount: number;
+  confirmedDuplicatesCount: number;
+  validation: ImportValidationReport;
+  importResult: ImportExecutionResult | null;
+  overview: CatalogOverviewSummary;
+} {
+  const state = getActiveCatalogState(deps?.stateFilePath);
+  const scopedSetCodes = options?.setCodes?.length
+    ? new Set(options.setCodes.map((s) => normalizeSetCode(s)))
+    : null;
+
+  const beforeValidation = validateCatalogImport({ setCodes: options?.setCodes }, deps);
+  const beforeRejectedCount = beforeValidation.rejectedCards.length;
+
+  let reprocessedCount = 0;
+  const keysToMove: Array<{ oldKey: string; newKey: string; entry: DiscoveredCardEntry }> = [];
+
+  for (const [oldKey, entry] of Object.entries(state.discoveredCards)) {
+    if (scopedSetCodes && !scopedSetCodes.has(normalizeSetCode(entry.sourceSetCode))) {
+      continue;
+    }
+    reprocessedCount++;
+
+    const normSet =
+      normalizeSetCode(entry.card.setCode || entry.sourceSetCode) || entry.sourceSetCode;
+    let nextCardNum = normalizeCardNumForCompare(entry.card.cardNumber);
+
+    // Try recovering real card number from rawArtworkFile / image hint if still synthetic
+    if (isSyntheticCardNumber(nextCardNum) && entry.rawArtworkFile) {
+      const recoveredNum = extractCardNumberFromImageField(entry.rawArtworkFile);
+      if (recoveredNum) {
+        nextCardNum = normalizeCardNumForCompare(recoveredNum);
+      }
+    }
+
+    const routedSet = isSyntheticCardNumber(nextCardNum)
+      ? normSet
+      : inferCanonicalSetCodeFromCardNumber(nextCardNum, normSet, entry.card.setCode);
+
+    const safeName = (entry.card.name || entry.card.jpName || entry.sourceWikiTitle || nextCardNum)
+      .trim()
+      .slice(0, 160);
+    const wasSyntheticBefore = isSyntheticCardNumber(entry.card.cardNumber);
+    const isNowCanonicalNum = Boolean(nextCardNum && !isSyntheticCardNumber(nextCardNum));
+
+    const effectiveSet =
+      routedSet &&
+      !routedSet.endsWith('-ARCHIVE') &&
+      !GENERIC_PROMO_HUB_CODES.has(routedSet) &&
+      (entry.sourceSetCode.endsWith('-ARCHIVE') ||
+        entry.sourceSetCode === 'REVIVAL' ||
+        entry.sourceSetCode === 'TOKENS' ||
+        GENERIC_PROMO_HUB_CODES.has(entry.sourceSetCode))
+        ? routedSet
+        : normSet;
+
+    const safeId = sanitizeCatalogDocumentId(
+      !(wasSyntheticBefore && isNowCanonicalNum) &&
+        entry.card.id &&
+        /^[a-zA-Z0-9_-]{1,128}$/.test(entry.card.id)
+        ? entry.card.id
+        : `${effectiveSet}-${nextCardNum}${entry.card.isRevival ? '-rv' : ''}`,
+      `${effectiveSet}-${safeName}`
+    );
+
+    if (!state.sets[effectiveSet]) {
+      const meta = inferSetCategoryAndFormats('', effectiveSet, effectiveSet);
+      state.sets[effectiveSet] = {
+        setCode: effectiveSet,
+        wikiTitle: effectiveSet,
+        category: meta.category,
+        name: effectiveSet,
+        jpName: '',
+        productType: meta.productType,
+        releaseDate: entry.card.formats?.includes('Standard') ? '2026+' : 'All Eras',
+        formats: entry.card.formats?.length ? entry.card.formats : meta.formats,
+        blockLabel: meta.blockLabel,
+        tagline: `${effectiveSet} — Recovered during catalog reprocessing.`,
+        featuredCardId: `${effectiveSet.toLowerCase()}-001`,
+        colors: ALL_COLORS,
+        totalCardsInSet: 0,
+        wikiUrl: `${WIKI_BASE}${encodeURIComponent(effectiveSet)}`,
+        sources: ['reprocess'],
+        sourceCollectionType: classifySetSourceCollection({
+          setCode: effectiveSet,
+          category: meta.category,
+        }),
+        isNumberOnly: isNumberOnlySetIdentifier(effectiveSet, effectiveSet),
+        inSpiritsdex: false,
+        scanStatus: 'completed',
+        lastScanAt: new Date().toISOString(),
+        lastError: null,
+        discoveredCount: 0,
+        existingCount: 0,
+        missingCount: 0,
+        updatedCount: 0,
+        uncertainCount: 0,
+        duplicateCount: 0,
+        incompleteCount: 0,
+        missingArtworkCount: 0,
+      };
+      upsertStoredSetMetadata(state.sets[effectiveSet]);
+    }
+
+    entry.sourceSetCode = effectiveSet;
+    entry.card = {
+      ...entry.card,
+      id: safeId,
+      cardNumber: nextCardNum || `${effectiveSet}-CAT-${crypto.createHash('sha1').update(oldKey).digest('hex').slice(0, 8).toUpperCase()}`,
+      name: safeName,
+      setCode: effectiveSet,
+      setName: state.sets[effectiveSet]?.name || entry.card.setName || effectiveSet,
+      rarity: (entry.card.rarity || 'C').slice(0, 16) as BattleSpiritsCard['rarity'],
+    };
+    entry.incompleteFields = evaluateIncompleteMetadata(entry.card, entry.rawArtworkFile);
+
+    const newKey = `${effectiveSet}::${normalizeCardNumForCompare(entry.card.cardNumber)}::${entry.card.isRevival ? 'rv' : 'orig'}::${sanitizeCatalogDocumentId(entry.card.wikiTitle || entry.card.name, entry.card.cardNumber, 64)}`;
+    if (newKey !== oldKey) {
+      keysToMove.push({ oldKey, newKey, entry });
+    }
+  }
+
+  for (const { oldKey, newKey, entry } of keysToMove) {
+    if (!state.discoveredCards[newKey]) {
+      entry.discoveryKey = newKey;
+      state.discoveredCards[newKey] = entry;
+      delete state.discoveredCards[oldKey];
+    } else if (!entry.imported) {
+      delete state.discoveredCards[oldKey];
+    }
+  }
+
+  // Clear stale error logs that only reflect previously recoverable parse/import warnings
+  state.errorLogs = state.errorLogs.filter(
+    (log) => !/ID collision|Missing required identifier|stale/i.test(log.message)
+  );
+  saveCatalogScanState(state, deps?.stateFilePath);
+
+  compareCatalogWithWiki(deps);
+  const afterValidation = validateCatalogImport({ setCodes: options?.setCodes }, deps);
+  const importResult = options?.autoImport
+    ? executeCatalogImport({ setCodes: options?.setCodes }, deps)
+    : null;
+
+  const overview = getCatalogOverview(deps);
+  const recoveredToReadyCount = Math.max(0, beforeRejectedCount - afterValidation.rejectedCards.length);
+
+  return {
+    reprocessedCount,
+    recoveredToReadyCount,
+    confirmedDuplicatesCount: afterValidation.confirmedDuplicatesCount,
+    validation: afterValidation,
+    importResult,
+    overview,
+  };
+}
+
+/**
+ * Re-hydrates synthetic/placeholder entries when needed and re-runs normalization, comparison,
+ * validation, and optional import recovery without re-scanning full Wiki sets.
+ */
+export async function reprocessAndRetryCatalogEntries(
+  options?: {
+    setCodes?: string[];
+    autoImport?: boolean;
+    rehydrateSynthetic?: boolean;
+  },
+  deps?: CatalogDependencies
+): Promise<{
+  reprocessedCount: number;
+  recoveredToReadyCount: number;
+  confirmedDuplicatesCount: number;
+  validation: ImportValidationReport;
+  importResult: ImportExecutionResult | null;
+  overview: CatalogOverviewSummary;
+}> {
+  if (options?.rehydrateSynthetic) {
+    const state = getActiveCatalogState(deps?.stateFilePath);
+    const batchFetchFn = deps?.batchFetchPagesFn || batchFetchWikiPages;
+    const scopedSetCodes = options?.setCodes?.length
+      ? new Set(options.setCodes.map((s) => normalizeSetCode(s)))
+      : null;
+
+    const syntheticEntries = Object.values(state.discoveredCards).filter(
+      (e) =>
+        !e.imported &&
+        isSyntheticCardNumber(e.card.cardNumber) &&
+        Boolean(e.sourceWikiTitle) &&
+        (!scopedSetCodes || scopedSetCodes.has(normalizeSetCode(e.sourceSetCode)))
+    );
+
+    if (syntheticEntries.length > 0) {
+      const titles = Array.from(new Set(syntheticEntries.map((e) => e.sourceWikiTitle)));
+      const bundles = await batchFetchFn(titles);
+      for (const entry of syntheticEntries) {
+        const bundle = bundles.get(entry.sourceWikiTitle);
+        if (!bundle?.wikitext) continue;
+        const blocks = extractTaggedCardTableBlocks(bundle.wikitext);
+        const chosen =
+          (entry.card.isRevival ? blocks.find((b) => b.isRevival) : blocks.find((b) => !b.isRevival)) ||
+          blocks[0];
+        if (!chosen) continue;
+        const fields = parseTemplateFields(chosen.block);
+        const explicitNum = cleanWikitextInline(
+          fields.cardnum || fields.number || fields.cardno || fields.cardnumber || fields.num || ''
+        )
+          .replace(/\s+/g, '')
+          .trim();
+        const imgNum =
+          extractCardNumberFromImageField(fields.image) ||
+          extractCardNumberFromImageField(fields.bimage) ||
+          (bundle.pageImages || []).map((p) => extractCardNumberFromImageField(p)).find(Boolean) ||
+          '';
+        const extracted = explicitNum || imgNum;
+        if (extracted) {
+          const cleanNum = normalizeCardNumForCompare(extracted);
+          const inferredSet = inferCanonicalSetCodeFromCardNumber(
+            cleanNum,
+            entry.card.setCode || entry.sourceSetCode,
+            cleanWikitextInline(fields.set1 || fields.set || '')
+          );
+          entry.card = {
+            ...entry.card,
+            cardNumber: cleanNum,
+            setCode: inferredSet || entry.card.setCode,
+          };
+          if (!entry.rawArtworkFile && fields.image) {
+            entry.rawArtworkFile = cleanWikitextInline(fields.image).trim();
+            entry.hasArtworkHint = Boolean(entry.rawArtworkFile);
+          }
+        }
+      }
+      saveCatalogScanState(state, deps?.stateFilePath);
+    }
+  }
+
+  return reprocessCachedCatalogEntries(options, deps);
 }
 
 export function getCatalogOverview(deps?: CatalogDependencies): CatalogOverviewSummary {

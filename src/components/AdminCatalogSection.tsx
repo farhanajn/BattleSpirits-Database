@@ -124,6 +124,17 @@ interface ValidationSchedulerInfo {
   cronSecretConfigured: boolean;
 }
 
+type RejectionDiagnosticCategory =
+  | 'confirmed_duplicate'
+  | 'invalid_or_unsafe'
+  | 'insufficient_identifying_info'
+  | 'unsupported_identifier'
+  | 'wiki_extraction_error'
+  | 'database_write_failure'
+  | 'permission_failure'
+  | 'temporary_retryable'
+  | 'unexpected_error';
+
 interface RejectedCatalogCardRow {
   discoveryKey: string;
   cardNumber: string;
@@ -132,9 +143,22 @@ interface RejectedCatalogCardRow {
   originalSetCode: string;
   normalizedSetCode: string;
   reason: string;
+  diagnosticCategory?: RejectionDiagnosticCategory;
+  recoverable?: boolean;
+  recommendedAction?: string;
   missingFields: string[];
   duplicateMatch?: string;
   classification: string;
+}
+
+interface FailedImportDiagnosticRow {
+  discoveryKey: string;
+  cardNumber: string;
+  name: string;
+  reason: string;
+  diagnosticCategory?: RejectionDiagnosticCategory;
+  recoverable?: boolean;
+  recommendedAction?: string;
 }
 
 interface ImportValidationPreview {
@@ -145,6 +169,7 @@ interface ImportValidationPreview {
   skippedUncertain: number;
   skippedDuplicates: number;
   skippedAlreadyImported: number;
+  confirmedDuplicatesCount?: number;
   skippedInvalid?: number;
   manualMappingsProtected: number;
   warnings: string[];
@@ -240,12 +265,20 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const [onlyIncompleteMeta, setOnlyIncompleteMeta] = useState(false);
   const [validationPreview, setValidationPreview] = useState<ImportValidationPreview | null>(null);
   const [rejectedCards, setRejectedCards] = useState<RejectedCatalogCardRow[]>([]);
-  const [failedImports, setFailedImports] = useState<
-    Array<{ discoveryKey: string; cardNumber: string; name: string; reason: string }>
-  >([]);
+  const [confirmedDuplicatesCount, setConfirmedDuplicatesCount] = useState<number>(0);
+  const [diagnosticFilter, setDiagnosticFilter] = useState<string>('all');
+  const [failedImports, setFailedImports] = useState<FailedImportDiagnosticRow[]>([]);
   const [cloudSyncFailures, setCloudSyncFailures] = useState<{
     sets: Array<{ setCode: string; error: string }>;
     cards: Array<{ cardId: string; error: string }>;
+    failures?: Array<{
+      id: string;
+      entityType: 'set' | 'card';
+      error: string;
+      diagnosticCategory: string;
+      recoverable: boolean;
+      recommendedAction: string;
+    }>;
   } | null>(null);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [autoScanning, setAutoScanning] = useState(false);
@@ -560,9 +593,10 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       if (!res.ok) throw new Error(data.error || 'Validation failed');
       setValidationPreview(data);
       setRejectedCards(Array.isArray(data.rejectedCards) ? data.rejectedCards : []);
+      setConfirmedDuplicatesCount(Number(data.confirmedDuplicatesCount || 0));
       setFailedImports([]);
       onNotify?.(
-        `Validation ready: +${data.willAddCards} cards, +${data.willAddSets} sets, ${data.skippedUncertain} uncertain skipped`
+        `Validation ready: +${data.willAddCards} cards, +${data.willAddSets} sets (${Number(data.confirmedDuplicatesCount || 0)} already in DB, ${(data.rejectedCards || []).length} flagged)`
       );
     } catch (err) {
       onNotify?.(err instanceof Error ? err.message : 'Import validation failed');
@@ -585,13 +619,85 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
         importedCards
       );
       if (synced.failedSets.length > 0 || synced.failedCards.length > 0) {
-        setCloudSyncFailures({ sets: synced.failedSets, cards: synced.failedCards });
+        setCloudSyncFailures({
+          sets: synced.failedSets,
+          cards: synced.failedCards,
+          failures: Array.isArray(synced.failures) ? synced.failures : [],
+        });
         return ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud (${synced.failedCards.length} card / ${synced.failedSets.length} set failures)`;
       }
       setCloudSyncFailures(null);
       return ` & synced ${synced.pushedCards} cards / ${synced.pushedSets} sets to Cloud`;
-    } catch {
-      return ' (local import succeeded; Cloud sync skipped/failed)';
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Firestore write error';
+      setCloudSyncFailures({
+        sets: [],
+        cards: [],
+        failures: [
+          {
+            id: 'batch-sync',
+            entityType: 'card',
+            error: msg,
+            diagnosticCategory: 'database_write_failure',
+            recoverable: true,
+            recommendedAction: 'Ensure Admin sign-in is active and click Retry Failed Cloud Sync.',
+          },
+        ],
+      });
+      return ` (local import succeeded; Cloud sync error: ${msg})`;
+    }
+  };
+
+  const handleReprocessAndRetry = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/reprocess', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ autoImport: true, rehydrateSynthetic: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Reprocess failed');
+
+      const importResult = data.importResult;
+      if (importResult) {
+        const importedSets: ProductSet[] = Array.isArray(importResult.importedSets)
+          ? importResult.importedSets
+          : [];
+        const importedCards: BattleSpiritsCard[] = Array.isArray(importResult.importedCards)
+          ? importResult.importedCards
+          : [];
+        if (importedSets.length > 0 || importedCards.length > 0) {
+          onCatalogImported?.(importedSets, importedCards);
+        }
+        setRejectedCards(
+          Array.isArray(importResult.rejectedCards) ? importResult.rejectedCards : []
+        );
+        setFailedImports(
+          Array.isArray(importResult.failedImports) ? importResult.failedImports : []
+        );
+        setConfirmedDuplicatesCount(
+          Number(importResult.confirmedDuplicatesCount ?? data.confirmedDuplicatesCount ?? 0)
+        );
+        const cloudMsg = await syncAdditionsWithCloud(importedSets, importedCards);
+        onNotify?.(
+          `Reprocessed ${data.reprocessedCount} entries (${data.recoveredToReadyCount} recovered) · imported ${importResult.addedCardsCount} cards${cloudMsg}`
+        );
+      } else {
+        setRejectedCards(
+          Array.isArray(data.validation?.rejectedCards) ? data.validation.rejectedCards : []
+        );
+        setConfirmedDuplicatesCount(Number(data.confirmedDuplicatesCount || 0));
+        setValidationPreview(data.validation || null);
+        onNotify?.(
+          `Reprocessed ${data.reprocessedCount} entries · ${data.recoveredToReadyCount} recovered`
+        );
+      }
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Reprocess failed');
+    } finally {
+      setCatalogBusy(false);
     }
   };
 
@@ -618,6 +724,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
 
       onCatalogImported?.(importedSets, importedCards);
       setRejectedCards(Array.isArray(data.rejectedCards) ? data.rejectedCards : []);
+      setConfirmedDuplicatesCount(Number(data.confirmedDuplicatesCount || 0));
       setFailedImports(Array.isArray(data.failedImports) ? data.failedImports : []);
 
       const cloudMsg = await syncAdditionsWithCloud(importedSets, importedCards);
@@ -654,7 +761,11 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
         importedCards
       );
       if (synced.failedSets.length > 0 || synced.failedCards.length > 0) {
-        setCloudSyncFailures({ sets: synced.failedSets, cards: synced.failedCards });
+        setCloudSyncFailures({
+          sets: synced.failedSets,
+          cards: synced.failedCards,
+          failures: Array.isArray(synced.failures) ? synced.failures : [],
+        });
         onNotify?.(
           `Synced ${synced.pushedCards} cards / ${synced.pushedSets} sets (${synced.failedCards.length} card / ${synced.failedSets.length} set failures)`
         );
@@ -994,6 +1105,16 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
 
                 <button
                   type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleReprocessAndRetry()}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-amber-300 bg-amber-50 hover:bg-amber-100 text-xs font-semibold text-amber-950 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reprocess &amp; Retry Recoverable</span>
+                </button>
+
+                <button
+                  type="button"
                   disabled={catalogBusy || (overview?.missingCards ?? 0) + (overview?.cardsPendingReview ?? 0) === 0}
                   onClick={() => void handleExecuteImport()}
                   className="min-h-[38px] px-3.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
@@ -1105,111 +1226,245 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
               {validationPreview && (
                 <div className="p-3.5 rounded-2xl bg-sky-50 border border-sky-200 text-xs text-sky-950 space-y-1">
                   <div className="font-semibold">
-                    Import Dry-Run Validation: +{validationPreview.willAddCards} cards, +
-                    {validationPreview.willAddSets} sets, {validationPreview.willUpdateMetadata}{' '}
+                    Import Dry-Run Validation: +{validationPreview.willAddCards} ready to import, +
+                    {validationPreview.willAddSets} new sets, {validationPreview.willUpdateMetadata}{' '}
                     metadata enrichments
                   </div>
                   <div className="text-[11px] text-sky-800">
-                    Protected: {validationPreview.manualMappingsProtected} ManualWikiMapping ·
-                    Skipped: {validationPreview.skippedUncertain} uncertain,{' '}
-                    {validationPreview.skippedDuplicates} duplicates,{' '}
-                    {validationPreview.skippedAlreadyImported} already imported
-                    {validationPreview.skippedInvalid ? `, ${validationPreview.skippedInvalid} invalid` : ''}
+                    Already in DB (Confirmed Existing):{' '}
+                    {validationPreview.confirmedDuplicatesCount ??
+                      validationPreview.skippedAlreadyImported}{' '}
+                    · Flagged for Diagnostics:{' '}
+                    {validationPreview.rejectedCards?.length ??
+                      validationPreview.skippedUncertain +
+                        validationPreview.skippedDuplicates +
+                        (validationPreview.skippedInvalid || 0)}{' '}
+                    ({validationPreview.skippedUncertain} uncertain,{' '}
+                    {validationPreview.skippedDuplicates} conflict/duplicate,{' '}
+                    {validationPreview.skippedInvalid || 0} invalid) · Protected:{' '}
+                    {validationPreview.manualMappingsProtected} ManualWikiMapping
                   </div>
                 </div>
               )}
 
               {cloudSyncFailures &&
-                (cloudSyncFailures.sets.length > 0 || cloudSyncFailures.cards.length > 0) && (
-                  <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-1.5">
-                    <div className="flex items-center justify-between gap-2">
+                (cloudSyncFailures.sets.length > 0 ||
+                  cloudSyncFailures.cards.length > 0 ||
+                  (cloudSyncFailures.failures?.length ?? 0) > 0) && (
+                  <div className="p-3.5 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-950 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-semibold">
-                        Partial Cloud Sync Failures ({cloudSyncFailures.sets.length} sets,{' '}
+                        Cloud Sync Failures ({cloudSyncFailures.sets.length} sets,{' '}
                         {cloudSyncFailures.cards.length} cards)
                       </span>
                       <button
                         type="button"
                         disabled={catalogBusy}
                         onClick={() => void handleSyncAllImportedToCloud()}
-                        className="px-2.5 py-1 rounded-lg bg-amber-700 text-white text-[11px] font-semibold cursor-pointer"
+                        className="px-2.5 py-1 rounded-lg bg-red-700 hover:bg-red-800 text-white text-[11px] font-semibold cursor-pointer"
                       >
-                        Retry Cloud Sync
+                        Retry Failed Cloud Sync
                       </button>
                     </div>
-                    <div className="max-h-24 overflow-y-auto font-mono text-[11px] space-y-0.5">
-                      {cloudSyncFailures.sets.slice(0, 10).map((f) => (
-                        <div key={`fs-${f.setCode}`}>
-                          [SET {f.setCode}] {f.error}
-                        </div>
-                      ))}
-                      {cloudSyncFailures.cards.slice(0, 15).map((f) => (
-                        <div key={`fc-${f.cardId}`}>
-                          [CARD {f.cardId}] {f.error}
-                        </div>
-                      ))}
+                    <div className="max-h-32 overflow-y-auto text-[11px] space-y-1">
+                      {cloudSyncFailures.failures && cloudSyncFailures.failures.length > 0
+                        ? cloudSyncFailures.failures.slice(0, 25).map((f, idx) => (
+                            <div
+                              key={`cf-${f.entityType}-${f.id}-${idx}`}
+                              className="p-1.5 rounded-lg bg-white border border-red-200/80 space-y-0.5"
+                            >
+                              <div className="font-mono font-semibold text-red-900">
+                                [{f.entityType.toUpperCase()} {f.id}] {f.diagnosticCategory}{' '}
+                                {f.recoverable ? '(recoverable)' : '(schema fix needed)'}
+                              </div>
+                              <div className="text-red-800">{f.error}</div>
+                              <div className="text-[10px] text-slate-600">
+                                Action: {f.recommendedAction}
+                              </div>
+                            </div>
+                          ))
+                        : (
+                          <>
+                            {cloudSyncFailures.sets.slice(0, 10).map((f) => (
+                              <div key={`fs-${f.setCode}`} className="font-mono">
+                                [SET {f.setCode}] {f.error}
+                              </div>
+                            ))}
+                            {cloudSyncFailures.cards.slice(0, 15).map((f) => (
+                              <div key={`fc-${f.cardId}`} className="font-mono">
+                                [CARD {f.cardId}] {f.error}
+                              </div>
+                            ))}
+                          </>
+                        )}
                     </div>
                   </div>
                 )}
 
               {(rejectedCards.length > 0 || failedImports.length > 0) && (
-                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-semibold">
-                      Skipped / Rejected Card Diagnostics ({rejectedCards.length + failedImports.length})
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setRejectedCards([]);
-                        setFailedImports([]);
-                      }}
-                      className="text-[11px] underline text-amber-800 cursor-pointer"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                  <div className="max-h-40 overflow-y-auto divide-y divide-amber-200/70">
-                    {failedImports.map((f) => (
-                      <div key={`fi-${f.discoveryKey}`} className="py-1.5 text-[11px]">
-                        <span className="font-mono font-bold">{f.cardNumber}</span> {f.name} —{' '}
-                        <span className="text-red-800">{f.reason}</span>
-                      </div>
-                    ))}
-                    {rejectedCards.slice(0, 60).map((r) => (
-                      <div
-                        key={`rc-${r.discoveryKey}`}
-                        className="py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="font-semibold">
+                        Skipped / Rejected Card Diagnostics ({rejectedCards.length + failedImports.length})
+                      </span>
+                      {confirmedDuplicatesCount > 0 && (
+                        <span className="ml-2 text-[11px] text-amber-800">
+                          ({confirmedDuplicatesCount} already-in-DB matches excluded cleanly)
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={catalogBusy}
+                        onClick={() => void handleReprocessAndRetry()}
+                        className="px-2.5 py-1 rounded-lg bg-amber-800 hover:bg-amber-900 text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
                       >
-                        <div className="min-w-0">
-                          <span className="font-mono font-bold">{r.cardNumber || '—'}</span>{' '}
-                          <span className="font-semibold">{r.name || r.wikiTitle}</span>{' '}
-                          <span className="text-slate-600">
-                            ({r.originalSetCode}
-                            {r.normalizedSetCode && r.normalizedSetCode !== r.originalSetCode
-                              ? ` -> ${r.normalizedSetCode}`
-                              : ''}
-                            )
-                          </span>
-                          <div className="text-amber-900">
-                            {r.reason}
-                            {r.missingFields.length > 0
-                              ? ` [missing: ${r.missingFields.join(', ')}]`
-                              : ''}
-                            {r.duplicateMatch ? ` [match: ${r.duplicateMatch}]` : ''}
-                          </div>
-                        </div>
-                        {(r.classification === 'uncertain' ||
-                          r.classification === 'potential_duplicate') && (
-                          <button
-                            type="button"
-                            onClick={() => void handleToggleApproval(r.discoveryKey, true)}
-                            className="px-2 py-1 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 text-[11px] font-semibold text-amber-950 cursor-pointer shrink-0"
-                          >
-                            Approve
-                          </button>
-                        )}
-                      </div>
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Reprocess &amp; Retry Recoverable</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRejectedCards([]);
+                          setFailedImports([]);
+                          setDiagnosticFilter('all');
+                        }}
+                        className="text-[11px] underline text-amber-800 cursor-pointer"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[
+                      { id: 'all', label: `All (${rejectedCards.length + failedImports.length})` },
+                      {
+                        id: 'recoverable',
+                        label: `Recoverable (${rejectedCards.filter((r) => r.recoverable !== false).length + failedImports.filter((f) => f.recoverable !== false).length})`,
+                      },
+                      {
+                        id: 'confirmed_duplicate',
+                        label: `Duplicate (${rejectedCards.filter((r) => r.diagnosticCategory === 'confirmed_duplicate').length})`,
+                      },
+                      {
+                        id: 'insufficient_identifying_info',
+                        label: `Needs Review (${rejectedCards.filter((r) => (r.diagnosticCategory || 'insufficient_identifying_info') === 'insufficient_identifying_info').length})`,
+                      },
+                      {
+                        id: 'invalid_or_unsafe',
+                        label: `Invalid/Unsafe (${rejectedCards.filter((r) => r.diagnosticCategory === 'invalid_or_unsafe' || r.diagnosticCategory === 'unsupported_identifier').length})`,
+                      },
+                    ].map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setDiagnosticFilter(f.id)}
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-semibold border cursor-pointer ${
+                          diagnosticFilter === f.id
+                            ? 'bg-amber-900 border-amber-900 text-white'
+                            : 'bg-white border-amber-200 text-amber-900 hover:bg-amber-100'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
                     ))}
+                  </div>
+
+                  <div className="max-h-56 overflow-y-auto divide-y divide-amber-200/70">
+                    {failedImports
+                      .filter((f) => {
+                        if (diagnosticFilter === 'all') return true;
+                        if (diagnosticFilter === 'recoverable') return f.recoverable !== false;
+                        return (f.diagnosticCategory || 'database_write_failure') === diagnosticFilter;
+                      })
+                      .map((f) => (
+                        <div key={`fi-${f.discoveryKey}`} className="py-1.5 text-[11px] space-y-0.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-mono font-bold">{f.cardNumber}</span>
+                            <span className="font-semibold">{f.name}</span>
+                            <span className="px-1.5 py-0.2 rounded-md bg-red-100 border border-red-200 text-red-900 font-mono text-[10px]">
+                              {f.diagnosticCategory || 'database_write_failure'}
+                            </span>
+                            {f.recoverable !== false && (
+                              <span className="px-1.5 py-0.2 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-semibold">
+                                Recoverable
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-red-800">{f.reason}</div>
+                          {f.recommendedAction && (
+                            <div className="text-[10px] text-amber-900">
+                              Action: {f.recommendedAction}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    {rejectedCards
+                      .filter((r) => {
+                        const cat = r.diagnosticCategory || 'insufficient_identifying_info';
+                        if (diagnosticFilter === 'all') return true;
+                        if (diagnosticFilter === 'recoverable') return r.recoverable !== false;
+                        if (diagnosticFilter === 'invalid_or_unsafe') {
+                          return cat === 'invalid_or_unsafe' || cat === 'unsupported_identifier';
+                        }
+                        return cat === diagnosticFilter;
+                      })
+                      .slice(0, 60)
+                      .map((r) => (
+                        <div
+                          key={`rc-${r.discoveryKey}`}
+                          className="py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                        >
+                          <div className="min-w-0 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-mono font-bold">{r.cardNumber || '—'}</span>
+                              <span className="font-semibold">{r.name || r.wikiTitle}</span>
+                              <span className="text-slate-600">
+                                ({r.originalSetCode}
+                                {r.normalizedSetCode && r.normalizedSetCode !== r.originalSetCode
+                                  ? ` -> ${r.normalizedSetCode}`
+                                  : ''}
+                                )
+                              </span>
+                              {r.diagnosticCategory && (
+                                <span className="px-1.5 py-0.2 rounded-md bg-white border border-amber-300 text-amber-950 font-mono text-[10px]">
+                                  {r.diagnosticCategory}
+                                </span>
+                              )}
+                              {r.recoverable && (
+                                <span className="px-1.5 py-0.2 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-semibold">
+                                  Recoverable
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-amber-900">
+                              {r.reason}
+                              {r.missingFields.length > 0
+                                ? ` [missing: ${r.missingFields.join(', ')}]`
+                                : ''}
+                              {r.duplicateMatch ? ` [match: ${r.duplicateMatch}]` : ''}
+                            </div>
+                            {r.recommendedAction && (
+                              <div className="text-[10px] text-slate-600">
+                                Action: {r.recommendedAction}
+                              </div>
+                            )}
+                          </div>
+                          {(r.classification === 'uncertain' ||
+                            r.classification === 'potential_duplicate') && (
+                            <button
+                              type="button"
+                              onClick={() => void handleToggleApproval(r.discoveryKey, true)}
+                              className="px-2 py-1 rounded-lg bg-white border border-amber-300 hover:bg-amber-100 text-[11px] font-semibold text-amber-950 cursor-pointer shrink-0"
+                            >
+                              Approve
+                            </button>
+                          )}
+                        </div>
+                      ))}
                   </div>
                 </div>
               )}

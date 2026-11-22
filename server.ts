@@ -19,6 +19,7 @@ import {
   executeCatalogImport,
   getCatalogDashboardSnapshot,
   getImportedCatalogPayload,
+  reprocessAndRetryCatalogEntries,
   runCatalogScanBatch,
   scanWikiSetByCode,
   setDiscoveredCardApproval,
@@ -402,6 +403,23 @@ async function startServer() {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Catalog import failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/reprocess', async (req, res) => {
+    try {
+      const setCodes = Array.isArray(req.body?.setCodes)
+        ? req.body.setCodes.map((s: unknown) => String(s))
+        : undefined;
+      const result = await reprocessAndRetryCatalogEntries({
+        setCodes,
+        autoImport: Boolean(req.body?.autoImport),
+        rehydrateSynthetic: req.body?.rehydrateSynthetic !== false,
+      });
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog reprocessing failed';
       res.status(500).json({ error: message });
     }
   });

@@ -12,14 +12,20 @@ import {
   type ManualWikiMappingEntry,
 } from '../src/utils/ManualWikiMapping.ts';
 import {
+  buildCardNumberCompareKeys,
   classifySetSourceCollection,
   compareCatalogWithWiki,
   discoverAllWikiSets,
   executeCatalogImport,
+  extractCardNumberFromImageField,
   getCatalogDashboardSnapshot,
   getCatalogOverview,
+  isSyntheticCardNumber,
   normalizeSetCode,
+  reprocessAndRetryCatalogEntries,
+  reprocessCachedCatalogEntries,
   runCatalogScanBatch,
+  sanitizeCatalogDocumentId,
   sanitizeSetCode,
   scanWikiSetByCode,
   setDiscoveredCardApproval,
@@ -155,6 +161,11 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
 == Promotional Cards ==
 * [[Promo Cards/P26]]
 `,
+      BS78: `
+== Card List ==
+* BS78-001 [[No Artwork Wing]] (Red / Spirit / R)
+* BS78-002 [[Crimson Blade Dragon]] (Red / Spirit / X)
+`,
       BS01: `
 {{SetTable
 |title=BS01
@@ -168,6 +179,8 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
 | BS01-099 || [[Missing Flame Tiger]] || Spirit || Red || R
 |-
 | BS01-100 || [[創界神ウル]] || Spirit || White || X
+|-
+| BS01-101 || [[Crimson Blade Dragon]] || Spirit || Red || X
 |}
 `,
       BS72: `
@@ -176,11 +189,6 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
 |-
 | BS72-084 || [[Kizuna Field]] || Magic || White || C
 |}
-`,
-      BS78: `
-== Card List ==
-* BS78-001 [[No Artwork Wing]] (Red / Spirit / R)
-* BS78-002 [[Crimson Blade Dragon]] (Red / Spirit / X)
 `,
       '09': `
 {{SetRow|09-001|Nine Tail Fox|Spirit|Yellow|M}}
@@ -218,6 +226,10 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
       },
       'Crimson Blade Dragon': {
         wikitext: `{{CardTableV2|name=Crimson Blade Dragon|color=Red|cost=6}}`,
+        pageImages: [],
+      },
+      'Same Set Ambiguous Guard': {
+        wikitext: `{{CardTableV2|name=Same Edition Guard|color=Red|cost=4}}`,
         pageImages: [],
       },
     };
@@ -290,8 +302,9 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     const drake = cmp.entries.find((e) => e.card.cardNumber === 'BS01-001');
     const missingTiger = cmp.entries.find((e) => e.card.cardNumber === 'BS01-099');
     const unicodeCard = cmp.entries.find((e) => e.card.cardNumber === 'BS01-100');
+    const sameSetAmbiguous = cmp.entries.find((e) => e.card.cardNumber === 'BS01-101');
     const unusualNoArt = cmp.entries.find((e) => e.card.cardNumber === 'BS78-001');
-    const ambiguousReprint = cmp.entries.find((e) => e.card.cardNumber === 'BS78-002');
+    const distinctSetReprint = cmp.entries.find((e) => e.card.cardNumber === 'BS78-002');
     const kizuna = cmp.entries.find((e) => e.card.cardNumber === 'BS72-084');
 
     assert.equal(drake?.classification, 'matched');
@@ -301,7 +314,8 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     assert.equal(unicodeCard?.card.name, '創界神ウル', 'Japanese/Unicode name preserved safely');
     assert.ok(unicodeCard && unicodeCard.incompleteFields.length > 0, 'Incomplete fields flagged');
     assert.equal(unusualNoArt?.classification, 'missing', 'Unusual bullet listing fallback parsed');
-    assert.equal(ambiguousReprint?.classification, 'uncertain', 'Same name on different set number flagged uncertain, not auto-merged');
+    assert.equal(distinctSetReprint?.classification, 'missing', 'Distinct set card with its own canonical cardNumber imports cleanly');
+    assert.equal(sameSetAmbiguous?.classification, 'uncertain', 'Same-set name collision flagged uncertain, not auto-merged');
     assert.equal(kizuna?.classification, 'updated_metadata', 'Safe enrichment detected for missing jpName/illustrator');
   });
 
@@ -313,8 +327,8 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     await scanWikiSetByCode('BS72', deps);
 
     const validation = validateCatalogImport({}, deps);
-    assert.ok(validation.willAddCards >= 3, 'Missing cards queued for safe add');
-    assert.ok(validation.skippedUncertain >= 1, 'Uncertain match BS78-002 excluded unless manually approved');
+    assert.ok(validation.willAddCards >= 4, 'Missing cards queued for safe add');
+    assert.ok(validation.skippedUncertain >= 1, 'Uncertain match BS01-101 excluded unless manually approved');
     assert.ok(validation.manualMappingsProtected >= 1, 'BS72-084 manual mapping protected');
 
     const kizunaBefore = getManualWikiMapping({ id: 'bs72-bs72-084', cardNumber: 'BS72-084' });
@@ -428,10 +442,10 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
           isRevival: true,
         }),
         makeBaselineCard({
-          id: 'bs01-002',
-          cardNumber: 'BS01-002',
+          id: 'bs73-002',
+          cardNumber: 'BS73-002',
           name: 'Same Edition Guard',
-          setCode: 'BS01',
+          setCode: 'BS73',
           isRevival: false,
         }),
       ],
@@ -519,7 +533,7 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
 
     assert.equal(tcpRevival?.classification, 'missing', 'Revival TCP card compared against Original is missing (not uncertain)');
     assert.equal(bs23Orig?.classification, 'missing', 'Original BS23 card compared against Revival is missing');
-    assert.equal(sameVerUncertain?.classification, 'uncertain', 'Same-version name collision on different set stays uncertain');
+    assert.equal(sameVerUncertain?.classification, 'uncertain', 'Same-version name collision in same set stays uncertain');
 
     const validation = validateCatalogImport({}, revivalDeps);
     assert.equal(validation.willAddCards, 2);
@@ -775,6 +789,269 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     assert.equal(finalOverview.setsFailed, 0);
     assert.equal(finalOverview.coverageComplete, true);
     assert.equal(finalOverview.coverageWarning, null);
+  });
+
+  it('extracts card numbers from Wiki image fields, sanitizes Unicode/long Firestore doc IDs, eliminates false Revival/cross-set/category rejections, and recovers stale cached rejections via reprocess', async () => {
+    // 1. Card number extraction from {{CardTable3}} | image = filenames
+    assert.equal(extractCardNumberFromImageField('P23-05.png'), 'P23-05');
+    assert.equal(extractCardNumberFromImageField('File:PX26-06.png'), 'PX26-06');
+    assert.equal(extractCardNumberFromImageField('SD37-012-OG.jpg'), 'SD37-012');
+    assert.equal(extractCardNumberFromImageField('BS73-T001.png'), 'BS73-T001');
+    assert.equal(extractCardNumberFromImageField('BS70-CP02.png'), 'BS70-CP02');
+    assert.equal(extractCardNumberFromImageField('BSC22-132.jpg'), 'BSC22-132');
+    assert.equal(isSyntheticCardNumber('BS01-CAT-1A2B3C4D'), true);
+    assert.equal(isSyntheticCardNumber('PX26-06'), false);
+    assert.ok(buildCardNumberCompareKeys('BS73-TCP01(A)').includes('BS73-TCP01'));
+    assert.ok(buildCardNumberCompareKeys('BS73-TCP02B').includes('BS73-TCP02(B)'));
+    assert.ok(buildCardNumberCompareKeys('CP02', 'BS45').includes('BS45-CP02'));
+
+    // 2. Deterministic Firestore-safe document IDs (alphanumeric, _, -, <= 128 chars)
+    const jpId = sanitizeCatalogDocumentId('26rbs01-創界神ウル-revival', 'fallback');
+    assert.match(jpId, /^[a-zA-Z0-9_-]{1,128}$/);
+    const longId = sanitizeCatalogDocumentId(`prefix-${'x'.repeat(200)}`, 'fallback');
+    assert.ok(longId.length <= 128);
+    assert.match(longId, /^[a-zA-Z0-9_-]{1,128}$/);
+    // Distinct Unicode strings produce distinct hashed IDs rather than collapsing
+    assert.notEqual(
+      sanitizeCatalogDocumentId('聖龍皇'),
+      sanitizeCatalogDocumentId('滅神星龍')
+    );
+
+    // 3. Cross-set reprints, same-number Original vs Revival, and category-sweep prefix sharing
+    const statePath = path.join(tmpDir, `diagnostics-fix-${Date.now()}.json`);
+    const baselineCards: BattleSpiritsCard[] = [
+      makeBaselineCard({
+        id: 'px01-px01',
+        cardNumber: 'PX01',
+        name: 'The KnightLord of Thunder',
+        jpName: '雷皇騎',
+        setCode: 'PX01',
+        isRevival: false,
+      }),
+      makeBaselineCard({
+        id: 'bs12-bs12-x01',
+        cardNumber: 'BS12-X01',
+        name: 'The BullDragonDeity Dragonic-Taurus',
+        jpName: '龍星神',
+        setCode: 'BS12',
+        isRevival: false,
+      }),
+      makeBaselineCard({
+        id: 'bs73-bs73-cp02-rv',
+        cardNumber: 'BS73-CP02',
+        name: 'Rekka Yukimura (Revival)',
+        jpName: '烈火幸村',
+        setCode: 'BS73',
+        isRevival: true,
+      }),
+      makeBaselineCard({
+        id: 'bs01-bs01-091',
+        cardNumber: 'BS01-091',
+        name: 'The Artifact Laguna',
+        setCode: 'BS01',
+        isRevival: false,
+      }),
+      makeBaselineCard({
+        id: 'bs01-001',
+        cardNumber: 'BS01-001',
+        name: 'Drake Knight',
+        setCode: 'BS01',
+        isRevival: false,
+      }),
+    ];
+
+    const deps: CatalogDependencies = {
+      stateFilePath: statePath,
+      existingCardsProvider: () => baselineCards,
+      fetchWikiJsonFn: async (params) => {
+        if (params.list === 'categorymembers') {
+          if (params.cmtitle === 'Category:Booster Sets' && !params.cmcontinue) {
+            return {
+              query: {
+                categorymembers: [{ title: '26RBS01' }, { title: 'BSC01' }, { title: 'BS01' }, { title: 'BS73' }],
+              },
+            };
+          }
+          if (params.cmtitle === 'Category:Promo X-Rare' && !params.cmcontinue) {
+            return {
+              query: {
+                categorymembers: [
+                  { title: 'HighEvo-Delphyne' },
+                  { title: 'HighEvo-Harpuia' },
+                  { title: 'HighEvo-Ophiotaurus' },
+                ],
+              },
+            };
+          }
+          return { query: { categorymembers: [] } };
+        }
+        if (params.list === 'allpages') return { query: { allpages: [] } };
+        if (params.prop === 'revisions') {
+          const t = String(params.titles || '');
+          const map: Record<string, string> = {
+            'Card Sets': '* [[26RBS01]]\n* [[BSC01]]\n* [[BS01]]\n* [[BS73]]\n* [[RP26-STD]]',
+            '26RBS01': `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| 26RBS01-001 || [[創界神ストライク]]\n|}`,
+            BSC01: `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS01-001 || [[Drake Knight]]\n|}`,
+            BS01: `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS01-091 || [[The ShieldSpirit Dis]]\n|}`,
+            BS73: `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS73-CP02 || [[Rekka Yukimura]]\n|}`,
+            'RP26-STD': `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| RPX26-01 || [[The KnightLord of Thunder]]\n|}`,
+            'Category:Revival': `{{SetRow|BS12-X01|The BullDragonDeity Dragonic-Taurus (Revival)|Spirit|Red|X}}`,
+          };
+          const wt = map[t];
+          if (!wt) return { query: { pages: { '-1': { title: t, missing: '' } } } };
+          return {
+            query: {
+              pages: { '401': { title: t, revisions: [{ slots: { main: { '*': wt } } }] } },
+            },
+          };
+        }
+        return { query: {} };
+      },
+      batchFetchPagesFn: async (titles) => {
+        const out = new Map<string, WikiPageBundle>();
+        for (const t of titles) {
+          if (t === 'HighEvo-Delphyne') {
+            out.set(t, { wikitext: '{{CardTable3|name=HighEvo-Delphyne|image=PX26-06.png|rarity1=PX}}', pageImages: ['PX26-06.png'] });
+          } else if (t === 'HighEvo-Harpuia') {
+            out.set(t, { wikitext: '{{CardTable3|name=HighEvo-Harpuia|image=PX26-07.png|rarity1=PX}}', pageImages: ['PX26-07.png'] });
+          } else if (t === 'HighEvo-Ophiotaurus') {
+            out.set(t, { wikitext: '{{CardTable3|name=HighEvo-Ophiotaurus|image=PX26-08.png|rarity1=PX}}', pageImages: ['PX26-08.png'] });
+          } else if (t === '創界神ストライク') {
+            out.set(t, { wikitext: '{{CardTable3|jpname=創界神ストライク|color=White}}', pageImages: [] });
+          } else if (t === 'The KnightLord of Thunder') {
+            out.set(t, { wikitext: '{{CardTable3|name=The KnightLord of Thunder|jpname=雷皇騎|color=White|image=RPX26-01.png}}', pageImages: ['RPX26-01.png'] });
+          } else if (t === 'Rekka Yukimura') {
+            out.set(t, {
+              wikitext: '{{CardTable3|name=Rekka Yukimura|jpname=烈火幸村|cardnum=BS73-CP02}}\n==Revival==\n{{CardTable3|name=Rekka Yukimura (Revival)|jpname=烈火幸村|cardnum=BS73-CP02}}',
+              pageImages: [],
+            });
+          } else if (t === 'The BullDragonDeity Dragonic-Taurus (Revival)') {
+            out.set(t, { wikitext: '{{CardTable3|name=The BullDragonDeity Dragonic-Taurus (Revival)|jpname=龍星神|cardnum=BS12-X01}}', pageImages: [] });
+          } else {
+            out.set(t, { wikitext: `{{CardTable3|name=${t}|color=Red}}`, pageImages: [] });
+          }
+        }
+        return out;
+      },
+    };
+
+    await discoverAllWikiSets(deps);
+    await scanWikiSetByCode('26RBS01', deps);
+    await scanWikiSetByCode('BSC01', deps);
+    await scanWikiSetByCode('BS01', deps);
+    await scanWikiSetByCode('BS73', deps);
+    await scanWikiSetByCode('RP26-STD', deps);
+    await scanWikiSetByCode('PROMO-PX-ARCHIVE', deps);
+
+    const cmp = compareCatalogWithWiki(deps);
+    // Zero false rejections across HighEvo-* category sweep cards (card numbers extracted from image field & routed to PX26)
+    const delphyne = cmp.entries.find((e) => e.card.cardNumber === 'PX26-06');
+    const harpuia = cmp.entries.find((e) => e.card.cardNumber === 'PX26-07');
+    const ophiotaurus = cmp.entries.find((e) => e.card.cardNumber === 'PX26-08');
+    assert.equal(delphyne?.classification, 'missing');
+    assert.equal(delphyne?.card.setCode, 'PX26');
+    assert.equal(harpuia?.classification, 'missing');
+    assert.equal(ophiotaurus?.classification, 'missing');
+
+    // BSC01-scoped BS01-001 vs BS01-001 is distinct set reprint, NOT false duplicate
+    const bscReprint = cmp.entries.find((e) => e.sourceSetCode === 'BSC01' && e.card.cardNumber === 'BS01-001');
+    assert.equal(bscReprint?.classification, 'missing');
+
+    // RPX26-01 vs PX01 (distinct set & distinct number) AND BS73-CP02 Original vs BS73-CP02 Revival (same number, opposite version) both import cleanly
+    const rpx26Card = cmp.entries.find((e) => e.card.cardNumber === 'RPX26-01');
+    const bs73Cp02Orig = cmp.entries.find((e) => e.card.cardNumber === 'BS73-CP02' && !e.card.isRevival);
+    assert.equal(rpx26Card?.classification, 'missing');
+    assert.equal(bs73Cp02Orig?.classification, 'missing');
+
+    // Genuine BS01-091 conflict IS still flagged cleanly rather than overwritten
+    const bs01Conflict = cmp.entries.find((e) => e.card.cardNumber === 'BS01-091');
+    assert.notEqual(bs01Conflict?.classification, 'missing');
+
+    const validation = validateCatalogImport({}, deps);
+    assert.ok(validation.rejectedCards.every((r) => r.diagnosticCategory && typeof r.recoverable === 'boolean' && r.recommendedAction));
+    assert.ok(!validation.rejectedCards.some((r) => r.cardNumber.startsWith('PX26-')), 'All PX26 category sweep cards pass validation');
+    assert.ok(!validation.rejectedCards.some((r) => r.cardNumber === '26RBS01-001'), 'Japanese-name card in 26RBS01 passes validation');
+    assert.ok(!validation.rejectedCards.some((r) => r.cardNumber === 'BS73-CP02'), 'Original vs Revival sharing BS73-CP02 passes validation');
+
+    const execRes = executeCatalogImport({}, deps);
+    assert.ok(execRes.importedCards.some((c) => c.cardNumber === 'PX26-06' && c.setCode === 'PX26'));
+    assert.ok(execRes.importedCards.some((c) => c.cardNumber === 'BS73-CP02' && c.isRevival === false));
+    assert.ok(execRes.importedCards.some((c) => c.cardNumber === '26RBS01-001' && /^[a-zA-Z0-9_-]{1,128}$/.test(c.id)));
+    assert.equal(execRes.failedImports.length, 0);
+
+    // 4. Reprocess & Retry recovery of stale synthetic cached entries without re-scanning Wiki sets
+    const seedPath = path.join(tmpDir, `stale-seed-${Date.now()}.json`);
+    await discoverAllWikiSets({ ...deps, stateFilePath: seedPath });
+    const staleState = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
+    // Inject a stale synthetic pre-fix rejected entry + an entry missing required cardNumber
+    staleState.discoveredCards['PROMO-PX-ARCHIVE::PROMO-PX-ARCHIVE-HIGHEVO-::orig::highevo-delphyne'] = {
+      discoveryKey: 'PROMO-PX-ARCHIVE::PROMO-PX-ARCHIVE-HIGHEVO-::orig::highevo-delphyne',
+      card: makeBaselineCard({
+        id: 'promo-px-archive-HIGHEVO-bad$id',
+        cardNumber: 'PROMO-PX-ARCHIVE-HIGHEVO-',
+        name: 'HighEvo-Delphyne',
+        setCode: 'PROMO-PX-ARCHIVE',
+        wikiTitle: 'HighEvo-Delphyne',
+      }),
+      sourceSetCode: 'PROMO-PX-ARCHIVE',
+      originalSetCode: 'PROMO-PX-ARCHIVE',
+      sourceWikiTitle: 'HighEvo-Delphyne',
+      rawArtworkFile: 'PX26-06.png',
+      hasArtworkHint: true,
+      incompleteFields: [],
+      parseWarnings: [],
+      classification: 'potential_duplicate',
+      matchSignals: ['duplicate_card_number_in_scan'],
+      matchConfidence: 50,
+      metadataDeltas: [],
+      approvedForImport: false,
+      imported: false,
+      importedAt: null,
+    };
+    staleState.discoveredCards['BS01::BROKEN::orig::empty'] = {
+      discoveryKey: 'BS01::BROKEN::orig::empty',
+      card: makeBaselineCard({ id: 'bs01-empty', cardNumber: '', name: '', jpName: '', setCode: 'BS01' }),
+      sourceSetCode: 'BS01',
+      originalSetCode: 'BS01',
+      sourceWikiTitle: '',
+      rawArtworkFile: '',
+      hasArtworkHint: false,
+      incompleteFields: ['artwork'],
+      parseWarnings: [],
+      classification: 'missing',
+      matchSignals: [],
+      matchConfidence: 0,
+      metadataDeltas: [],
+      approvedForImport: false,
+      imported: false,
+      importedAt: null,
+    };
+    // Write to a fresh uncached stateFilePath so getActiveCatalogState loads the pre-fix stale disk state cleanly
+    const stalePath = path.join(tmpDir, `stale-reprocess-${Date.now()}.json`);
+    fs.writeFileSync(stalePath, JSON.stringify(staleState));
+    const staleDeps: CatalogDependencies = {
+      ...deps,
+      stateFilePath: stalePath,
+    };
+
+    const preCheck = validateCatalogImport({}, staleDeps);
+    assert.ok(preCheck.rejectedCards.length >= 2, 'Pre-reprocess sees both stale duplicate and missing-identifier rejection');
+    const missingIdDiag = preCheck.rejectedCards.find((r) => r.discoveryKey === 'BS01::BROKEN::orig::empty');
+    assert.equal(missingIdDiag?.diagnosticCategory, 'insufficient_identifying_info');
+    assert.equal(missingIdDiag?.recoverable, false);
+
+    const reprocessed = await reprocessAndRetryCatalogEntries(
+      { autoImport: true, rehydrateSynthetic: true },
+      staleDeps
+    );
+    assert.ok(reprocessed.recoveredToReadyCount >= 1);
+    assert.ok(
+      reprocessed.importResult?.importedCards.some((c) => c.cardNumber === 'PX26-06' && c.setCode === 'PX26'),
+      'Reprocess & retry recovers stale PROMO-PX-ARCHIVE-HIGHEVO- into PX26-06 and imports it cleanly'
+    );
+    // Sync call still works idempotently
+    const syncOnly = reprocessCachedCatalogEntries({ autoImport: false }, staleDeps);
+    assert.ok(syncOnly.reprocessedCount >= 1);
   });
 });
 
