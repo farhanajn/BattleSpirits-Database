@@ -15,6 +15,7 @@ import {
   defaultVariant,
   enrichSetMetadata,
   ensureBanListLoaded,
+  extractPromoSectionsAndLinkedSets,
   extractTaggedCardTableBlocks,
   fetchWikiJson,
   getSyncedWikiDirectory,
@@ -25,6 +26,7 @@ import {
   parseSetTableRows,
   parseTemplateFields,
   resolveCardRestriction,
+  resolvePromoSubSeriesSetCode,
   upsertStoredSetMetadata,
   WIKI_BASE,
   type WikiPageBundle,
@@ -38,9 +40,37 @@ export type ComparisonClassification =
   | 'potential_duplicate'
   | 'updated_metadata';
 
+export type SourceCollectionType =
+  | 'regular_booster'
+  | 'starter_deck'
+  | 'px_series'
+  | 'promo_list'
+  | 'campaign'
+  | 'event_prize'
+  | 'collab_promo'
+  | 'supplementary_other';
+
+export interface SourceCoverageBucket {
+  sourceType: SourceCollectionType;
+  label: string;
+  setsDiscovered: number;
+  setsScanned: number;
+  setsPending: number;
+  setsFailed: number;
+  cardsDiscovered: number;
+  cardsMatched: number;
+  cardsMissing: number;
+  cardsImportable: number;
+  status: 'complete' | 'partial' | 'pending' | 'failed' | 'unscanned';
+}
+
 export interface DiscoveredSetRecord extends ProductSet {
   sources: string[];
   aliases?: string[];
+  sourceCollectionType?: SourceCollectionType;
+  scanSection?: string;
+  cardNumberPrefix?: string;
+  categorySweepTitles?: string[];
   isNumberOnly: boolean;
   inSpiritsdex: boolean;
   scanStatus: SetScanStatus;
@@ -114,6 +144,10 @@ export interface CatalogOverviewSummary {
   setsPending: number;
   setsFailed: number;
   numberOnlySetsCount: number;
+  promoSetsDiscovered: number;
+  promoSetsScanned: number;
+  promoCardsFound: number;
+  promoCardsMissing: number;
   totalWikiCardsDiscovered: number;
   existingCardsMatched: number;
   missingCards: number;
@@ -123,6 +157,9 @@ export interface CatalogOverviewSummary {
   incompleteMetadataCards: number;
   missingArtworkCards: number;
   importedCardsCount: number;
+  coverageComplete: boolean;
+  coverageWarning: string | null;
+  sourceCoverage: SourceCoverageBucket[];
   jobStatus: CatalogScanState['jobStatus'];
   currentSetCode: string | null;
   scannedSetsCount: number;
@@ -216,13 +253,30 @@ export function normalizeCardNumForCompare(raw?: string): string {
 }
 
 const CANONICAL_SET_CODE_RE =
-  /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3}|RP\d{2}-STD|PX\d{2}-STD|TOKENS|REVIVAL|\d{1,4})$/i;
+  /^(?:26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}[A-Z]?|EX\d{1,3}|CP\d{1,3}|PX\d{0,3}|RPX?\d{2}-STD|P\d{2,3}|SJ\d{1,3}|KA\d{1,3}|X\d{1,3}|KFC|EXPROMO|GX|HK[A-Z]{2}\d{1,3}|TOKENS|REVIVAL|\d{1,4})$/i;
+
+const PROMO_WIKI_TITLE_TO_CODE: Record<string, string> = {
+  'promo cards': 'PROMO-X',
+  'promo cards/promo x-rares': 'PROMO-PX',
+  'promo cards/regular promos': 'PROMO-REG',
+  'promo cards/campaign promos': 'PROMO-CMP',
+  'promo cards/limited pack promos': 'PROMO-LIM',
+  'promo cards/jump promos': 'PROMO-JMP',
+  'promo cards/anime promos': 'PROMO-ANM',
+  'standard promo cards/regular promos': 'RP26-STD',
+  'standard promo cards/promo x-rares': 'PX26-STD',
+};
 
 /**
  * Normalizes spacing/hyphenation/casing variants of set identifiers (e.g. "BS 23", "bs-23" -> "BS23",
- * "26R SD 01" -> "26RSD01") without collapsing distinct sets ("BS01" vs "SD01" vs "01").
+ * "26R SD 01" -> "26RSD01", "PX 25" -> "PX25") without collapsing distinct sets ("BS01" vs "SD01" vs "01").
  */
 export function normalizeSetCode(rawCode: string): string {
+  const rawLower = String(rawCode || '').trim().toLowerCase();
+  if (PROMO_WIKI_TITLE_TO_CODE[rawLower]) {
+    return PROMO_WIKI_TITLE_TO_CODE[rawLower];
+  }
+
   const cleaned = String(rawCode || '')
     .trim()
     .replace(/^Category:/i, '')
@@ -234,7 +288,7 @@ export function normalizeSetCode(rawCode: string): string {
   const compact = cleaned.replace(/[\s_-]+/g, '').toUpperCase();
   if (
     compact &&
-    /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
+    /^(?:26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}[A-Z]?|EX\d{1,3}|CP\d{1,3}|PX\d{1,3}|P\d{2,3}|SJ\d{1,3}|KA\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
       compact
     )
   ) {
@@ -245,6 +299,11 @@ export function normalizeSetCode(rawCode: string): string {
 }
 
 export function sanitizeSetCode(rawTitle: string): string {
+  const rawLower = rawTitle.trim().toLowerCase();
+  if (PROMO_WIKI_TITLE_TO_CODE[rawLower]) {
+    return PROMO_WIKI_TITLE_TO_CODE[rawLower];
+  }
+
   const cleaned = rawTitle
     .trim()
     .replace(/^Category:/i, '')
@@ -253,7 +312,7 @@ export function sanitizeSetCode(rawTitle: string): string {
 
   const compactUpper = cleaned.replace(/[\s_-]+/g, '').toUpperCase();
   if (
-    /^(?:26R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}|EX\d{1,3}|CP\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
+    /^(?:26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\d{1,3}|SD\d{1,3}|CBX?\d{1,3}|BSC\d{1,3}|PB\d{1,3}|PC\d{1,3}|LM\d{1,3}[A-Z]?|EX\d{1,3}|CP\d{1,3}|PX\d{1,3}|P\d{2,3}|SJ\d{1,3}|KA\d{1,3}|HK[A-Z]{2}\d{1,3})$/i.test(
       compactUpper
     )
   ) {
@@ -266,7 +325,7 @@ export function sanitizeSetCode(rawTitle: string): string {
   }
 
   const embedded = cleaned.match(
-    /\b(26R[A-Z]{2,4}\d{1,3}|BS\s*\d{2,3}|SD\s*\d{2,3}|CBX?\s*\d{2,3}|BSC\s*\d{2,3}|PB\s*\d{2,3}|PC\s*\d{2,3}|HK(?:BP|SP)\d+)\b/i
+    /\b(26R[A-Z]{2,4}\d{1,3}|27R[A-Z]{2,4}\d{1,3}|BS\s*\d{2,3}|SD\s*\d{2,3}|CBX?\s*\d{2,3}|BSC\s*\d{2,3}|PB\s*\d{2,3}|PC\s*\d{2,3}|PX\s*\d{2}|CP\s*\d{2}|SJ\s*\d{2}|LM\s*\d{2}[A-Z]?|HK(?:BP|SP)\d+)\b/i
   );
   if (embedded) {
     return normalizeSetCode(embedded[1]);
@@ -289,6 +348,99 @@ export function isNumberOnlySetIdentifier(setCode: string, name?: string): boole
   }
   return false;
 }
+
+export function classifySetSourceCollection(set: {
+  setCode: string;
+  category?: SetCategory;
+  wikiTitle?: string;
+  sources?: string[];
+  name?: string;
+  sourceCollectionType?: SourceCollectionType;
+}): SourceCollectionType {
+  if (set.sourceCollectionType) return set.sourceCollectionType;
+  const code = (set.setCode || '').trim().toUpperCase();
+  const title = (set.wikiTitle || set.name || '').toLowerCase();
+  const sources = (set.sources || []).join(' ').toLowerCase();
+
+  if (
+    code === 'PX' ||
+    /^PX\d+/i.test(code) ||
+    /^RPX\d+/i.test(code) ||
+    code === 'PROMO-PX' ||
+    code === 'PROMO-PX-ARCHIVE' ||
+    title.includes('promo x-rare')
+  ) {
+    return 'px_series';
+  }
+  if (
+    /^CP\d+/i.test(code) ||
+    code === 'PROMO-CMP' ||
+    code === 'PROMO-CAMPAIGN-ARCHIVE' ||
+    title.includes('campaign promo')
+  ) {
+    return 'campaign';
+  }
+  if (
+    /^LM\d+/i.test(code) ||
+    /^SJ\d+/i.test(code) ||
+    code === 'PROMO-LIM' ||
+    code === 'PROMO-JMP' ||
+    title.includes('limited pack') ||
+    title.includes('jump') ||
+    title.includes('memorial pack') ||
+    title.includes('mermorial pack') ||
+    sources.includes('limited pack')
+  ) {
+    return 'event_prize';
+  }
+  if (
+    set.category === 'Collab Booster' ||
+    /^CB/i.test(code) ||
+    /^26RCB/i.test(code)
+  ) {
+    return 'collab_promo';
+  }
+  if (
+    set.category === 'Promo' ||
+    /^P\d{2}$/i.test(code) ||
+    /^RP\d+/i.test(code) ||
+    /^PROMO/i.test(code) ||
+    /^X\d+/i.test(code) ||
+    code === 'KFC' ||
+    code === 'EXPROMO' ||
+    sources.includes('promo')
+  ) {
+    return 'promo_list';
+  }
+  if (
+    set.category === 'Starter Deck' ||
+    set.category === 'Standard Starter' ||
+    /^SD\d+/i.test(code) ||
+    /^26RSD/i.test(code)
+  ) {
+    return 'starter_deck';
+  }
+  if (
+    set.category === 'Booster' ||
+    set.category === 'Standard Booster' ||
+    /^BS\d+/i.test(code) ||
+    /^26RBS/i.test(code)
+  ) {
+    return 'regular_booster';
+  }
+  return 'supplementary_other';
+}
+
+const SOURCE_COVERAGE_META: Array<{ sourceType: SourceCollectionType; label: string }> = [
+  { sourceType: 'regular_booster', label: 'Regular Boosters (BS / 26RBS)' },
+  { sourceType: 'starter_deck', label: 'Starter & Mega Decks (SD / 26RSD)' },
+  { sourceType: 'px_series', label: 'PX Promo X-Rares (PX / PX13–PX26+)' },
+  { sourceType: 'promo_list', label: 'Promo Lists (P-Series / RP / X / EX)' },
+  { sourceType: 'campaign', label: 'Campaign Promos (CP / Box-Toppers)' },
+  { sourceType: 'event_prize', label: 'Event, Magazine & Limited Packs (LM / SJ)' },
+  { sourceType: 'collab_promo', label: 'Collaboration Sets & Promos (CB / CBX)' },
+  { sourceType: 'supplementary_other', label: 'Supplementary, PB, PC, Revival & Tokens' },
+];
 
 function inferSetCategoryAndFormats(
   sectionHeading: string,
@@ -698,7 +850,14 @@ export async function discoverAllWikiSets(
   const discoveredByCode = new Map<string, DiscoveredSetRecord>();
 
   const registerDiscovered = (
-    input: Partial<ProductSet> & { setCode: string; wikiTitle: string },
+    input: Partial<ProductSet> & {
+      setCode: string;
+      wikiTitle: string;
+      sourceCollectionType?: SourceCollectionType;
+      scanSection?: string;
+      cardNumberPrefix?: string;
+      categorySweepTitles?: string[];
+    },
     sourceLabel: string,
     inSpiritsdexHint: boolean
   ) => {
@@ -713,12 +872,21 @@ export async function discoverAllWikiSets(
       code;
     const isNumOnly = isNumberOnlySetIdentifier(code, fallbackDisplayName);
     const inDex = Boolean(inSpiritsdexHint || dirMatch || baselineSetCodes.has(code));
+    const resolvedCategory = input.category || dirMatch?.category || 'Booster';
+    const resolvedCollectionType = classifySetSourceCollection({
+      setCode: code,
+      category: resolvedCategory,
+      wikiTitle: input.wikiTitle || dirMatch?.wikiTitle || code,
+      sources: [sourceLabel],
+      name: fallbackDisplayName,
+      sourceCollectionType: input.sourceCollectionType || existing?.sourceCollectionType,
+    });
 
     if (!existing) {
       const rec: DiscoveredSetRecord = {
         setCode: code,
         wikiTitle: input.wikiTitle || dirMatch?.wikiTitle || code,
-        category: input.category || dirMatch?.category || 'Booster',
+        category: resolvedCategory,
         name: fallbackDisplayName,
         jpName: input.jpName || dirMatch?.jpName || '',
         productType: input.productType || dirMatch?.productType || 'Booster Set',
@@ -741,6 +909,10 @@ export async function discoverAllWikiSets(
           dirMatch?.wikiUrl ||
           `${WIKI_BASE}${encodeURIComponent((input.wikiTitle || code).replace(/ /g, '_'))}`,
         sources: [sourceLabel],
+        sourceCollectionType: resolvedCollectionType,
+        ...(input.scanSection ? { scanSection: input.scanSection } : {}),
+        ...(input.cardNumberPrefix ? { cardNumberPrefix: input.cardNumberPrefix } : {}),
+        ...(input.categorySweepTitles?.length ? { categorySweepTitles: input.categorySweepTitles } : {}),
         isNumberOnly: isNumOnly,
         inSpiritsdex: inDex,
         scanStatus: 'pending',
@@ -768,10 +940,31 @@ export async function discoverAllWikiSets(
         ? input.name
         : existing.name || code;
 
+      const resolvedWikiTitle =
+        input.scanSection && input.wikiTitle
+          ? input.wikiTitle
+          : !existing.wikiTitle || existing.wikiTitle.toUpperCase() === code
+          ? input.wikiTitle || existing.wikiTitle || code
+          : existing.wikiTitle;
+
       const updated: DiscoveredSetRecord = {
         ...existing,
-        wikiTitle: existing.wikiTitle || input.wikiTitle || code,
+        wikiTitle: resolvedWikiTitle,
+        wikiUrl:
+          input.scanSection && input.wikiTitle
+            ? `${WIKI_BASE}${encodeURIComponent(input.wikiTitle.replace(/ /g, '_'))}`
+            : existing.wikiUrl,
         name: chosenName,
+        sourceCollectionType:
+          input.sourceCollectionType ||
+          existing.sourceCollectionType ||
+          resolvedCollectionType,
+        scanSection: input.scanSection || existing.scanSection,
+        cardNumberPrefix: input.cardNumberPrefix || existing.cardNumberPrefix,
+        categorySweepTitles:
+          input.categorySweepTitles?.length
+            ? Array.from(new Set([...(existing.categorySweepTitles || []), ...input.categorySweepTitles]))
+            : existing.categorySweepTitles,
         isNumberOnly: isNumberOnlySetIdentifier(code, chosenName),
         inSpiritsdex: existing.inSpiritsdex || inDex,
         sources: mergedSources,
@@ -842,7 +1035,7 @@ export async function discoverAllWikiSets(
     });
   }
 
-  // Source 2: Paginated Wiki Set Categories (cmcontinue exhausted completely)
+  // Source 2: Paginated Wiki Set Categories (including Limited Packs)
   const categoryQueries: Array<{ title: string; sectionHint: string }> = [
     { title: 'Category:Booster Sets', sectionHint: 'Booster Sets' },
     { title: 'Category:Starter Decks', sectionHint: 'Starter Decks' },
@@ -854,6 +1047,7 @@ export async function discoverAllWikiSets(
     { title: 'Category:Japanese Sets', sectionHint: 'Booster Sets' },
     { title: 'Category:Sets', sectionHint: 'Booster Sets' },
     { title: 'Category:Card Sets', sectionHint: 'Booster Sets' },
+    { title: 'Category:Limited Pack', sectionHint: 'Limited Pack Promo Sets' },
   ];
 
   for (const cat of categoryQueries) {
@@ -872,6 +1066,7 @@ export async function discoverAllWikiSets(
             formats: meta.formats,
             productType: meta.productType,
             blockLabel: meta.blockLabel,
+            ...(cat.title === 'Category:Limited Pack' ? { sourceCollectionType: 'event_prize' as const } : {}),
           },
           `wiki:${cat.title}`,
           false
@@ -887,22 +1082,24 @@ export async function discoverAllWikiSets(
     }
   }
 
-  // Source 3: Paginated Promo subpages
-  for (const prefix of ['Promo Cards', 'Standard Promo Cards']) {
+  // Source 3: Paginated Promo & Limited Pack subpages / prefixes
+  for (const prefix of ['Promo Cards', 'Standard Promo Cards', 'Limited Pack']) {
     try {
       const promoPages = await fetchPaginatedAllPagesPrefix(prefix, fetchFn);
       for (const title of promoPages) {
         const code = sanitizeSetCode(title);
         const isStd = title.toLowerCase().includes('standard');
+        const isLimited = prefix === 'Limited Pack';
         registerDiscovered(
           {
             setCode: code,
             wikiTitle: title,
             name: title,
-            category: 'Promo',
+            category: isLimited ? 'Promo' : 'Promo',
             formats: isStd ? ['Standard', 'Eternal'] : ['Eternal'],
             productType: 'Promo Set',
-            blockLabel: isStd ? 'Standard Promo' : 'Eternal Promo',
+            blockLabel: isStd ? 'Standard Promo' : isLimited ? 'Limited Pack' : 'Eternal Promo',
+            sourceCollectionType: isLimited ? 'event_prize' : undefined,
           },
           `wiki:allpages:${prefix}`,
           false
@@ -913,6 +1110,129 @@ export async function discoverAllWikiSets(
         setCode: 'DISCOVERY',
         page: `allpages:${prefix}`,
         message: err instanceof Error ? err.message : `Failed to crawl promo pages (${prefix})`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  // Source 4: Deep-crawl Promo, PX, Campaign, Jump & Limited Pack hub pages to discover PX/PX13..PX26+, P14..P25+, CP13+, SJ/LM sub-sets
+  const promoHubTitles = [
+    'Promo Cards/Promo X-Rares',
+    'Standard Promo Cards/Promo X-Rares',
+    'Promo Cards/Regular Promos',
+    'Standard Promo Cards/Regular Promos',
+    'Promo Cards/Campaign Promos',
+    'Promo Cards/Limited Pack Promos',
+    'Promo Cards/Jump Promos',
+    'Promo Cards',
+  ];
+  for (const hubTitle of promoHubTitles) {
+    try {
+      const hubRes = (await fetchFn({
+        action: 'query',
+        titles: hubTitle,
+        prop: 'revisions',
+        rvprop: 'content',
+        rvslots: 'main',
+        redirects: '1',
+      })) as {
+        query?: {
+          pages?: Record<string, { revisions?: { slots?: { main?: { '*'?: string } } }[] }>;
+        };
+      };
+      const hubWt = Object.values(hubRes.query?.pages || {})[0]?.revisions?.[0]?.slots?.main?.['*'] || '';
+      if (!hubWt) continue;
+
+      const extracted = extractPromoSectionsAndLinkedSets(hubWt, hubTitle);
+      for (const item of extracted) {
+        registerDiscovered(
+          {
+            setCode: item.setCode,
+            wikiTitle: item.wikiTitle,
+            name: item.name,
+            category: 'Promo',
+            formats: item.formats,
+            productType: 'Promo Set',
+            blockLabel: item.formats.includes('Standard') ? 'Standard Promo' : 'Eternal Promo',
+            sourceCollectionType: item.sourceKind,
+            scanSection: item.scanSection,
+            cardNumberPrefix: item.cardNumberPrefix,
+          },
+          `wiki:hub:${hubTitle}`,
+          false
+        );
+      }
+    } catch (err) {
+      errors.push({
+        setCode: 'DISCOVERY',
+        page: hubTitle,
+        message: err instanceof Error ? err.message : `Failed to crawl promo hub ${hubTitle}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  // Source 5: Card-level Promo / Campaign / Magazine Category Archives (captures category-only promos omitted from tables)
+  const promoCategorySweeps: Array<{
+    setCode: string;
+    name: string;
+    categories: string[];
+    sourceCollectionType: SourceCollectionType;
+  }> = [
+    {
+      setCode: 'PROMO-PX-ARCHIVE',
+      name: 'Category Archive: Promo X-Rare & PX Cards',
+      categories: ['Category:Promo X-Rare', 'Category:PX'],
+      sourceCollectionType: 'px_series',
+    },
+    {
+      setCode: 'PROMO-CAT-ARCHIVE',
+      name: 'Category Archive: Promo, Magazine & Special Cards',
+      categories: ['Category:Promo', 'Category:Magazine', 'Category:Special Rarity'],
+      sourceCollectionType: 'promo_list',
+    },
+    {
+      setCode: 'PROMO-CAMPAIGN-ARCHIVE',
+      name: 'Category Archive: Campaign Promo Cards',
+      categories: ['Category:Campaign Promo'],
+      sourceCollectionType: 'campaign',
+    },
+  ];
+
+  for (const sweep of promoCategorySweeps) {
+    try {
+      const collected = new Set<string>();
+      for (const catTitle of sweep.categories) {
+        const members = await fetchPaginatedCategoryMembers(catTitle, fetchFn, '0');
+        for (const t of members) {
+          if (t && !CARD_SETS_IGNORE_TITLES.has(t) && !t.includes('/')) {
+            collected.add(t);
+          }
+        }
+      }
+      if (collected.size > 0) {
+        registerDiscovered(
+          {
+            setCode: sweep.setCode,
+            wikiTitle: sweep.categories[0],
+            name: sweep.name,
+            category: 'Promo',
+            formats: ['Eternal'],
+            productType: 'Promo Set',
+            blockLabel: 'Category Card Sweep',
+            sourceCollectionType: sweep.sourceCollectionType,
+            categorySweepTitles: Array.from(collected),
+            totalCardsInSet: collected.size,
+          },
+          `wiki:${sweep.categories.join('+')}`,
+          false
+        );
+      }
+    } catch (err) {
+      errors.push({
+        setCode: sweep.setCode,
+        page: sweep.categories[0],
+        message: err instanceof Error ? err.message : `Failed to query promo category sweep ${sweep.setCode}`,
         timestamp: new Date().toISOString(),
       });
     }
@@ -1441,106 +1761,168 @@ export async function scanWikiSetByCode(
       }
     };
 
-    const candidateTitles = Array.from(
-      new Set([setRec.wikiTitle || canonicalCode, canonicalCode, rawSetInput].filter(Boolean))
-    );
-    let wikitext = '';
-    for (const titleCandidate of candidateTitles) {
-      const pageRes = (await fetchFn({
-        action: 'query',
-        titles: titleCandidate,
-        prop: 'revisions',
-        rvprop: 'content',
-        rvslots: 'main',
-        redirects: '1',
-      })) as {
-        query?: {
-          pages?: Record<
-            string,
-            { missing?: string; title?: string; revisions?: { slots?: { main?: { '*'?: string } } }[] }
-          >;
-        };
-      };
-      const pageObj = Object.values(pageRes.query?.pages || {})[0];
-      const fetchedWt = pageObj?.revisions?.[0]?.slots?.main?.['*'] || '';
-      if (fetchedWt) {
-        wikitext = fetchedWt;
-        break;
-      }
-    }
-
     const wikiTitle = setRec.wikiTitle || canonicalCode;
-    if (wikitext) {
-      for (const rowCard of parseSetTableRows(wikitext, setRec)) {
-        addRaw(rowCard);
-      }
-      // Run supplemental parsers EVEN when tables exist so numbered bullets, SetRow, and gallery cards never get missed
-      for (const loose of parseUnusualSetListings(wikitext, setRec, {
-        strictNumberOnly: rawCardsMap.size > 0,
-      })) {
-        addRaw(loose.card, loose.parseWarning);
-      }
-      const enriched = enrichSetMetadata(setRec, wikitext, Array.from(rawCardsMap.values()).map((v) => v.card));
-      setRec.name = enriched.name || setRec.name;
-      setRec.releaseDate = enriched.releaseDate || setRec.releaseDate;
-      setRec.tagline = enriched.tagline || setRec.tagline;
-      setRec.colors = enriched.colors || setRec.colors;
-      setRec.isNumberOnly = isNumberOnlySetIdentifier(setRec.setCode, setRec.name);
-    }
+    const isUmbrellaPromoHub = new Set([
+      'PROMO-PX',
+      'PROMO-REG',
+      'PROMO-CMP',
+      'PROMO-X',
+      'PROMO-LIM',
+      'PROMO-JMP',
+      'PROMO-ANM',
+    ]).has(canonicalCode);
 
-    // Fallback/supplemental category enumeration (`Category:<SetCode>` or `Category:<WikiTitle>`) with FULL pagination
-    if (rawCardsMap.size === 0 || canonicalCode === 'TOKENS' || canonicalCode === 'REVIVAL') {
-      const catCandidates =
-        canonicalCode === 'REVIVAL'
-          ? ['Category:Revival Cards']
-          : canonicalCode === 'TOKENS'
-          ? ['Category:Token Cards', "Category:Can't put in deck"]
-          : Array.from(new Set([`Category:${canonicalCode}`, `Category:${wikiTitle}`]));
+    if (setRec.categorySweepTitles && setRec.categorySweepTitles.length > 0) {
+      for (const title of setRec.categorySweepTitles) {
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        const isRev = /\(revival\)/i.test(title);
+        addRaw(
+          {
+            id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
+            cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
+            name: title.replace(/\s*\([^)]+\)\s*$/, ''),
+            jpName: '',
+            color: setRec.colors?.[0] || 'Red',
+            type: 'Spirit',
+            rarity: 'P',
+            setCode: canonicalCode,
+            setName: setRec.name || canonicalCode,
+            formats: setRec.formats?.length ? setRec.formats : ['Eternal'],
+            blockIcon: setRec.blockLabel || 'Wiki',
+            restriction: 'Unlimited',
+            isRevival: isRev,
+            cost: 0,
+            reduction: {},
+            symbols: {},
+            families: [],
+            effects: [],
+            keywords: [],
+            flavorText: '',
+            illustrator: '',
+            artworkImage: '',
+            artVariant: defaultVariant('Spirit', setRec.colors?.[0] || 'Red'),
+            wikiTitle: title,
+            wikiUrl: `${WIKI_BASE}${encodeURIComponent(title.replace(/ /g, '_'))}`,
+            isWikiLoaded: false,
+            rulings: [],
+          },
+          `Discovered from ${wikiTitle}`
+        );
+      }
+    } else {
+      const candidateTitles = Array.from(
+        new Set([wikiTitle, canonicalCode, rawSetInput].filter(Boolean))
+      );
+      let wikitext = '';
+      for (const titleCandidate of candidateTitles) {
+        const pageRes = (await fetchFn({
+          action: 'query',
+          titles: titleCandidate,
+          prop: 'revisions',
+          rvprop: 'content',
+          rvslots: 'main',
+          redirects: '1',
+        })) as {
+          query?: {
+            pages?: Record<
+              string,
+              { missing?: string; title?: string; revisions?: { slots?: { main?: { '*'?: string } } }[] }
+            >;
+          };
+        };
+        const pageObj = Object.values(pageRes.query?.pages || {})[0];
+        const fetchedWt = pageObj?.revisions?.[0]?.slots?.main?.['*'] || '';
+        if (fetchedWt) {
+          wikitext = fetchedWt;
+          break;
+        }
+      }
 
-      for (const catName of catCandidates) {
-        try {
-          const catMembers = await fetchPaginatedCategoryMembers(catName, fetchFn, '0');
-          for (const title of catMembers) {
-            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-            const isRev = canonicalCode === 'REVIVAL' || /\(revival\)/i.test(title);
-            const fallbackCard: BattleSpiritsCard = {
-              id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
-              cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
-              name: title.replace(/\s*\([^)]+\)\s*$/, ''),
-              jpName: '',
-              color: setRec.colors?.[0] || 'Red',
-              type: 'Spirit',
-              rarity: setRec.category === 'Promo' ? 'P' : 'C',
-              setCode: canonicalCode,
-              setName: setRec.name || canonicalCode,
-              formats: setRec.formats?.length ? setRec.formats : ['Eternal'],
-              blockIcon: setRec.blockLabel || 'Wiki',
-              restriction: 'Unlimited',
-              isRevival: isRev,
-              isToken: canonicalCode === 'TOKENS',
-              cost: 0,
-              reduction: {},
-              symbols: {},
-              families: [],
-              effects: [],
-              keywords: [],
-              flavorText: '',
-              illustrator: '',
-              artworkImage: '',
-              artVariant: defaultVariant('Spirit', setRec.colors?.[0] || 'Red'),
-              wikiTitle: title,
-              wikiUrl: `${WIKI_BASE}${encodeURIComponent(title.replace(/ /g, '_'))}`,
-              isWikiLoaded: false,
-              rulings: [],
-            };
-            addRaw(fallbackCard, `Discovered from ${catName}`);
+      if (wikitext) {
+        const isSectionScoped = Boolean(setRec.scanSection);
+        for (const rowCard of parseSetTableRows(wikitext, setRec, {
+          sectionFilter: setRec.scanSection || undefined,
+          resolveSubSeriesSets: isSectionScoped || isUmbrellaPromoHub,
+        })) {
+          addRaw(rowCard);
+        }
+        // Only run loose bullet/gallery fallback when not scoped to a single promo heading on a shared hub page
+        if (!isSectionScoped) {
+          for (const loose of parseUnusualSetListings(wikitext, setRec, {
+            strictNumberOnly: rawCardsMap.size > 0,
+          })) {
+            addRaw(loose.card, loose.parseWarning);
           }
-        } catch (catErr) {
-          warnings.push(
-            `Category lookup failed (${catName}): ${
-              catErr instanceof Error ? catErr.message : 'unknown error'
-            }`
+          const enriched = enrichSetMetadata(
+            setRec,
+            wikitext,
+            Array.from(rawCardsMap.values()).map((v) => v.card)
           );
+          setRec.name = enriched.name || setRec.name;
+          setRec.releaseDate = enriched.releaseDate || setRec.releaseDate;
+          setRec.tagline = enriched.tagline || setRec.tagline;
+          setRec.colors = enriched.colors || setRec.colors;
+          setRec.isNumberOnly = isNumberOnlySetIdentifier(setRec.setCode, setRec.name);
+        }
+      }
+
+      // Fallback/supplemental category enumeration (`Category:<SetCode>` or `Category:<WikiTitle>`) with FULL pagination
+      if (
+        !setRec.scanSection &&
+        (rawCardsMap.size === 0 || canonicalCode === 'TOKENS' || canonicalCode === 'REVIVAL')
+      ) {
+        const catCandidates =
+          canonicalCode === 'REVIVAL'
+            ? ['Category:Revival Cards']
+            : canonicalCode === 'TOKENS'
+            ? ['Category:Token Cards', "Category:Can't put in deck"]
+            : Array.from(new Set([`Category:${canonicalCode}`, `Category:${wikiTitle}`]));
+
+        for (const catName of catCandidates) {
+          try {
+            const catMembers = await fetchPaginatedCategoryMembers(catName, fetchFn, '0');
+            for (const title of catMembers) {
+              const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              const isRev = canonicalCode === 'REVIVAL' || /\(revival\)/i.test(title);
+              const fallbackCard: BattleSpiritsCard = {
+                id: `${canonicalCode.toLowerCase()}-${slug}${isRev ? '-rv' : ''}`,
+                cardNumber: `${canonicalCode}-${slug.slice(0, 8).toUpperCase()}`,
+                name: title.replace(/\s*\([^)]+\)\s*$/, ''),
+                jpName: '',
+                color: setRec.colors?.[0] || 'Red',
+                type: 'Spirit',
+                rarity: setRec.category === 'Promo' ? 'P' : 'C',
+                setCode: canonicalCode,
+                setName: setRec.name || canonicalCode,
+                formats: setRec.formats?.length ? setRec.formats : ['Eternal'],
+                blockIcon: setRec.blockLabel || 'Wiki',
+                restriction: 'Unlimited',
+                isRevival: isRev,
+                isToken: canonicalCode === 'TOKENS',
+                cost: 0,
+                reduction: {},
+                symbols: {},
+                families: [],
+                effects: [],
+                keywords: [],
+                flavorText: '',
+                illustrator: '',
+                artworkImage: '',
+                artVariant: defaultVariant('Spirit', setRec.colors?.[0] || 'Red'),
+                wikiTitle: title,
+                wikiUrl: `${WIKI_BASE}${encodeURIComponent(title.replace(/ /g, '_'))}`,
+                isWikiLoaded: false,
+                rulings: [],
+              };
+              addRaw(fallbackCard, `Discovered from ${catName}`);
+            }
+          } catch (catErr) {
+            warnings.push(
+              `Category lookup failed (${catName}): ${
+                catErr instanceof Error ? catErr.message : 'unknown error'
+              }`
+            );
+          }
         }
       }
     }
@@ -1554,12 +1936,14 @@ export async function scanWikiSetByCode(
     );
     const bundles = allTitles.length > 0 ? await batchFetchFn(allTitles) : new Map<string, WikiPageBundle>();
 
-    // Remove previous entries belonging exclusively to this scanned set before storing fresh scan entries
+    // Remove previous un-imported entries belonging to this scanned set before storing fresh scan entries
     for (const [k, existingEntry] of Object.entries(state.discoveredCards)) {
       if (existingEntry.sourceSetCode === canonicalCode && !existingEntry.imported) {
         delete state.discoveredCards[k];
       }
     }
+
+    const routedChildSetCodes = new Set<string>();
 
     for (const { card: rawCard, warning } of rawList) {
       const bundle = rawCard.wikiTitle ? bundles.get(rawCard.wikiTitle) : undefined;
@@ -1581,6 +1965,39 @@ export async function scanWikiSetByCode(
             if (rawImg && /\.(?:png|jpe?g|webp|gif)/i.test(rawImg)) {
               rawArtFile = rawImg;
             }
+            const fieldCardNum = cleanWikitextInline(
+              fields.cardnum || fields.number || fields.cardno || fields.cardnumber || fields.num || ''
+            )
+              .replace(/\s+/g, '')
+              .trim();
+            const isSyntheticNum =
+              setRec.categorySweepTitles?.length ||
+              !hydrated.cardNumber ||
+              hydrated.cardNumber.startsWith(`${canonicalCode}-`) && hydrated.cardNumber.includes('ARCHIVE');
+            if (fieldCardNum && (isSyntheticNum || hydrated.cardNumber === 'WIKI')) {
+              const cleanedNum = fieldCardNum.toUpperCase();
+              const subSet = resolvePromoSubSeriesSetCode(
+                cleanedNum,
+                cleanWikitextInline(fields.set1 || fields.set || ''),
+                hydrated.setCode || canonicalCode
+              );
+              const nextRarity = fields.rarity
+                ? normalizeRarity(cleanWikitextInline(fields.rarity))
+                : hydrated.rarity;
+              const slug = cleanedNum.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+              hydrated = {
+                ...hydrated,
+                cardNumber: cleanedNum,
+                rarity: nextRarity,
+                setCode: subSet || hydrated.setCode,
+                id: `${(subSet || hydrated.setCode).toLowerCase()}-${slug}${hydrated.isRevival ? '-rv' : ''}`,
+              };
+            } else if (fields.rarity) {
+              hydrated = {
+                ...hydrated,
+                rarity: normalizeRarity(cleanWikitextInline(fields.rarity)),
+              };
+            }
             for (const altKey of ['altname', 'alt', 'othername', 'engname', 'name']) {
               const val = cleanWikitextInline(fields[altKey] || '').trim();
               if (val && val !== hydrated.name) altNames.push(val);
@@ -1600,6 +2017,69 @@ export async function scanWikiSetByCode(
         hydrated = { ...hydrated, name: hydrated.jpName.trim() };
       }
 
+      // If this scan came from a virtual category-archive sweep or umbrella promo hub, route the card cleanly to its canonical sub-series setCode
+      let effectiveSourceSet = canonicalCode;
+      if (setRec.categorySweepTitles?.length || isUmbrellaPromoHub) {
+        const subSet = resolvePromoSubSeriesSetCode(
+          hydrated.cardNumber,
+          hydrated.setCode,
+          hydrated.setCode || canonicalCode
+        );
+        if (subSet && subSet !== canonicalCode && !subSet.endsWith('-ARCHIVE')) {
+          effectiveSourceSet = normalizeSetCode(subSet) || subSet;
+          if (!state.sets[effectiveSourceSet]) {
+            state.sets[effectiveSourceSet] = {
+              setCode: effectiveSourceSet,
+              wikiTitle: setRec.wikiTitle || effectiveSourceSet,
+              category: 'Promo',
+              name: effectiveSourceSet,
+              jpName: '',
+              productType: 'Promo Set',
+              releaseDate: hydrated.formats?.includes('Standard') ? '2026+' : 'All Eras',
+              formats: hydrated.formats?.length ? hydrated.formats : ['Eternal'],
+              blockLabel: hydrated.formats?.includes('Standard') ? 'Standard Promo' : 'Eternal Promo',
+              tagline: `${effectiveSourceSet} — Discovered from Battle Spirits Wiki.`,
+              featuredCardId: `${effectiveSourceSet.toLowerCase()}-01`,
+              colors: ALL_COLORS,
+              totalCardsInSet: 0,
+              wikiUrl: `${WIKI_BASE}${encodeURIComponent(setRec.wikiTitle || effectiveSourceSet)}`,
+              sources: [setRec.wikiTitle || `hub:${canonicalCode}`],
+              sourceCollectionType: classifySetSourceCollection({
+                setCode: effectiveSourceSet,
+                category: 'Promo',
+                wikiTitle: setRec.wikiTitle,
+              }),
+              isNumberOnly: false,
+              inSpiritsdex: false,
+              scanStatus: 'completed',
+              lastScanAt: new Date().toISOString(),
+              lastError: null,
+              discoveredCount: 0,
+              existingCount: 0,
+              missingCount: 0,
+              updatedCount: 0,
+              uncertainCount: 0,
+              duplicateCount: 0,
+              incompleteCount: 0,
+              missingArtworkCount: 0,
+            };
+            upsertStoredSetMetadata(state.sets[effectiveSourceSet]);
+          }
+          routedChildSetCodes.add(effectiveSourceSet);
+          hydrated = {
+            ...hydrated,
+            setCode: effectiveSourceSet,
+            setName: state.sets[effectiveSourceSet]?.name || effectiveSourceSet,
+          };
+        }
+      } else if (setRec.scanSection && hydrated.setCode !== canonicalCode) {
+        hydrated = {
+          ...hydrated,
+          setCode: canonicalCode,
+          setName: setRec.name || canonicalCode,
+        };
+      }
+
       if (!rawArtFile && bundle?.pageImages && bundle.pageImages.length > 0) {
         const usablePageImg = bundle.pageImages.find((f) =>
           /\.(?:png|jpe?g|webp|gif)$/i.test(f)
@@ -1614,13 +2094,13 @@ export async function scanWikiSetByCode(
       }
 
       const incompleteFields = evaluateIncompleteMetadata(hydrated, rawArtFile);
-      const discoveryKey = `${canonicalCode}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${(hydrated.wikiTitle || hydrated.name).toLowerCase().replace(/[^a-z0-9\p{L}\p{N}]+/gu, '-')}`;
+      const discoveryKey = `${effectiveSourceSet}::${normalizeCardNumForCompare(hydrated.cardNumber)}::${hydrated.isRevival ? 'rv' : 'orig'}::${(hydrated.wikiTitle || hydrated.name).toLowerCase().replace(/[^a-z0-9\p{L}\p{N}]+/gu, '-')}`;
       const existingEntry = state.discoveredCards[discoveryKey];
 
       state.discoveredCards[discoveryKey] = {
         discoveryKey,
         card: hydrated,
-        sourceSetCode: canonicalCode,
+        sourceSetCode: effectiveSourceSet,
         originalSetCode: rawSetInput || canonicalCode,
         sourceWikiTitle: hydrated.wikiTitle || hydrated.name,
         alternateNames: Array.from(new Set(altNames)),
@@ -1637,6 +2117,18 @@ export async function scanWikiSetByCode(
         imported: existingEntry?.imported ?? false,
         importedAt: existingEntry?.importedAt ?? null,
       };
+    }
+
+    for (const childCode of routedChildSetCodes) {
+      const child = state.sets[childCode];
+      if (child) {
+        child.scanStatus = 'completed';
+        child.lastScanAt = new Date().toISOString();
+        child.lastError = null;
+        state.failedSetCodes = state.failedSetCodes.filter((c) => c !== childCode);
+        state.pendingSetCodes = state.pendingSetCodes.filter((c) => c !== childCode);
+        upsertStoredSetMetadata(child);
+      }
     }
 
     setRec.scanStatus = 'completed';
@@ -1677,9 +2169,18 @@ export async function scanWikiSetByCode(
   }
 }
 
+const PROMO_SPECIAL_COLLECTION_TYPES = new Set<SourceCollectionType>([
+  'px_series',
+  'promo_list',
+  'campaign',
+  'event_prize',
+  'collab_promo',
+]);
+
 export async function runCatalogScanBatch(
   options: {
     mode: 'all' | 'resume' | 'retry_failed';
+    scope?: 'all' | 'promo_special';
     setCodes?: string[];
     maxSetsPerRun?: number;
   },
@@ -1700,24 +2201,58 @@ export async function runCatalogScanBatch(
       await discoverAllWikiSets(deps);
     }
 
+    const scopeIsPromo = options.scope === 'promo_special';
+    const matchesScope = (s: DiscoveredSetRecord) =>
+      !scopeIsPromo ||
+      PROMO_SPECIAL_COLLECTION_TYPES.has(classifySetSourceCollection(s)) ||
+      s.category === 'Promo';
+
     let queue: string[] = [];
     if (options.setCodes && options.setCodes.length > 0) {
       queue = options.setCodes.map((s) => s.trim().toUpperCase()).filter((s) => Boolean(state.sets[s]));
     } else if (options.mode === 'retry_failed') {
       queue = Array.from(
         new Set([
-          ...state.failedSetCodes,
+          ...state.failedSetCodes.filter((c) => !state.sets[c] || matchesScope(state.sets[c])),
           ...Object.values(state.sets)
-            .filter((s) => s.scanStatus === 'failed')
+            .filter((s) => s.scanStatus === 'failed' && matchesScope(s))
             .map((s) => s.setCode),
         ])
       );
-    } else if (options.mode === 'resume' && state.pendingSetCodes.length > 0) {
-      queue = [...state.pendingSetCodes];
+    } else if (options.mode === 'resume') {
+      const savedPending = state.pendingSetCodes.filter((c) => state.sets[c] && matchesScope(state.sets[c]));
+      const allPendingInScope = Object.values(state.sets)
+        .filter((s) => s.scanStatus === 'pending' && matchesScope(s))
+        .map((s) => s.setCode);
+      queue = Array.from(new Set([...savedPending, ...allPendingInScope]));
     } else {
       queue = Object.values(state.sets)
-        .filter((s) => (options.mode === 'all' ? true : s.scanStatus === 'pending'))
+        .filter(
+          (s) =>
+            matchesScope(s) &&
+            (options.mode === 'all' ? (scopeIsPromo ? s.scanStatus !== 'completed' : true) : s.scanStatus === 'pending')
+        )
         .map((s) => s.setCode);
+      if (scopeIsPromo && queue.length === 0 && options.mode === 'all') {
+        queue = Object.values(state.sets)
+          .filter(matchesScope)
+          .map((s) => s.setCode);
+      }
+    }
+
+    if (scopeIsPromo && queue.length > 1) {
+      const promoPriority = (setCode: string): number => {
+        const s = state.sets[setCode];
+        if (!s) return 99;
+        const t = classifySetSourceCollection(s);
+        if (t === 'px_series') return 0;
+        if (t === 'promo_list') return 1;
+        if (t === 'campaign') return 2;
+        if (t === 'event_prize') return 3;
+        if (t === 'collab_promo') return 4;
+        return 5;
+      };
+      queue.sort((a, b) => promoPriority(a) - promoPriority(b));
     }
 
     state.jobStatus = 'running';
@@ -1725,7 +2260,12 @@ export async function runCatalogScanBatch(
       state.startedAt = new Date().toISOString();
       state.completedAt = null;
     }
-    state.pendingSetCodes = [...queue];
+    const otherPendingOutsideScope = scopeIsPromo
+      ? Object.values(state.sets)
+          .filter((s) => s.scanStatus === 'pending' && !matchesScope(s))
+          .map((s) => s.setCode)
+      : [];
+    state.pendingSetCodes = Array.from(new Set([...queue, ...otherPendingOutsideScope]));
     state.totalSetsToScan =
       options.mode === 'resume'
         ? Math.max(state.totalSetsToScan, state.scannedSetsCount + queue.length)
@@ -1754,6 +2294,17 @@ export async function runCatalogScanBatch(
       saveCatalogScanState(state, deps?.stateFilePath);
     }
 
+    const processedOrFailedSet = new Set([...processedSets, ...failedSets]);
+    const remainingQueue = queue.filter(
+      (c) => !processedOrFailedSet.has(c) && state.sets[c]?.scanStatus === 'pending'
+    );
+    const remainingOtherPending = state.pendingSetCodes.filter(
+      (c) =>
+        !processedOrFailedSet.has(c) &&
+        !remainingQueue.includes(c) &&
+        state.sets[c]?.scanStatus === 'pending'
+    );
+    state.pendingSetCodes = [...remainingQueue, ...remainingOtherPending];
     state.jobStatus = state.pendingSetCodes.length > 0 ? 'paused' : 'completed';
     if (state.jobStatus === 'completed') {
       state.completedAt = new Date().toISOString();
@@ -2007,6 +2558,9 @@ export function executeCatalogImport(
     entry.importedAt = nowIso;
     entry.classification = 'matched';
     touchedSets.add(entry.sourceSetCode);
+    if (entry.card.setCode) {
+      touchedSets.add(entry.card.setCode.trim().toUpperCase());
+    }
   }
 
   for (const code of touchedSets) {
@@ -2042,6 +2596,89 @@ export function getCatalogOverview(deps?: CatalogDependencies): CatalogOverviewS
   const setsList = Object.values(state.sets);
   const cardsList = Object.values(state.discoveredCards);
 
+  const sourceBucketsMap = new Map<SourceCollectionType, SourceCoverageBucket>();
+  for (const meta of SOURCE_COVERAGE_META) {
+    sourceBucketsMap.set(meta.sourceType, {
+      sourceType: meta.sourceType,
+      label: meta.label,
+      setsDiscovered: 0,
+      setsScanned: 0,
+      setsPending: 0,
+      setsFailed: 0,
+      cardsDiscovered: 0,
+      cardsMatched: 0,
+      cardsMissing: 0,
+      cardsImportable: 0,
+      status: 'unscanned',
+    });
+  }
+
+  const setTypeByCode = new Map<string, SourceCollectionType>();
+  for (const s of setsList) {
+    const sType = classifySetSourceCollection(s);
+    setTypeByCode.set(s.setCode.toUpperCase(), sType);
+    const b = sourceBucketsMap.get(sType)!;
+    b.setsDiscovered++;
+    if (s.scanStatus === 'completed') b.setsScanned++;
+    else if (s.scanStatus === 'failed') b.setsFailed++;
+    else b.setsPending++;
+  }
+
+  for (const c of cardsList) {
+    const sType =
+      setTypeByCode.get(c.sourceSetCode.toUpperCase()) ||
+      classifySetSourceCollection({
+        setCode: c.sourceSetCode,
+        name: c.card.setName,
+        wikiTitle: c.sourceWikiTitle,
+      });
+    const b = sourceBucketsMap.get(sType)!;
+    b.cardsDiscovered++;
+    if (c.classification === 'matched') b.cardsMatched++;
+    else if (c.classification === 'missing') {
+      b.cardsMissing++;
+      if (c.card.id && c.card.cardNumber && c.card.name && c.card.setCode) {
+        b.cardsImportable++;
+      }
+    } else if (c.approvedForImport && !c.imported) {
+      b.cardsImportable++;
+    }
+  }
+
+  const sourceCoverage = Array.from(sourceBucketsMap.values()).map((b) => {
+    let status: SourceCoverageBucket['status'] = 'unscanned';
+    if (b.setsDiscovered === 0) status = 'unscanned';
+    else if (b.setsFailed > 0 && b.setsScanned === 0) status = 'failed';
+    else if (b.setsScanned === b.setsDiscovered && b.setsFailed === 0 && b.setsPending === 0) {
+      status = 'complete';
+    } else if (b.setsPending === b.setsDiscovered) {
+      status = 'pending';
+    } else {
+      status = 'partial';
+    }
+    return { ...b, status };
+  });
+
+  const promoTypes = new Set<SourceCollectionType>(['px_series', 'promo_list', 'campaign', 'event_prize']);
+  const promoBuckets = sourceCoverage.filter((b) => promoTypes.has(b.sourceType));
+  const promoSetsDiscovered = promoBuckets.reduce((s, b) => s + b.setsDiscovered, 0);
+  const promoSetsScanned = promoBuckets.reduce((s, b) => s + b.setsScanned, 0);
+  const promoCardsFound = promoBuckets.reduce((s, b) => s + b.cardsDiscovered, 0);
+  const promoCardsMissing = promoBuckets.reduce((s, b) => s + b.cardsMissing, 0);
+
+  const incompleteBuckets = sourceCoverage.filter((b) => b.status !== 'complete');
+  const coverageComplete = setsList.length > 0 && incompleteBuckets.length === 0;
+  let coverageWarning: string | null = null;
+  if (setsList.length === 0) {
+    coverageWarning = 'No Wiki sets discovered yet. Run Discover Wiki Sets to initialize full catalog coverage.';
+  } else if (!coverageComplete) {
+    const summaryParts = incompleteBuckets
+      .filter((b) => b.setsDiscovered > 0 || promoTypes.has(b.sourceType))
+      .slice(0, 4)
+      .map((b) => `${b.label} (${b.setsScanned}/${b.setsDiscovered} scanned, ${b.setsFailed} failed)`);
+    coverageWarning = `Catalog coverage is NOT complete yet — incomplete source(s): ${summaryParts.join('; ')}`;
+  }
+
   return {
     totalWikiSetsDiscovered: setsList.length,
     totalSetsInSpiritsdex: setsList.filter((s) => s.inSpiritsdex).length,
@@ -2049,6 +2686,10 @@ export function getCatalogOverview(deps?: CatalogDependencies): CatalogOverviewS
     setsPending: setsList.filter((s) => s.scanStatus === 'pending' || s.scanStatus === 'scanning').length,
     setsFailed: setsList.filter((s) => s.scanStatus === 'failed').length,
     numberOnlySetsCount: setsList.filter((s) => s.isNumberOnly).length,
+    promoSetsDiscovered,
+    promoSetsScanned,
+    promoCardsFound,
+    promoCardsMissing,
     totalWikiCardsDiscovered: cardsList.length,
     existingCardsMatched: cardsList.filter((c) => c.classification === 'matched').length,
     missingCards: cardsList.filter((c) => c.classification === 'missing').length,
@@ -2064,6 +2705,9 @@ export function getCatalogOverview(deps?: CatalogDependencies): CatalogOverviewS
     incompleteMetadataCards: cardsList.filter((c) => c.incompleteFields.length > 0).length,
     missingArtworkCards: cardsList.filter((c) => !c.hasArtworkHint).length,
     importedCardsCount: Object.keys(state.importedCards).length,
+    coverageComplete,
+    coverageWarning,
+    sourceCoverage,
     jobStatus: state.jobStatus,
     currentSetCode: state.currentSetCode,
     scannedSetsCount: state.scannedSetsCount,
@@ -2095,6 +2739,10 @@ export function getCatalogDashboardSnapshot(
       sets = sets.filter((s) => s.isNumberOnly);
     } else if (options.setFilter === 'missing_from_db') {
       sets = sets.filter((s) => !s.inSpiritsdex || s.missingCount > 0);
+    } else if (options.setFilter === 'promo_special') {
+      sets = sets.filter((s) =>
+        PROMO_SPECIAL_COLLECTION_TYPES.has(classifySetSourceCollection(s)) || s.category === 'Promo'
+      );
     } else {
       sets = sets.filter((s) => s.scanStatus === options.setFilter);
     }

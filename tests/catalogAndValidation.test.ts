@@ -12,9 +12,11 @@ import {
   type ManualWikiMappingEntry,
 } from '../src/utils/ManualWikiMapping.ts';
 import {
+  classifySetSourceCollection,
   compareCatalogWithWiki,
   discoverAllWikiSets,
   executeCatalogImport,
+  getCatalogDashboardSnapshot,
   getCatalogOverview,
   normalizeSetCode,
   runCatalogScanBatch,
@@ -39,7 +41,14 @@ import {
 } from '../server/manualUrlValidator.ts';
 import { createScheduledValidationHandler } from '../server/api/validation/scheduled.ts';
 import { createArtworkValidationRouter } from '../server/controllers/artworkValidationController.ts';
-import { parseSetTableRows, enrichSetMetadata, type WikiPageBundle } from '../server/wikiService.ts';
+import {
+  enrichSetMetadata,
+  extractPromoSectionsAndLinkedSets,
+  normalizeRarity,
+  parseSetTableRows,
+  resolvePromoSubSeriesSetCode,
+  type WikiPageBundle,
+} from '../server/wikiService.ts';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spiritsdex-test-'));
 
@@ -517,6 +526,255 @@ describe('Wiki Catalog Discovery, Comparison, and Safe Import', () => {
     assert.equal(validation.skippedUncertain, 1);
     assert.equal(validation.rejectedCards.length, 1, 'Rejection diagnostic emitted for skipped uncertain card');
     assert.equal(validation.rejectedCards[0].cardNumber, 'BS73-099');
+  });
+
+  it('normalizes PX/promo rarity and sub-series dynamically including future PX27+ and extracts promo hub sections', () => {
+    assert.equal(normalizeRarity('PX'), 'P');
+    assert.equal(normalizeRarity('SJ'), 'P');
+    assert.equal(normalizeRarity('LM'), 'P');
+    assert.equal(normalizeRarity('GX'), 'P');
+
+    assert.equal(resolvePromoSubSeriesSetCode('PX25-01', '', 'PROMO-PX'), 'PX25');
+    assert.equal(resolvePromoSubSeriesSetCode('PX26-01', '', 'PROMO-PX'), 'PX26');
+    assert.equal(resolvePromoSubSeriesSetCode('PX27-01', '', 'PROMO-PX'), 'PX27');
+    assert.equal(resolvePromoSubSeriesSetCode('RPX26-01', '', 'PROMO-REG'), 'PX26-STD');
+    assert.equal(resolvePromoSubSeriesSetCode('RP26-01', '', 'PROMO-REG'), 'RP26-STD');
+    assert.equal(resolvePromoSubSeriesSetCode('P25-03', '', 'PROMO-REG'), 'P25');
+    assert.equal(resolvePromoSubSeriesSetCode('CP14-01', '', 'PROMO-REG'), 'CP14');
+    assert.equal(resolvePromoSubSeriesSetCode('PX-01', '== PX19 ==', 'PROMO-PX'), 'PX19');
+    assert.equal(resolvePromoSubSeriesSetCode('PX01', '== PX ==', 'PROMO-PX'), 'PX');
+
+    assert.equal(
+      classifySetSourceCollection({ setCode: 'PX26', name: 'PX26', wikiTitle: 'Promo Cards/Promo X-Rares' }),
+      'px_series'
+    );
+    assert.equal(
+      classifySetSourceCollection({ setCode: 'CP14', name: 'Campaign 2014' }),
+      'campaign'
+    );
+    assert.equal(
+      classifySetSourceCollection({ setCode: 'SJ15', name: 'Saikyou Jump 2015' }),
+      'event_prize'
+    );
+
+    const promoHubText = `
+== PX25 ==
+{{SetRow|PX25-01|Apollo PX25|Spirit|Red|PX}}
+== PX26 ==
+{{SetRow|PX26-01|Solar PX26|Spirit|Red|PX}}
+== PX27 ==
+{{SetRow|PX27-01|Future PX27|Spirit|Blue|PX}}
+* [[Promo Cards/P26]]
+`;
+    const extracted = extractPromoSectionsAndLinkedSets(promoHubText, 'Promo Cards/Promo X-Rares');
+    assert.ok(extracted.some((s) => s.setCode === 'PX25'));
+    assert.ok(extracted.some((s) => s.setCode === 'PX26'));
+    assert.ok(extracted.some((s) => s.setCode === 'PX27'));
+    assert.ok(extracted.some((s) => s.wikiTitle === 'Promo Cards/P26'));
+
+    const inlineHubWikitext = `|}==Promo 25=={| align="center" border="1"| style="text-align: center;" |'''Number'''| style="text-align: center;" |'''Name'''| style="text-align: center;" |'''Color'''| style="text-align: center;" |'''Type'''|-|P25-01|[[The Dana Corporal]]|{{Blue}}|Spirit|-|}==Campaign Promos 14=={| align="center" border="1"| style="text-align: center;" |'''Number'''| style="text-align: center;" |'''Name'''| style="text-align: center;" |'''Color'''| style="text-align: center;" |'''Type'''|-|CP14-01|[[Ultimate-Siegfried-Baby]]|{{Red}}|Ultimate|-|}`;
+    const inlineSections = extractPromoSectionsAndLinkedSets(inlineHubWikitext, 'Promo Cards/Regular Promos');
+    assert.ok(inlineSections.some((s) => s.setCode === 'P25' && s.scanSection === 'Promo 25'));
+    assert.ok(inlineSections.some((s) => s.setCode === 'CP14' && s.scanSection === 'Campaign Promos 14'));
+
+    const p25Parsed = parseSetTableRows(
+      inlineHubWikitext,
+      {
+        setCode: 'P25',
+        name: 'Regular Promos P25',
+        jpName: '',
+        category: 'Promo',
+        productType: 'Promo Set',
+        releaseDate: '',
+        blockLabel: 'Promo',
+        formats: ['Eternal'],
+        tagline: 'Promo cards',
+        featuredCardId: '',
+        colors: [],
+        totalCardsInSet: 0,
+        wikiUrl: '',
+      },
+      { sectionFilter: 'Promo 25', resolveSubSeriesSets: true }
+    );
+    assert.equal(p25Parsed.length, 1);
+    assert.equal(p25Parsed[0].cardNumber, 'P25-01');
+    assert.equal(p25Parsed[0].color, 'Blue');
+
+    const cp14Parsed = parseSetTableRows(
+      inlineHubWikitext,
+      {
+        setCode: 'CP14',
+        name: 'Campaign Promos CP14',
+        jpName: '',
+        category: 'Promo',
+        productType: 'Promo Set',
+        releaseDate: '',
+        blockLabel: 'Promo',
+        formats: ['Eternal'],
+        tagline: 'Campaign promo cards',
+        featuredCardId: '',
+        colors: [],
+        totalCardsInSet: 0,
+        wikiUrl: '',
+      },
+      { sectionFilter: 'Campaign Promos 14', resolveSubSeriesSets: true }
+    );
+    assert.equal(cp14Parsed.length, 1);
+    assert.equal(cp14Parsed[0].cardNumber, 'CP14-01');
+    assert.equal(cp14Parsed[0].type, 'Ultimate');
+  });
+
+  it('discovers PX/promo hubs & category sweeps, imports artwork-less promo cards idempotently, and enforces honest sourceCoverage warnings', async () => {
+    const promoStateFile = path.join(tmpDir, `promo-coverage-${Date.now()}.json`);
+    const promoDeps: CatalogDependencies = {
+      stateFilePath: promoStateFile,
+      existingCardsProvider: () => [
+        makeBaselineCard({
+          id: 'bs01-001',
+          cardNumber: 'BS01-001',
+          name: 'Drake Knight',
+          setCode: 'BS01',
+        }),
+      ],
+      fetchWikiJsonFn: async (params) => {
+        if (params.list === 'categorymembers') {
+          if (params.cmtitle === 'Category:Booster Sets' && !params.cmcontinue) {
+            return { query: { categorymembers: [{ title: 'BS01' }] } };
+          }
+          if (params.cmtitle === 'Category:Promo X-Rare' && !params.cmcontinue) {
+            return {
+              query: {
+                categorymembers: [{ title: 'Archive Cat PX28 Card' }],
+              },
+            };
+          }
+          return { query: { categorymembers: [] } };
+        }
+        if (params.list === 'allpages') {
+          return { query: { allpages: [] } };
+        }
+        if (params.prop === 'revisions') {
+          const t = String(params.titles || '');
+          const pagesMap: Record<string, string> = {
+            'Card Sets': `
+== Booster Sets ==
+* [[BS01]]
+== Promotional Cards ==
+* [[Promo Cards/Promo X-Rares]]
+`,
+            BS01: `{| class="wikitable"\n! Card Number !! Card Name\n|-\n| BS01-001 || [[Drake Knight]]\n|}`,
+            'Promo Cards/Promo X-Rares': `
+== PX25 ==
+{| class="wikitable"
+! Card Number !! Card Name !! Card Type !! Color !! Rarity
+|-
+| PX25-01 || [[Flame Tiger PX25]] || Spirit || Red || PX
+|}
+== PX26 ==
+{| class="wikitable"
+! Card Number !! Card Name !! Card Type !! Color !! Rarity
+|-
+| PX26-01 || [[Artworkless Star PX26]] || Spirit || White || PX
+|}
+== PX27 ==
+{| class="wikitable"
+! Card Number !! Card Name !! Card Type !! Color !! Rarity
+|-
+| PX27-01 || [[Horizon Dragon PX27]] || Spirit || Blue || PX
+|}
+`,
+          };
+          const wt = pagesMap[t];
+          if (!wt) return { query: { pages: { '-1': { title: t, missing: '' } } } };
+          return {
+            query: {
+              pages: {
+                '301': {
+                  title: t,
+                  revisions: [{ slots: { main: { '*': wt } } }],
+                },
+              },
+            },
+          };
+        }
+        return { query: {} };
+      },
+      batchFetchPagesFn: async (titles) => {
+        const out = new Map<string, WikiPageBundle>();
+        for (const t of titles) {
+          if (t === 'Drake Knight') {
+            out.set(t, { wikitext: '{{CardTableV2|name=Drake Knight|color=Red|cost=3}}', pageImages: ['BS01-001.png'] });
+          } else if (t === 'Flame Tiger PX25') {
+            out.set(t, { wikitext: '{{CardTableV2|name=Flame Tiger PX25|color=Red|cost=4|cardnum=PX25-01}}', pageImages: ['PX25-01.png'] });
+          } else if (t === 'Artworkless Star PX26') {
+            // Explicitly NO artwork
+            out.set(t, { wikitext: '{{CardTableV2|name=Artworkless Star PX26|color=White|cost=5|cardnum=PX26-01}}', pageImages: [] });
+          } else if (t === 'Horizon Dragon PX27') {
+            out.set(t, { wikitext: '{{CardTableV2|name=Horizon Dragon PX27|color=Blue|cost=6|cardnum=PX27-01}}', pageImages: [] });
+          } else if (t === 'Archive Cat PX28 Card') {
+            out.set(t, { wikitext: '{{CardTableV2|name=Archive Cat PX28 Card|color=Yellow|cost=3|cardnum=PX28-01|rarity=PX}}', pageImages: [] });
+          }
+        }
+        return out;
+      },
+    };
+
+    const discovery = await discoverAllWikiSets(promoDeps);
+    assert.ok(discovery.sets.some((s) => s.setCode === 'PX25'), 'PX25 sub-series discovered');
+    assert.ok(discovery.sets.some((s) => s.setCode === 'PX26'), 'PX26 sub-series discovered');
+    assert.ok(discovery.sets.some((s) => s.setCode === 'PX27'), 'Future PX27 sub-series discovered');
+    assert.ok(
+      discovery.sets.some((s) => s.setCode === 'PROMO-PX-ARCHIVE'),
+      'Category-only PX archive sweep discovered'
+    );
+
+    // Before scanning anything, coverage must be marked incomplete with warning
+    const initialOverview = getCatalogOverview(promoDeps);
+    assert.equal(initialOverview.coverageComplete, false);
+    assert.ok(initialOverview.coverageWarning, 'Emits honest incomplete coverage warning');
+
+    // Run promo_special scoped batch: should scan promo/PX sources while leaving BS01 pending
+    await runCatalogScanBatch({ mode: 'all', scope: 'promo_special', maxSetsPerRun: 50 }, promoDeps);
+    const snapPromoOnly = getCatalogDashboardSnapshot({ setFilter: 'promo_special' }, promoDeps);
+    assert.ok(snapPromoOnly.sets.every((s) => s.setCode !== 'BS01'));
+    assert.ok(snapPromoOnly.sets.some((s) => s.setCode === 'PX26' && s.scanStatus === 'completed'));
+
+    const postPromoOverview = getCatalogOverview(promoDeps);
+    assert.equal(
+      postPromoOverview.coverageComplete,
+      false,
+      'Must still report incomplete coverage because BS01 regular_booster remains pending'
+    );
+    assert.ok(postPromoOverview.promoCardsFound >= 4);
+    assert.ok(postPromoOverview.promoCardsMissing >= 4);
+
+    // Confirm artwork-less PX26-01 is flagged missing (not dropped) and imports cleanly
+    const cmp = compareCatalogWithWiki(promoDeps);
+    const px26Entry = cmp.entries.find((e) => e.card.cardNumber === 'PX26-01');
+    const px28CatEntry = cmp.entries.find((e) => e.card.cardNumber === 'PX28-01');
+    assert.equal(px26Entry?.classification, 'missing');
+    assert.equal(px26Entry?.hasArtworkHint, false);
+    assert.equal(px26Entry?.card.rarity, 'P');
+    assert.equal(px28CatEntry?.classification, 'missing');
+
+    const importRes1 = executeCatalogImport({}, promoDeps);
+    assert.ok(importRes1.addedCardsCount >= 4, 'Imports PX25, artwork-less PX26, PX27, and category-sweep PX28 cards');
+    assert.ok(
+      importRes1.importedCards.some((c) => c.cardNumber === 'PX26-01' && c.setCode === 'PX26'),
+      'Artwork-less PX26-01 imported cleanly with PX26 setCode'
+    );
+
+    // Repeat import is strictly idempotent
+    const importRes2 = executeCatalogImport({}, promoDeps);
+    assert.equal(importRes2.addedCardsCount, 0);
+
+    // Scanning all remaining pending sets transitions coverageComplete to true when 0 pending/failed
+    await runCatalogScanBatch({ mode: 'resume', maxSetsPerRun: 5000 }, promoDeps);
+    const finalOverview = getCatalogOverview(promoDeps);
+    assert.equal(finalOverview.setsPending, 0);
+    assert.equal(finalOverview.setsFailed, 0);
+    assert.equal(finalOverview.coverageComplete, true);
+    assert.equal(finalOverview.coverageWarning, null);
   });
 });
 

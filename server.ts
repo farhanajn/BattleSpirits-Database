@@ -306,20 +306,24 @@ async function startServer() {
       const rawMode = String(req.body?.mode || 'all');
       const mode: 'all' | 'resume' | 'retry_failed' =
         rawMode === 'resume' || rawMode === 'retry_failed' ? rawMode : 'all';
+      const rawScope = String(req.body?.scope || 'all');
+      const scope: 'all' | 'promo_special' =
+        rawScope === 'promo_special' ? 'promo_special' : 'all';
       const maxSetsPerRun =
         typeof req.body?.maxSetsPerRun === 'number' && req.body.maxSetsPerRun > 0
-          ? req.body.maxSetsPerRun
+          ? Math.min(200, Math.floor(req.body.maxSetsPerRun))
           : 15;
       const setCodes = Array.isArray(req.body?.setCodes)
-        ? req.body.setCodes.map((s: unknown) => String(s))
+        ? req.body.setCodes.slice(0, 200).map((s: unknown) => String(s))
         : undefined;
 
       const result = await runCatalogScanBatch({
         mode,
+        scope,
         maxSetsPerRun,
         setCodes,
       });
-      res.json({ mode, ...result });
+      res.json({ mode, scope, ...result });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Catalog scan failed';
       const status = /already running/i.test(message) ? 409 : 500;

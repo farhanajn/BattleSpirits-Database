@@ -18,7 +18,11 @@ import { CardArtwork } from './CardArtwork';
 import { CardThumbnail } from './CardThumbnail';
 import { SymbolIcon } from './SymbolIcon';
 import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
-import { buildSetSearchTokens, matchesIndexedSetQuery } from '../utils/setMetadataSync';
+import {
+  buildSetSearchTokens,
+  matchesIndexedSetQuery,
+  normalizeSetIdentifier,
+} from '../utils/setMetadataSync';
 
 type SetCategoryTab =
   | 'all'
@@ -183,13 +187,7 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
     });
   }, [formatFilteredSets, setCategory, setQuery, setTokensByCode]);
 
-  const normalizeSetKey = (raw: string) =>
-    (raw || '')
-      .trim()
-      .toUpperCase()
-      .replace(/\s+/g, '')
-      .replace(/^(26R)-(BS|SD|EB|DB|CB)(\d+)$/, '$1$2$3')
-      .replace(/([A-Z])[-]+(\d)/g, '$1$2');
+  const normalizeSetKey = (raw: string) => normalizeSetIdentifier(raw);
 
   // Single O(N) pass to compute available cards per set for the active format
   const cardCountsBySet = useMemo(() => {

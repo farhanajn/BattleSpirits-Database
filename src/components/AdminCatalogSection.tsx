@@ -27,6 +27,20 @@ import {
 
 type AdminSubTab = 'overview' | 'review' | 'validation';
 
+interface SourceCoverageBucketRow {
+  sourceType: string;
+  label: string;
+  setsDiscovered: number;
+  setsScanned: number;
+  setsPending: number;
+  setsFailed: number;
+  cardsDiscovered: number;
+  cardsMatched: number;
+  cardsMissing: number;
+  cardsImportable: number;
+  status: 'complete' | 'partial' | 'pending' | 'failed' | 'unscanned';
+}
+
 interface CatalogOverview {
   totalWikiSetsDiscovered: number;
   totalSetsInSpiritsdex: number;
@@ -34,6 +48,10 @@ interface CatalogOverview {
   setsPending: number;
   setsFailed: number;
   numberOnlySetsCount: number;
+  promoSetsDiscovered?: number;
+  promoSetsScanned?: number;
+  promoCardsFound?: number;
+  promoCardsMissing?: number;
   totalWikiCardsDiscovered: number;
   existingCardsMatched: number;
   missingCards: number;
@@ -43,6 +61,9 @@ interface CatalogOverview {
   incompleteMetadataCards: number;
   missingArtworkCards: number;
   importedCardsCount: number;
+  coverageComplete?: boolean;
+  coverageWarning?: string | null;
+  sourceCoverage?: SourceCoverageBucketRow[];
   jobStatus: string;
   currentSetCode: string | null;
   scannedSetsCount: number;
@@ -401,6 +422,29 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       await loadCatalogStatus();
     } catch (err) {
       onNotify?.(err instanceof Error ? err.message : 'Catalog scan failed');
+    } finally {
+      setCatalogBusy(false);
+    }
+  };
+
+  const handleScanPromosSpecial = async () => {
+    setCatalogBusy(true);
+    try {
+      const res = await fetch('/api/admin/catalog/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'all', scope: 'promo_special', maxSetsPerRun: 40 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'PX & Promo scan failed');
+      const processed = Array.isArray(data.processedSets) ? data.processedSets.length : 0;
+      const failed = Array.isArray(data.failedSets) ? data.failedSets.length : 0;
+      onNotify?.(
+        `Scanned ${processed} PX/promo source(s)${failed > 0 ? ` (${failed} failed)` : ''} · ${data.overview?.promoCardsMissing ?? 0} missing promo cards detected`
+      );
+      await loadCatalogStatus();
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'PX & Promo scan failed');
     } finally {
       setCatalogBusy(false);
     }
@@ -875,6 +919,16 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                   <span>Scan Batch (12)</span>
                 </button>
 
+                <button
+                  type="button"
+                  disabled={catalogBusy}
+                  onClick={() => void handleScanPromosSpecial()}
+                  className="min-h-[38px] px-3.5 rounded-xl bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>Scan PX &amp; Promos</span>
+                </button>
+
                 {autoScanning ? (
                   <button
                     type="button"
@@ -984,6 +1038,66 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                         )}%`,
                       }}
                     />
+                  </div>
+                </div>
+              )}
+
+              {/* Honest Source-Coverage Accounting Breakdown */}
+              {overview && Array.isArray(overview.sourceCoverage) && overview.sourceCoverage.length > 0 && (
+                <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-bold text-slate-900">
+                        Wiki Source Coverage Breakdown (PX, Promo, Campaign, Event &amp; Regular Sets)
+                      </div>
+                      <div className="text-[11px] text-slate-500">
+                        Promo &amp; special sets scanned: {overview.promoSetsScanned ?? 0}/
+                        {overview.promoSetsDiscovered ?? 0} · Promo cards found:{' '}
+                        {overview.promoCardsFound ?? 0} ({overview.promoCardsMissing ?? 0} missing)
+                      </div>
+                    </div>
+                    {overview.coverageComplete ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold shrink-0">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>All Discovered Sources Scanned</span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-[11px] font-semibold shrink-0">
+                        <AlertTriangle className="w-3.5 h-3.5" />
+                        <span>Partial Coverage (Incomplete)</span>
+                      </span>
+                    )}
+                  </div>
+
+                  {overview.coverageWarning && (
+                    <div
+                      role="status"
+                      className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-950 flex items-start gap-2"
+                    >
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0 mt-0.5" />
+                      <span>{overview.coverageWarning}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                    {overview.sourceCoverage.map((bucket) => (
+                      <div
+                        key={bucket.sourceType}
+                        className="p-2.5 rounded-xl bg-white border border-slate-200/80 space-y-1 text-[11px]"
+                      >
+                        <div className="flex items-center justify-between gap-1.5">
+                          <span className="font-semibold text-slate-900 truncate">{bucket.label}</span>
+                          {renderStatusBadge(bucket.status)}
+                        </div>
+                        <div className="font-mono text-slate-600 flex items-center justify-between tabular-nums">
+                          <span>Sets: {bucket.setsScanned}/{bucket.setsDiscovered}</span>
+                          <span>
+                            Cards: {bucket.cardsDiscovered}
+                            {bucket.cardsMissing > 0 ? ` (+${bucket.cardsMissing})` : ''}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -1105,6 +1219,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                 <div className="flex flex-wrap items-center gap-1.5">
                   {[
                     { id: 'all', label: 'All Sets' },
+                    { id: 'promo_special', label: 'PX & Promos' },
                     { id: 'pending', label: 'Pending' },
                     { id: 'completed', label: 'Scanned' },
                     { id: 'failed', label: 'Failed' },
@@ -1130,7 +1245,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     type="search"
                     value={setSearchQuery}
                     onChange={(e) => setSetSearchQuery(e.target.value)}
-                    placeholder="Find set (e.g. BS23, 26RSD01)..."
+                    placeholder="Find set (e.g. BS23, PX25, PX26, 26RSD01)..."
                     className="min-h-[32px] w-48 px-2.5 rounded-xl border border-slate-200 bg-white text-xs text-slate-900"
                   />
                   {filteredSets.length > 120 && !setSearchQuery.trim() && (

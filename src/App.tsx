@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Ban,
   Settings,
+  Database,
 } from 'lucide-react';
 import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
@@ -76,7 +77,9 @@ import { useWikiImagePrefetch } from './hooks/useWikiImagePrefetch';
 import {
   loadFastCachedSets,
   matchesIndexedSetQuery,
+  normalizeSetIdentifier,
   saveFastCachedSets,
+  sortSetsForFilterDropdown,
   synchronizeAndIndexSets,
 } from './utils/setMetadataSync';
 import { fetchPublishedCatalogAdditions } from './utils/catalogCloudSync';
@@ -291,11 +294,7 @@ function resolveSearchSetIntent(
 }
 
 export function normalizeSetCodeForClient(rawCode: string): string {
-  const upper = (rawCode || '').trim().toUpperCase().replace(/\s+/g, '');
-  if (!upper) return '';
-  return upper
-    .replace(/^(26R)-(BS|SD|EB|DB|CB)(\d+)$/, '$1$2$3')
-    .replace(/([A-Z])[-]+(\d)/g, '$1$2');
+  return normalizeSetIdentifier(rawCode);
 }
 
 function getCardNumberPrefix(cardNumber: string): string {
@@ -356,7 +355,11 @@ function parseStateFromUrl(): {
       color: rawColor && VALID_COLORS.includes(rawColor) ? rawColor : 'All',
       type: parsedTypes,
       rarity: parsedRarities,
-      setCode: params.get('set') || 'All',
+      setCode: (() => {
+        const rawSetParam = (params.get('set') || '').trim();
+        if (!rawSetParam || rawSetParam.toLowerCase() === 'all') return 'All';
+        return normalizeSetIdentifier(rawSetParam) || 'All';
+      })(),
       costBracket: rawCost && VALID_COSTS.includes(rawCost) ? rawCost : 'All',
       keyword: params.get('kw') || 'All',
       sortBy: rawSort && VALID_SORTS.includes(rawSort) ? rawSort : 'number',
@@ -704,6 +707,11 @@ export default function App() {
   });
   const [loadingCardsJson, setLoadingCardsJson] = useState(true);
   const [searchAnchorIndex, setSearchAnchorIndex] = useState(0);
+  const [wikiSearchResults, setWikiSearchResults] = useState<BattleSpiritsCard[]>([]);
+  const [wikiSearchLoading, setWikiSearchLoading] = useState(false);
+  const [wikiSearchError, setWikiSearchError] = useState<string | null>(null);
+  const [wikiSearchQueryLoaded, setWikiSearchQueryLoaded] = useState('');
+  const wikiSearchAbortRef = useRef<AbortController | null>(null);
 
   // Google Firebase Auth & Cloud Sync State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -1203,9 +1211,14 @@ export default function App() {
   const syncedProductSets = indexedSetDirectory.sets;
 
   const availableSets = useMemo(() => {
-    return syncedProductSets
-      .filter((s) => matchesFormatFilter(s.formats, filters.format))
-      .map((s) => ({ setCode: s.setCode, name: s.name }));
+    const formatMatching = syncedProductSets.filter((s) =>
+      matchesFormatFilter(s.formats, filters.format)
+    );
+    return sortSetsForFilterDropdown(formatMatching).map((s) => ({
+      setCode: s.setCode,
+      name: s.name,
+      category: s.category,
+    }));
   }, [syncedProductSets, filters.format]);
 
   const availableKeywords = useMemo(() => {
@@ -1411,15 +1424,16 @@ export default function App() {
     // Determine target set code priority for natural number ordering
     const targetExactSet =
       filters.setCode !== 'All'
-        ? filters.setCode.toUpperCase()
+        ? normalizeSetCodeForClient(filters.setCode)
         : setQIntent?.exactSetCode || searchSetIntent?.exactSetCode || '';
     const targetPaddedNum = setQIntent?.paddedSetNum || searchSetIntent?.paddedSetNum || '';
 
     const getNativePriority = (c: BattleSpiritsCard): number => {
       const prefix = getCardNumberPrefix(c.cardNumber);
+      const cardSetNorm = normalizeSetCodeForClient(c.setCode);
       if (targetExactSet) {
         if (prefix === targetExactSet) return 0;
-        if (c.setCode.toUpperCase() === targetExactSet) return 1;
+        if (cardSetNorm === targetExactSet) return 1;
         return 2;
       }
       if (targetPaddedNum) {
@@ -1427,7 +1441,7 @@ export default function App() {
         if (new RegExp(`(?:^|[^0-9])${targetPaddedNum}$`, 'i').test(prefix)) return 1;
         return 2;
       }
-      return prefix === c.setCode.toUpperCase() ? 0 : 1;
+      return prefix === cardSetNorm ? 0 : 1;
     };
 
     dedupedList.sort((a, b) => {
@@ -1467,6 +1481,123 @@ export default function App() {
   useEffect(() => {
     setSearchAnchorIndex(0);
   }, [filteredCards]);
+
+  const effectiveWikiQuery = useMemo(() => {
+    const q = filters.search.trim();
+    const sq = filters.setQuery.trim();
+    if (q && sq) return `${sq} ${q}`;
+    if (q) return q;
+    if (sq) return sq;
+    if (filters.setCode !== 'All' && filters.setCode !== 'TOKENS' && filters.setCode !== 'REVIVAL') {
+      return filters.setCode;
+    }
+    return '';
+  }, [filters.search, filters.setQuery, filters.setCode]);
+
+  const runLiveWikiSearch = useCallback(
+    async (queryText: string, format: FormatFilter) => {
+      const trimmed = queryText.trim();
+      if (trimmed.length < 2) {
+        setWikiSearchResults([]);
+        setWikiSearchError(null);
+        setWikiSearchQueryLoaded('');
+        return;
+      }
+
+      if (wikiSearchAbortRef.current) {
+        wikiSearchAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      wikiSearchAbortRef.current = controller;
+
+      setWikiSearchLoading(true);
+      setWikiSearchError(null);
+      try {
+        const qs = new URLSearchParams({
+          q: trimmed,
+          format,
+        });
+        const res = await fetch(`/api/wiki/search?${qs.toString()}`, {
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || 'Live Wiki search failed');
+        }
+        const incoming = Array.isArray(data?.cards) ? (data.cards as BattleSpiritsCard[]) : [];
+        setWikiSearchResults(incoming);
+        setWikiSearchQueryLoaded(trimmed);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setWikiSearchError(err instanceof Error ? err.message : 'Unable to reach Battle Spirits Wiki');
+        setWikiSearchResults([]);
+        setWikiSearchQueryLoaded(trimmed);
+      } finally {
+        if (!controller.signal.aborted) {
+          setWikiSearchLoading(false);
+        }
+      }
+    },
+    []
+  );
+
+  // Auto-trigger live Wiki fallback search when offline DB finds 0 matches in Search tab
+  useEffect(() => {
+    if (activeTab !== 'search') return;
+    if (!effectiveWikiQuery || effectiveWikiQuery.length < 2) {
+      setWikiSearchResults([]);
+      setWikiSearchError(null);
+      setWikiSearchQueryLoaded('');
+      return;
+    }
+    if (filteredCards.length > 0) {
+      // Clear stale results when query changes and local matches already exist
+      if (wikiSearchQueryLoaded !== effectiveWikiQuery && wikiSearchResults.length > 0) {
+        setWikiSearchResults([]);
+        setWikiSearchQueryLoaded('');
+      }
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void runLiveWikiSearch(effectiveWikiQuery, filters.format);
+    }, 400);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    activeTab,
+    effectiveWikiQuery,
+    filters.format,
+    filteredCards.length,
+    wikiSearchQueryLoaded,
+    wikiSearchResults.length,
+    runLiveWikiSearch,
+  ]);
+
+  // Deduplicate live Wiki preview cards against already-loaded local catalog
+  const uniqueWikiPreviewCards = useMemo(() => {
+    if (wikiSearchResults.length === 0) return [];
+    const localIds = new Set(allCardsList.map((c) => c.id));
+    const localKeys = new Set(
+      allCardsList
+        .map((c) => {
+          const norm = normalizeCardNumber(c.cardNumber || '');
+          return norm && norm !== 'WIKI' ? `${norm}|${c.isRevival ? 'rv' : 'orig'}` : '';
+        })
+        .filter(Boolean)
+    );
+    return wikiSearchResults.filter((card) => {
+      if (localIds.has(card.id)) return false;
+      const norm = normalizeCardNumber(card.cardNumber || '');
+      if (norm && norm !== 'WIKI') {
+        const key = `${norm}|${card.isRevival ? 'rv' : 'orig'}`;
+        if (localKeys.has(key)) return false;
+      }
+      return true;
+    });
+  }, [wikiSearchResults, allCardsList]);
 
   // Pre-fetch upcoming card images in Search gallery using wikiImageClient cache
   useWikiImagePrefetch({
@@ -2366,34 +2497,153 @@ export default function App() {
                   <span>Loading local offline English card database (/cards.json)...</span>
                 </div>
               ) : filteredCards.length === 0 ? (
-                <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-3">
-                  <p className="text-sm text-slate-600">
-                    {filters.search.trim() || filters.setQuery.trim()
-                      ? `No cards in the offline database matched "${[filters.search.trim(), filters.setQuery.trim()].filter(Boolean).join(' · ')}".`
-                      : 'No Battle Spirits cards match your current filters.'}
-                  </p>
-                  <div className="flex flex-wrap items-center justify-center gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => setFilters(INITIAL_FILTERS)}
-                      className="min-h-[44px] px-5 rounded-xl bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 cursor-pointer"
-                    >
-                      Reset Filters
-                    </button>
+                <div className="space-y-4">
+                  <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-3">
+                    <p className="text-sm text-slate-600">
+                      {filters.search.trim() || filters.setQuery.trim()
+                        ? `No cards in the offline database matched "${[filters.search.trim(), filters.setQuery.trim()].filter(Boolean).join(' · ')}".`
+                        : 'No Battle Spirits cards match your current filters.'}
+                    </p>
+                    <div className="flex flex-wrap items-center justify-center gap-2.5">
+                      {effectiveWikiQuery.length >= 2 && (
+                        <button
+                          type="button"
+                          disabled={wikiSearchLoading}
+                          onClick={() => void runLiveWikiSearch(effectiveWikiQuery, filters.format)}
+                          className="min-h-[44px] px-5 rounded-xl bg-red-600 text-white text-xs font-semibold hover:bg-red-700 cursor-pointer disabled:opacity-50 inline-flex items-center gap-2"
+                        >
+                          {wikiSearchLoading ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Database className="w-4 h-4" />
+                          )}
+                          <span>
+                            {wikiSearchLoading
+                              ? 'Searching Battle Spirits Wiki...'
+                              : 'Search Battle Spirits Wiki'}
+                          </span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setFilters(INITIAL_FILTERS)}
+                        className="min-h-[44px] px-5 rounded-xl bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 cursor-pointer"
+                      >
+                        Reset Filters
+                      </button>
+                    </div>
+                    {wikiSearchError && (
+                      <p className="text-xs text-red-700">{wikiSearchError}</p>
+                    )}
+                    {!wikiSearchLoading &&
+                      !wikiSearchError &&
+                      wikiSearchQueryLoaded === effectiveWikiQuery &&
+                      uniqueWikiPreviewCards.length === 0 && (
+                        <p className="text-xs text-slate-500">
+                          No additional preview cards found on the Battle Spirits Wiki for &ldquo;{effectiveWikiQuery}&rdquo;.
+                        </p>
+                      )}
                   </div>
+
+                  {uniqueWikiPreviewCards.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+                        <div className="inline-flex items-center gap-2 text-xs font-bold text-slate-900">
+                          <Database className="w-4 h-4 text-indigo-700" />
+                          <span>
+                            Battle Spirits Wiki Results (Live Preview · Not Yet Imported)
+                          </span>
+                        </div>
+                        <span className="font-mono text-xs text-slate-500 tabular-nums">
+                          {uniqueWikiPreviewCards.length} preview card(s)
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+                        {uniqueWikiPreviewCards.map((card) => (
+                          <CardThumbnail
+                            key={`wiki-preview-${card.id}`}
+                            card={card}
+                            deckQty={0}
+                            onSelect={setSelectedCard}
+                            onAddToDeck={() =>
+                              showToast(
+                                'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                              )
+                            }
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-                  {filteredCards.map((card, idx) => (
-                    <CardThumbnail
-                      key={card.id}
-                      card={card}
-                      deckQty={activeDeckQtyMap[card.id] || 0}
-                      onSelect={setSelectedCard}
-                      onAddToDeck={handleQuickAddToDeck}
-                      onHoverOrFocus={() => setSearchAnchorIndex(idx)}
-                    />
-                  ))}
+                <div className="space-y-6">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+                    {filteredCards.map((card, idx) => (
+                      <CardThumbnail
+                        key={card.id}
+                        card={card}
+                        deckQty={activeDeckQtyMap[card.id] || 0}
+                        onSelect={setSelectedCard}
+                        onAddToDeck={handleQuickAddToDeck}
+                        onHoverOrFocus={() => setSearchAnchorIndex(idx)}
+                      />
+                    ))}
+                  </div>
+
+                  {effectiveWikiQuery.length >= 2 && (
+                    <div className="pt-2 border-t border-slate-200/80 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">
+                          Need missing cards or promos (e.g. PX25, PX26) from Battle Spirits Wiki?
+                        </span>
+                        <button
+                          type="button"
+                          disabled={wikiSearchLoading}
+                          onClick={() => void runLiveWikiSearch(effectiveWikiQuery, filters.format)}
+                          className="min-h-[34px] px-3.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          {wikiSearchLoading ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Database className="w-3.5 h-3.5 text-indigo-700" />
+                          )}
+                          <span>Search Live Wiki for More</span>
+                        </button>
+                      </div>
+
+                      {uniqueWikiPreviewCards.length > 0 && (
+                        <div className="space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="inline-flex items-center gap-2 text-xs font-bold text-slate-900">
+                              <Database className="w-4 h-4 text-indigo-700" />
+                              <span>
+                                Battle Spirits Wiki Results (Live Preview · Not Yet Imported)
+                              </span>
+                            </div>
+                            <span className="font-mono text-xs text-slate-500 tabular-nums">
+                              {uniqueWikiPreviewCards.length} preview card(s)
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+                            {uniqueWikiPreviewCards.map((card) => (
+                              <CardThumbnail
+                                key={`wiki-preview-${card.id}`}
+                                card={card}
+                                deckQty={0}
+                                onSelect={setSelectedCard}
+                                onAddToDeck={() =>
+                                  showToast(
+                                    'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                                  )
+                                }
+                              />
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </section>

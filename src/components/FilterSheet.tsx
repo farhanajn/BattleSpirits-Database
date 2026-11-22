@@ -1,12 +1,14 @@
 import React from 'react';
 import { X, RotateCcw } from 'lucide-react';
-import { CardRarity, CardType, FilterState, FormatFilter } from '../types/card';
+import { CardRarity, CardType, FilterState, FormatFilter, SetCategory } from '../types/card';
 import { ALL_COLORS, ALL_RARITIES, ALL_TYPES, COLOR_META } from '../data/theme';
 import { SymbolIcon } from './SymbolIcon';
+import { normalizeSetIdentifier, sortSetsForFilterDropdown } from '../utils/setMetadataSync';
 
 interface SetOption {
   setCode: string;
   name: string;
+  category?: SetCategory;
 }
 
 interface FilterControlsProps {
@@ -24,6 +26,20 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
   onChange,
   onReset,
 }) => {
+  const sortedSets = React.useMemo(
+    () => sortSetsForFilterDropdown(availableSets),
+    [availableSets]
+  );
+
+  const selectedSetValue = React.useMemo(() => {
+    if (!filters.setCode || filters.setCode === 'All') return 'All';
+    const targetNorm = normalizeSetIdentifier(filters.setCode);
+    const matched = sortedSets.find(
+      (s) => s.setCode === filters.setCode || normalizeSetIdentifier(s.setCode) === targetNorm
+    );
+    return matched ? matched.setCode : filters.setCode;
+  }, [filters.setCode, sortedSets]);
+
   const toggleType = (target: CardType) => {
     const exists = filters.type.includes(target);
     const nextTypes = exists
@@ -277,16 +293,21 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
           </label>
           <select
             id="filter-set"
-            value={filters.setCode}
+            value={selectedSetValue}
             onChange={(e) => onChange({ ...filters, setCode: e.target.value })}
             className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
             <option value="All">All Sets</option>
-            {availableSets.map((s) => (
-              <option key={s.setCode} value={s.setCode}>
-                {s.name && s.name !== s.setCode ? `${s.setCode} — ${s.name}` : s.setCode}
-              </option>
-            ))}
+            {sortedSets.map((s) => {
+              const cleanName = (s.name || '').trim();
+              const hasDistinctName =
+                Boolean(cleanName) && cleanName.toUpperCase() !== s.setCode.trim().toUpperCase();
+              return (
+                <option key={s.setCode} value={s.setCode}>
+                  {hasDistinctName ? `${s.setCode} — ${cleanName}` : s.setCode}
+                </option>
+              );
+            })}
           </select>
         </div>
 

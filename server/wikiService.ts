@@ -876,10 +876,21 @@ function mergeStoredSetRecord(existing: ProductSet | undefined, incoming: Produc
       ? existing.tagline
       : incoming.tagline || existing.tagline;
 
+  const nextCategory =
+    incoming.category === 'Promo' && existing.category && existing.category !== 'Promo'
+      ? existing.category
+      : incoming.category || existing.category;
+  const nextProductType =
+    incoming.productType === 'Promo Set' && existing.productType && existing.productType !== 'Promo Set'
+      ? existing.productType
+      : incoming.productType || existing.productType;
+
   return {
     ...existing,
     ...incoming,
     setCode: code,
+    category: nextCategory,
+    productType: nextProductType,
     name: nextName,
     jpName: incoming.jpName || existing.jpName || '',
     releaseDate: nextDate,
@@ -907,6 +918,30 @@ export function upsertStoredSetMetadata(incoming: ProductSet): ProductSet {
   storedSetListCache = Array.from(DIRECTORY_MAP.values());
   setRegistrySyncedAt = Date.now();
   return merged;
+}
+
+function inferCategoryAndTypeFromCode(
+  sc: string,
+  isStd: boolean,
+  isToken?: boolean
+): { category: ProductSet['category']; productType: ProductSet['productType'] } {
+  if (/^(?:26RBS|26REB|26RDB|26RCB|27RBS)/i.test(sc)) {
+    return { category: 'Standard Booster', productType: 'Booster Set' };
+  }
+  if (/^(?:26RSD|27RSD)/i.test(sc)) {
+    return { category: 'Standard Starter', productType: 'Starter Deck' };
+  }
+  if (/^BS\d+/i.test(sc)) return { category: 'Booster', productType: 'Booster Set' };
+  if (/^SD\d+/i.test(sc)) return { category: 'Starter Deck', productType: 'Starter Deck' };
+  if (/^CBX?\d+/i.test(sc)) return { category: 'Collab Booster', productType: 'Collab Booster' };
+  if (/^BSC\d+/i.test(sc)) return { category: 'Supplementary', productType: 'Supplementary Set' };
+  if (/^PB\d+/i.test(sc)) return { category: 'Premium Bandai', productType: 'Premium Bandai' };
+  if (/^PC\d+/i.test(sc)) return { category: 'Premium Card Set', productType: 'Premium Card Set' };
+  if (isToken || sc === 'TOKENS') return { category: 'Token', productType: 'Token Set' };
+  if (/^\d+$/.test(sc)) {
+    return { category: isStd ? 'Standard Booster' : 'Booster', productType: 'Booster Set' };
+  }
+  return { category: 'Promo', productType: 'Promo Set' };
 }
 
 function ensureStoredSetRegistryHydrated() {
@@ -952,13 +987,14 @@ function ensureStoredSetRegistryHydrated() {
             const sample = st.sample;
             const colors = Array.from(st.colors);
             const isStd = Array.isArray(sample.formats) && sample.formats.includes('Standard');
+            const inferred = inferCategoryAndTypeFromCode(sc, isStd, sample.isToken);
             upsertStoredSetMetadata({
               setCode: sc,
               wikiTitle: sc,
-              category: /^\d+$/.test(sc) ? (isStd ? 'Standard Booster' : 'Booster') : 'Promo',
+              category: inferred.category,
               name: sample.setName && !SERVER_GENERIC_NAME_RE.test(sample.setName) ? sample.setName : sc,
               jpName: '',
-              productType: /^\d+$/.test(sc) ? 'Booster Set' : 'Promo Set',
+              productType: inferred.productType,
               releaseDate: isStd ? '2026+' : 'Official Release',
               formats: sample.formats?.length ? sample.formats : ['Eternal'],
               blockLabel: sample.blockIcon || 'Eternal',
@@ -1113,7 +1149,21 @@ export function normalizeRarity(raw: string): CardRarity {
   if (lower === 'm' || lower.includes('master')) return 'M';
   if (lower === 'r' || lower === 'rare' || lower.includes('rebirth rare')) return 'R';
   if (lower === 'u' || lower.includes('uncommon')) return 'U';
-  if (lower.includes('promo') || lower === 'p' || lower.includes('campaign') || lower === 'cp') return 'P';
+  if (
+    lower.includes('promo') ||
+    lower === 'p' ||
+    lower === 'px' ||
+    lower === 'lm' ||
+    lower === 'sj' ||
+    lower === 'gx' ||
+    lower === 'ka' ||
+    lower === 'sp' ||
+    lower.includes('campaign') ||
+    lower === 'cp' ||
+    lower.includes('limited')
+  ) {
+    return 'P';
+  }
   return 'C';
 }
 
@@ -2232,214 +2282,632 @@ export function hydrateCardFromWikitext(
   };
 }
 
-export function parseSetTableRows(
+const GENERIC_PROMO_HUB_CODES = new Set([
+  'PROMO',
+  'PROMO-PX',
+  'PROMO-REG',
+  'PROMO-CMP',
+  'PROMO-LIM',
+  'PROMO-JMP',
+  'PROMO-ANM',
+  'PROMO-X',
+]);
+
+export function resolvePromoSubSeriesSetCode(
+  cardNumber: string,
+  sectionHeading: string,
+  fallbackSetCode: string
+): string {
+  const numUpper = (cardNumber || '').trim().toUpperCase().replace(/\s+/g, '');
+  const secUpper = (sectionHeading || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  const fbUpper = (fallbackSetCode || '').trim().toUpperCase();
+
+  const rpxM = numUpper.match(/^RPX(\d+)-/);
+  if (rpxM) return rpxM[1] === '26' ? 'PX26-STD' : `RPX${rpxM[1]}-STD`;
+
+  const rpM = numUpper.match(/^RP(\d+)-/);
+  if (rpM) return rpM[1] === '26' ? 'RP26-STD' : `RP${rpM[1]}-STD`;
+
+  const pxNumM = numUpper.match(/^PX(\d+)-/);
+  if (pxNumM) return `PX${pxNumM[1]}`;
+
+  if (/^PX-\d+/i.test(numUpper)) {
+    const secPx = secUpper.match(/\b(PX\d+)\b/);
+    if (secPx) return secPx[1];
+    if (/^PX\d+$/i.test(fbUpper)) return fbUpper;
+    return 'PX19';
+  }
+
+  if (/^PX\d+[A-Z]*$/i.test(numUpper)) {
+    return 'PX';
+  }
+
+  const pM = numUpper.match(/^P(\d{2})-(?!X)/);
+  if (pM) return `P${pM[1]}`;
+
+  const cpM = numUpper.match(/^CP(\d{2})-/);
+  if (cpM) return `CP${cpM[1]}`;
+
+  const specM = numUpper.match(/^(SJ|LM|KA|EX)(\d{1,3}[A-Z]?)-/);
+  if (specM) return `${specM[1]}${specM[2]}`;
+
+  if (/^X-\d+/i.test(numUpper)) return 'PROMO-X';
+  if (/^GX-\d+/i.test(numUpper)) return 'PROMO-ANM';
+  if (/^KF-\d+/i.test(numUpper)) return 'KFC';
+
+  if (fbUpper && !GENERIC_PROMO_HUB_CODES.has(fbUpper)) {
+    return fbUpper;
+  }
+
+  const headingSeriesM = secUpper.match(
+    /^(?:PROMO\s+|CAMPAIGN\s+PROMOS?\s+)?(PX\d*|RPX\d+|RP\d+|P\d+|CP\d+|SJ\d+|LM\d+[A-Z]?|EX\d*)$/
+  );
+  if (headingSeriesM) {
+    const h = headingSeriesM[1];
+    if (/^\d+$/.test(h)) {
+      if (secUpper.includes('CAMPAIGN')) return `CP${h}`;
+      if (secUpper.includes('PROMO')) return `P${h}`;
+    }
+    return h;
+  }
+
+  return fbUpper || 'PROMO';
+}
+
+export interface ExtractedPromoSectionSet {
+  setCode: string;
+  name: string;
+  wikiTitle: string;
+  scanSection?: string;
+  cardNumberPrefix?: string;
+  formats: GameFormat[];
+  sourceKind: 'px_series' | 'promo_list' | 'campaign' | 'event_prize' | 'supplementary_other';
+}
+
+export function extractPromoSectionsAndLinkedSets(
   wikitext: string,
-  setMeta: ProductSet
-): BattleSpiritsCard[] {
-  const cards: BattleSpiritsCard[] = [];
-  const seenKeys = new Set<string>();
+  hubWikiTitle: string
+): ExtractedPromoSectionSet[] {
+  const results: ExtractedPromoSectionSet[] = [];
+  const seenCodes = new Set<string>();
+  const isStdHub = /standard promo/i.test(hubWikiTitle);
+  const formats: GameFormat[] = isStdHub ? ['Standard', 'Eternal'] : ['Eternal'];
 
-  const tables = wikitext.split(/\{\|/);
-  for (const table of tables) {
-    let colIdxMap: {
-      number?: number;
-      name?: number;
-      color?: number;
-      type?: number;
-      rarity?: number;
-    } = {};
-    let hasExplicitHeader = false;
-    let sectionIsRevival = false;
-    let sectionIsToken = false;
+  const addResult = (item: ExtractedPromoSectionSet) => {
+    const key = item.setCode.toUpperCase();
+    if (!key || seenCodes.has(key)) return;
+    seenCodes.add(key);
+    results.push({ ...item, setCode: key });
+  };
 
-    const rows = table.split(/\n\|-/);
-    for (const row of rows) {
-      // Detect colspan section titles inside tables (e.g. Revival Cards, Token Card, Campaign Promo)
-      const colspanHdrMatch = row.match(/!\s*colspan\s*=\s*"?\d+"?[^|\n]*\|([^\n]+)/i);
-      if (colspanHdrMatch) {
-        const secText = cleanWikitextInline(colspanHdrMatch[1]);
-        sectionIsRevival = /\brevival\b/i.test(secText);
-        sectionIsToken = /\btoken\b/i.test(secText);
-      }
+  const normalizedWt = wikitext
+    .replace(/(={2,4}[^=\n]+?={2,4})/g, '\n$1\n')
+    .replace(/\{\|/g, '\n{|')
+    .replace(/\|\}/g, '\n|}\n');
+  const lines = normalizedWt.split('\n');
+  let insideTable = false;
 
-      // Capture header column layout robustly (supports both `!!` multi-line and single-line `! scope="col"` headers)
-      if (row.includes('! scope="col"') || /^\s*!/m.test(row)) {
-        const splitHeaderRow = row
-          .replace(/!!/g, '\n!')
-          .replace(
-            /!\s*(?=(?:scope|width|align|valign|style|class|colspan|rowspan)\s*=|''')/gi,
-            '\n!'
-          );
-        const headerCells = splitHeaderRow
-          .split('\n')
-          .map((l) => l.trim())
-          .filter((l) => l.startsWith('!') && !/colspan\s*=/i.test(l))
-          .map((l) =>
-            cleanWikitextInline(
-              l.replace(/^!+(?:\s*(?:scope|width|align|valign|style|class)\s*=\s*"?[^"|]*"?\s*)*\|?/i, '')
-            ).toLowerCase()
-          )
-          .filter(Boolean);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line.startsWith('{|')) insideTable = true;
+    if (line.startsWith('|}')) {
+      insideTable = false;
+      continue;
+    }
 
-        if (headerCells.length >= 3) {
-          colIdxMap = {};
-          hasExplicitHeader = true;
-          headerCells.forEach((h, idx) => {
-            if (h.includes('number') || h === 'no.' || h === 'id') colIdxMap.number = idx;
-            else if (h.includes('name') || h === 'card') colIdxMap.name = idx;
-            else if (h.includes('color') || h.includes('attribute')) colIdxMap.color = idx;
-            else if (h.includes('type')) colIdxMap.type = idx;
-            else if (h.includes('rarity')) colIdxMap.rarity = idx;
-          });
-        }
-        if (!row.includes('[[')) continue;
-      }
+    const hdr = line.match(/^={2,4}\s*([^=]+?)\s*={2,4}$/);
+    if (hdr) {
+      const heading = cleanWikitextInline(hdr[1]).trim();
+      const upperH = heading.toUpperCase();
 
-      if (!row.includes('[[')) continue;
-
-      const normalizedRow = row
-        .replace(/\|\|/g, '\n|')
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l.startsWith('|') && !l.startsWith('|-') && !l.startsWith('|}'));
-
-      if (normalizedRow.length < 2) continue;
-
-      const cells = normalizedRow.map((c) => {
-        const stripped = c.slice(1).trim();
-        const attrMatch = stripped.match(
-          /^(?:style|align|bgcolor|width|class|colspan|rowspan)\s*=[^|]*\|([\s\S]*)$/i
-        );
-        return attrMatch ? attrMatch[1].trim() : stripped;
-      });
-
-      const detectedNameIdx =
-        colIdxMap.name !== undefined &&
-        cells[colIdxMap.name] &&
-        /\[\[[^\]]+\]\]/.test(cells[colIdxMap.name])
-          ? colIdxMap.name
-          : cells.findIndex((c) => /\[\[[^\]]+\]\]/.test(c) && !/\[\[File:/i.test(c));
-
-      if (detectedNameIdx < 1) continue;
-
-      const numberIdx =
-        colIdxMap.number !== undefined ? colIdxMap.number : detectedNameIdx - 1;
-      const numRaw = cleanWikitextInline(cells[numberIdx] || '')
-        .replace(/[\u2010-\u2015]/g, '-')
-        .replace(/\s+/g, '');
-      if (!numRaw || numRaw.length > 28 || /^(?:card)?number$/i.test(numRaw)) continue;
-
-      const nameCellRaw = cells[detectedNameIdx] || '';
-      const linkMatch = nameCellRaw.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
-      if (!linkMatch) continue;
-
-      const wikiTitle = linkMatch[1].trim();
-      const baseDisplayName = (linkMatch[2] || linkMatch[1]).trim();
-      if (!wikiTitle || wikiTitle.startsWith('File:') || wikiTitle.startsWith('Category:')) {
+      const pxM = upperH.match(/^PX(\d+)?$/);
+      if (pxM) {
+        const code = pxM[1] ? `PX${pxM[1]}` : 'PX';
+        addResult({
+          setCode: code,
+          name: code === 'PX' ? 'Promo X-Rares (PX Original)' : `Promo X-Rares ${code}`,
+          wikiTitle: hubWikiTitle,
+          scanSection: heading,
+          cardNumberPrefix: code === 'PX' ? 'PX' : `${code}-`,
+          formats,
+          sourceKind: 'px_series',
+        });
         continue;
       }
 
-      const colorCell =
-        colIdxMap.color !== undefined
-          ? cells[colIdxMap.color] || ''
-          : cells[detectedNameIdx + 1] || '';
-      const typeCell =
-        colIdxMap.type !== undefined
-          ? cells[colIdxMap.type] || ''
-          : cells[detectedNameIdx + 2] || '';
-      const rarityCell =
-        colIdxMap.rarity !== undefined
-          ? cells[colIdxMap.rarity] || ''
-          : hasExplicitHeader
-          ? ''
-          : cells[detectedNameIdx + 3] || '';
+      const rpxM = upperH.match(/^RPX(\d+)$/);
+      if (rpxM) {
+        const code = rpxM[1] === '26' ? 'PX26-STD' : `RPX${rpxM[1]}-STD`;
+        addResult({
+          setCode: code,
+          name: `Standard Format Promo X-Rares (RPX${rpxM[1]})`,
+          wikiTitle: hubWikiTitle,
+          scanSection: heading,
+          cardNumberPrefix: `RPX${rpxM[1]}-`,
+          formats: ['Standard', 'Eternal'],
+          sourceKind: 'px_series',
+        });
+        continue;
+      }
 
-      const colors = normalizeColor(colorCell);
-      const { type, subtypeLabel } = normalizeType(typeCell);
-      const rarity: CardRarity =
-        setMeta.category === 'Promo' && !rarityCell
-          ? 'P'
-          : normalizeRarity(rarityCell || (setMeta.category === 'Promo' ? 'P' : 'C'));
+      const rpM = upperH.match(/^RP(\d+)$/);
+      if (rpM) {
+        const code = rpM[1] === '26' ? 'RP26-STD' : `RP${rpM[1]}-STD`;
+        addResult({
+          setCode: code,
+          name: `Standard Format Regular Promos (RP${rpM[1]})`,
+          wikiTitle: hubWikiTitle,
+          scanSection: heading,
+          cardNumberPrefix: `RP${rpM[1]}-`,
+          formats: ['Standard', 'Eternal'],
+          sourceKind: 'promo_list',
+        });
+        continue;
+      }
 
-      const hasFullSetPrefix =
-        numRaw.includes('-') ||
-        /^(?:BS\d+|BSC\d+|SD\d+|CBX?\d+|PC\d+|LM\d+|PB\d+|EX\d+|CP\d+|26R[A-Z0-9]+|RP\d+|PX\d+|P\d+)/i.test(
-          numRaw
+      const pM = heading.match(/^Promo\s+(\d{2,3})$/i);
+      if (pM) {
+        const code = `P${pM[1]}`;
+        addResult({
+          setCode: code,
+          name: `Regular Promos ${code}`,
+          wikiTitle: hubWikiTitle,
+          scanSection: heading,
+          cardNumberPrefix: `${code}-`,
+          formats,
+          sourceKind: 'promo_list',
+        });
+        continue;
+      }
+
+      const cpM = heading.match(/^Campaign\s+Promos?\s+(\d{2,3})$/i);
+      if (cpM) {
+        const code = `CP${cpM[1]}`;
+        addResult({
+          setCode: code,
+          name: `Campaign Promos ${code}`,
+          wikiTitle: hubWikiTitle,
+          scanSection: heading,
+          cardNumberPrefix: `${code}-`,
+          formats,
+          sourceKind: 'campaign',
+        });
+        continue;
+      }
+      continue;
+    }
+
+    // Linked sub-sets listed outside card tables (e.g. `* [[SJ19]]`, `* [[LM19U]]`, `* [[X13 Promo]]`)
+    if (!insideTable && /^[*#]/.test(line) && line.includes('[[')) {
+      const linkM = line.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
+      if (!linkM) continue;
+      const target = linkM[1].trim();
+      const display = (linkM[2] || linkM[1]).trim();
+      if (
+        !target ||
+        /^(?:File|Image|Category|Template|Special):/i.test(target) ||
+        target === hubWikiTitle
+      ) {
+        continue;
+      }
+      const isKnownPromoPageShape =
+        /^(?:SJ|LM|EX|X|CP|PX|P)\d+[A-Z]*$/i.test(target) ||
+        /(?:Promo|Limited Pack|Memorial Pack|Mermorial Pack|Jump|KFC|Connected Battlers|CrossOver)/i.test(
+          target
         );
-      const fullNumber = hasFullSetPrefix
-        ? numRaw
-        : setMeta.setCode === 'PROMO-REG'
-        ? `P-${numRaw}`
-        : `${setMeta.setCode}-${numRaw}`;
+      if (!isKnownPromoPageShape) continue;
 
-      const isRevival =
-        setMeta.setCode === 'BSC22' ||
-        setMeta.setCode === 'REVIVAL' ||
-        /^BSC22-/i.test(fullNumber) ||
-        sectionIsRevival ||
-        /\(revival\)/i.test(nameCellRaw) ||
-        /\(revival\)/i.test(wikiTitle) ||
-        /(?:^|-)RV[A-Z0-9]*\d/i.test(fullNumber);
+      const normalizedCode = target
+        .toUpperCase()
+        .replace(/\s+PROMO$/i, 'PROMO')
+        .replace(/^KFC\s*PROMO$/i, 'KFC')
+        .replace(/^EX\s*PROMO$/i, 'EXPROMO')
+        .replace(/^X(\d+)\s*PROMO$/i, 'X$1')
+        .replace(/[^A-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40);
 
-      const isToken =
-        sectionIsToken ||
-        /\btoken\b/i.test(typeCell) ||
-        /-T\d+$/i.test(fullNumber);
+      if (!normalizedCode) continue;
+      const sourceKind: ExtractedPromoSectionSet['sourceKind'] =
+        /limited pack/i.test(target) || /^LM\d+/i.test(target)
+          ? 'event_prize'
+          : /jump|^SJ\d+/i.test(target)
+          ? 'event_prize'
+          : /campaign|^CP\d+/i.test(target)
+          ? 'campaign'
+          : 'promo_list';
 
-      const displayName =
-        isRevival && !/\(revival\)/i.test(baseDisplayName)
-          ? `${baseDisplayName} (Revival)`
-          : baseDisplayName;
-
-      const uniqueKey = `${setMeta.setCode}-${fullNumber}-${wikiTitle}-${isRevival ? 'rv' : 'orig'}`;
-      if (seenKeys.has(uniqueKey)) continue;
-      seenKeys.add(uniqueKey);
-
-      const id = `${setMeta.setCode.toLowerCase()}-${fullNumber
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')}${isRevival ? '-rv' : ''}`;
-      const defaultFile = `${fullNumber}.jpg`;
-
-      const defaultSymbols: Partial<Record<BattleSymbolKind, number>> =
-        type === 'Magic' || isToken
-          ? {}
-          : type === 'Ultimate'
-          ? { Ultimate: 1 }
-          : { [colors[0]]: 1 };
-
-      cards.push({
-        id,
-        cardNumber: fullNumber,
-        name: displayName,
-        jpName: '',
-        color: colors[0],
-        secondaryColor: colors[1],
-        colors,
-        type,
-        subtypeLabel,
-        rarity,
-        setCode: setMeta.setCode,
-        setName: setMeta.name,
-        formats: setMeta.formats,
-        blockIcon: setMeta.blockLabel,
-        restriction: resolveCardRestriction(fullNumber, displayName, isRevival),
-        isRevival,
-        isToken,
-        cost: 0,
-        reduction: {},
-        symbols: defaultSymbols,
-        families: [],
-        effects: [],
-        keywords: [],
-        flavorText: '',
-        illustrator: '',
-        artworkImage: `/api/wiki/image?file=${encodeURIComponent(defaultFile)}&fallback=${encodeURIComponent(fullNumber)}&title=${encodeURIComponent(wikiTitle)}`,
-        artVariant: defaultVariant(type, colors[0]),
-        wikiTitle,
-        wikiUrl: `${WIKI_BASE}${encodeURIComponent(wikiTitle.replace(/ /g, '_'))}`,
-        isWikiLoaded: false,
-        rulings: [],
+      addResult({
+        setCode: /^(?:SJ|LM|EX)\d+[A-Z]?$/i.test(target)
+          ? target.toUpperCase()
+          : normalizedCode,
+        name: display,
+        wikiTitle: target,
+        formats,
+        sourceKind,
       });
+    }
+  }
+
+  return results;
+}
+
+function toCanonicalPromoSectionTag(value: string): string {
+  const clean = (value || '').toUpperCase().trim();
+  const promoNum = clean.match(/^PROMO\s*(\d{2,}[A-Z]?)$/i);
+  if (promoNum) return `P${promoNum[1]}`;
+  const campaignNum = clean.match(/^CAMPAIGN\s*PROMOS?\s*(\d{2,}[A-Z]?)$/i);
+  if (campaignNum) return `CP${campaignNum[1]}`;
+  return clean.replace(/[^A-Z0-9-]/g, '');
+}
+
+function doesSectionOrCardMatchFilter(
+  sectionHeading: string,
+  fullNumber: string,
+  sectionFilterUpper: string
+): boolean {
+  const rawFilter = sectionFilterUpper.replace(/[^A-Z0-9-]/g, '');
+  const rawHeading = (sectionHeading || '').toUpperCase().replace(/[^A-Z0-9-]/g, '');
+  if (rawHeading && rawHeading === rawFilter) {
+    return true;
+  }
+
+  const canonFilter = toCanonicalPromoSectionTag(sectionFilterUpper);
+  const canonHeading = toCanonicalPromoSectionTag(sectionHeading);
+  if (canonHeading && canonHeading === canonFilter) {
+    return true;
+  }
+
+  const numUpper = fullNumber.toUpperCase();
+  if (canonFilter === 'PX') {
+    return /^PX\d+[A-Z]*$/.test(numUpper) || canonHeading === 'PX';
+  }
+  if (canonFilter === 'PX19') {
+    return /^PX-\d+/i.test(numUpper) || canonHeading === 'PX19';
+  }
+  if (canonFilter === 'PX26-STD') {
+    return /^RPX26-/i.test(numUpper) || canonHeading === 'RPX26';
+  }
+  if (canonFilter === 'RP26-STD') {
+    return /^RP26-/i.test(numUpper) || canonHeading === 'RP26';
+  }
+
+  const baseFilter = canonFilter.replace(/-STD$/, '');
+  return numUpper.startsWith(`${baseFilter}-`);
+}
+
+function splitTopLevelTableLine(line: string): string[] {
+  // If standard double-pipe `||` syntax is present on this line, split directly on `||`
+  if (line.includes('||')) {
+    return line
+      .slice(1)
+      .split('||')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  const out: string[] = [];
+  let buf = '';
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = 1; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+    if (ch === '[' && next === '[') {
+      bracketDepth++;
+      buf += '[[';
+      i++;
+      continue;
+    }
+    if (ch === ']' && next === ']' && bracketDepth > 0) {
+      bracketDepth--;
+      buf += ']]';
+      i++;
+      continue;
+    }
+    if (ch === '{' && next === '{') {
+      braceDepth++;
+      buf += '{{';
+      i++;
+      continue;
+    }
+    if (ch === '}' && next === '}' && braceDepth > 0) {
+      braceDepth--;
+      buf += '}}';
+      i++;
+      continue;
+    }
+    if (ch === '|' && bracketDepth === 0 && braceDepth === 0) {
+      const ahead = line.slice(i + 1);
+      const prevTrim = buf.trim();
+      const isCellAttrPrefix =
+        /^(?:style|align|bgcolor|width|class|colspan|rowspan)\s*=/i.test(prevTrim) &&
+        !prevTrim.includes('[[');
+      if (!isCellAttrPrefix || out.length > 0) {
+        out.push(prevTrim);
+        buf = '';
+        continue;
+      }
+      // Keep cell attribute prefix attached only if this single pipe separates attr|value;
+      // check if there are more top-level pipes later for multi-cell single-pipe lines
+      if (ahead.includes('|')) {
+        buf += ch;
+        continue;
+      }
+    }
+    buf += ch;
+  }
+  out.push(buf.trim());
+  return out.filter((s) => s.length > 0);
+}
+
+export function parseSetTableRows(
+  wikitext: string,
+  setMeta: ProductSet,
+  options?: { sectionFilter?: string; resolveSubSeriesSets?: boolean }
+): BattleSpiritsCard[] {
+  const cards: BattleSpiritsCard[] = [];
+  const seenKeys = new Set<string>();
+  const sectionFilterUpper = options?.sectionFilter?.trim().toUpperCase() || '';
+  const shouldResolveSubSeries = Boolean(options?.resolveSubSeriesSets);
+
+  // Normalize inline `|}== Heading =={|` boundaries so every wikitable retains its enclosing section heading
+  const normalizedWikitext = wikitext
+    .replace(/(={2,4}[^=\n]+?={2,4})/g, '\n$1\n')
+    .replace(/\{\|/g, '\n{|')
+    .replace(/\|\}/g, '\n|}\n');
+  const headingMatcher = /^={2,4}\s*([^=\n]+?)\s*={2,4}\s*$/gm;
+  const segments: Array<{ heading: string; content: string }> = [];
+  let lastIndex = 0;
+  let currentHeading = '';
+  let hm: RegExpExecArray | null;
+  while ((hm = headingMatcher.exec(normalizedWikitext)) !== null) {
+    if (hm.index > lastIndex) {
+      segments.push({ heading: currentHeading, content: normalizedWikitext.slice(lastIndex, hm.index) });
+    }
+    currentHeading = cleanWikitextInline(hm[1]).trim();
+    lastIndex = hm.index + hm[0].length;
+  }
+  if (lastIndex < normalizedWikitext.length) {
+    segments.push({ heading: currentHeading, content: normalizedWikitext.slice(lastIndex) });
+  }
+
+  for (const seg of segments) {
+    const tables = seg.content.split(/\{\|/);
+    for (const table of tables) {
+      if (!table.includes('[[')) continue;
+      let colIdxMap: {
+        number?: number;
+        name?: number;
+        color?: number;
+        type?: number;
+        rarity?: number;
+      } = {};
+      let hasExplicitHeader = false;
+      let sectionIsRevival = /\brevival\b/i.test(seg.heading);
+      let sectionIsToken = /\btoken\b/i.test(seg.heading);
+
+      // Normalize inline `|-` row separators (common on Promo & Campaign tables e.g. `|-|P25-01|...|-|P25-02|...`)
+      const normalizedTable = table.replace(/\|-/g, '\n|-');
+      const rows = normalizedTable.split(/\n\|-/);
+      for (const row of rows) {
+        // Detect colspan section titles inside tables (e.g. Revival Cards, Token Card, Campaign Promo)
+        const colspanHdrMatch = row.match(/!\s*colspan\s*=\s*"?\d+"?[^|\n]*\|([^\n]+)/i);
+        if (colspanHdrMatch) {
+          const secText = cleanWikitextInline(colspanHdrMatch[1]);
+          sectionIsRevival = /\brevival\b/i.test(secText);
+          sectionIsToken = /\btoken\b/i.test(secText);
+        }
+
+        // Capture header column layout robustly (supports both `!!` multi-line and single-line `! scope="col"` headers)
+        if (row.includes('! scope="col"') || /^\s*!/m.test(row)) {
+          const splitHeaderRow = row
+            .replace(/!!/g, '\n!')
+            .replace(
+              /!\s*(?=(?:scope|width|align|valign|style|class|colspan|rowspan)\s*=|''')/gi,
+              '\n!'
+            );
+          const headerCells = splitHeaderRow
+            .split('\n')
+            .map((l) => l.trim())
+            .filter((l) => l.startsWith('!') && !/colspan\s*=/i.test(l))
+            .map((l) =>
+              cleanWikitextInline(
+                l.replace(/^!+(?:\s*(?:scope|width|align|valign|style|class)\s*=\s*"?[^"|]*"?\s*)*\|?/i, '')
+              ).toLowerCase()
+            )
+            .filter(Boolean);
+
+          if (headerCells.length >= 3) {
+            colIdxMap = {};
+            hasExplicitHeader = true;
+            headerCells.forEach((h, idx) => {
+              if (h.includes('number') || h === 'no.' || h === 'id') colIdxMap.number = idx;
+              else if (h.includes('name') || h === 'card') colIdxMap.name = idx;
+              else if (h.includes('color') || h.includes('attribute')) colIdxMap.color = idx;
+              else if (h.includes('type')) colIdxMap.type = idx;
+              else if (h.includes('rarity')) colIdxMap.rarity = idx;
+            });
+          }
+          if (!row.includes('[[')) continue;
+        }
+
+        if (!row.includes('[[')) continue;
+
+        const rawPipeLines = row
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => l.startsWith('|') && !l.startsWith('|-') && !l.startsWith('|}'));
+
+        const expandedCellStrings: string[] = [];
+        for (const pl of rawPipeLines) {
+          if (pl.includes('||')) {
+            for (const part of pl.slice(1).split('||')) {
+              if (part.trim()) expandedCellStrings.push(part.trim());
+            }
+          } else {
+            const splitParts = splitTopLevelTableLine(pl);
+            if (splitParts.length >= 2) {
+              expandedCellStrings.push(...splitParts);
+            } else {
+              const single = pl.slice(1).trim();
+              if (single) expandedCellStrings.push(single);
+            }
+          }
+        }
+
+        if (expandedCellStrings.length < 2) continue;
+
+        const cells = expandedCellStrings.map((stripped) => {
+          const attrMatch = stripped.match(
+            /^(?:style|align|bgcolor|width|class|colspan|rowspan)\s*=[^|]*\|([\s\S]*)$/i
+          );
+          return attrMatch ? attrMatch[1].trim() : stripped;
+        });
+
+        const detectedNameIdx =
+          colIdxMap.name !== undefined &&
+          cells[colIdxMap.name] &&
+          /\[\[[^\]]+\]\]/.test(cells[colIdxMap.name])
+            ? colIdxMap.name
+            : cells.findIndex((c) => /\[\[[^\]]+\]\]/.test(c) && !/\[\[File:/i.test(c));
+
+        if (detectedNameIdx < 1) continue;
+
+        const numberIdx =
+          colIdxMap.number !== undefined ? colIdxMap.number : detectedNameIdx - 1;
+        const numRaw = cleanWikitextInline(cells[numberIdx] || '')
+          .replace(/[\u2010-\u2015\u2212]/g, '-')
+          .replace(/\s+/g, '');
+        if (!numRaw || numRaw.length > 28 || /^(?:card)?number$/i.test(numRaw)) continue;
+
+        const nameCellRaw = cells[detectedNameIdx] || '';
+        const linkMatch = nameCellRaw.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
+        if (!linkMatch) continue;
+
+        const wikiTitle = linkMatch[1].trim();
+        const baseDisplayName = (linkMatch[2] || linkMatch[1]).trim();
+        if (!wikiTitle || wikiTitle.startsWith('File:') || wikiTitle.startsWith('Category:')) {
+          continue;
+        }
+
+        const colorCell =
+          colIdxMap.color !== undefined
+            ? cells[colIdxMap.color] || ''
+            : cells[detectedNameIdx + 1] || '';
+        const typeCell =
+          colIdxMap.type !== undefined
+            ? cells[colIdxMap.type] || ''
+            : cells[detectedNameIdx + 2] || '';
+        const rarityCell =
+          colIdxMap.rarity !== undefined
+            ? cells[colIdxMap.rarity] || ''
+            : hasExplicitHeader
+            ? ''
+            : cells[detectedNameIdx + 3] || '';
+
+        const colors = normalizeColor(colorCell);
+        const { type, subtypeLabel } = normalizeType(typeCell);
+        const rarity: CardRarity =
+          setMeta.category === 'Promo' && !rarityCell
+            ? 'P'
+            : normalizeRarity(rarityCell || (setMeta.category === 'Promo' ? 'P' : 'C'));
+
+        const hasFullSetPrefix =
+          numRaw.includes('-') ||
+          /^(?:BS\d+|BSC\d+|SD\d+|CBX?\d+|PC\d+|LM\d+[A-Z]?|PB\d+|EX\d+|CP\d+|SJ\d+|KA\d+|26R[A-Z0-9]+|27R[A-Z0-9]+|RPX?\d+|PX\d+|P\d+|XX\d+)/i.test(
+            numRaw
+          );
+        const fullNumber = hasFullSetPrefix
+          ? numRaw
+          : setMeta.setCode === 'PROMO-REG'
+          ? `P-${numRaw}`
+          : `${setMeta.setCode}-${numRaw}`;
+
+        if (
+          sectionFilterUpper &&
+          !doesSectionOrCardMatchFilter(seg.heading, fullNumber, sectionFilterUpper)
+        ) {
+          continue;
+        }
+
+        const resolvedSetCode = shouldResolveSubSeries
+          ? resolvePromoSubSeriesSetCode(fullNumber, seg.heading, setMeta.setCode)
+          : setMeta.setCode;
+        const resolvedSetMeta =
+          resolvedSetCode !== setMeta.setCode
+            ? DIRECTORY_MAP.get(resolvedSetCode.toUpperCase())
+            : undefined;
+        const effectiveSetName = resolvedSetMeta?.name || (resolvedSetCode !== setMeta.setCode ? resolvedSetCode : setMeta.name);
+
+        const isRevival =
+          resolvedSetCode === 'BSC22' ||
+          resolvedSetCode === 'REVIVAL' ||
+          /^BSC22-/i.test(fullNumber) ||
+          sectionIsRevival ||
+          /\(revival\)/i.test(nameCellRaw) ||
+          /\(revival\)/i.test(wikiTitle) ||
+          /(?:^|-)RV[A-Z0-9]*\d/i.test(fullNumber);
+
+        const isToken =
+          sectionIsToken ||
+          /\btoken\b/i.test(typeCell) ||
+          /-T\d+$/i.test(fullNumber);
+
+        const displayName =
+          isRevival && !/\(revival\)/i.test(baseDisplayName)
+            ? `${baseDisplayName} (Revival)`
+            : baseDisplayName;
+
+        const uniqueKey = `${resolvedSetCode}-${fullNumber}-${wikiTitle}-${isRevival ? 'rv' : 'orig'}`;
+        if (seenKeys.has(uniqueKey)) continue;
+        seenKeys.add(uniqueKey);
+
+        const id = `${resolvedSetCode.toLowerCase()}-${fullNumber
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')}${isRevival ? '-rv' : ''}`;
+        const defaultFile = `${fullNumber}.jpg`;
+
+        const defaultSymbols: Partial<Record<BattleSymbolKind, number>> =
+          type === 'Magic' || isToken
+            ? {}
+            : type === 'Ultimate'
+            ? { Ultimate: 1 }
+            : { [colors[0]]: 1 };
+
+        cards.push({
+          id,
+          cardNumber: fullNumber,
+          name: displayName,
+          jpName: '',
+          color: colors[0],
+          secondaryColor: colors[1],
+          colors,
+          type,
+          subtypeLabel,
+          rarity,
+          setCode: resolvedSetCode,
+          setName: effectiveSetName,
+          formats: resolvedSetMeta?.formats || setMeta.formats,
+          blockIcon: resolvedSetMeta?.blockLabel || setMeta.blockLabel,
+          restriction: resolveCardRestriction(fullNumber, displayName, isRevival),
+          isRevival,
+          isToken,
+          cost: 0,
+          reduction: {},
+          symbols: defaultSymbols,
+          families: [],
+          effects: [],
+          keywords: [],
+          flavorText: '',
+          illustrator: '',
+          artworkImage: `/api/wiki/image?file=${encodeURIComponent(defaultFile)}&fallback=${encodeURIComponent(fullNumber)}&title=${encodeURIComponent(wikiTitle)}`,
+          artVariant: defaultVariant(type, colors[0]),
+          wikiTitle,
+          wikiUrl: `${WIKI_BASE}${encodeURIComponent(wikiTitle.replace(/ /g, '_'))}`,
+          isWikiLoaded: false,
+          rulings: [],
+        });
+      }
     }
   }
 
@@ -2614,45 +3082,50 @@ function inferCardSetAndNumber(
   const normalizedImgCode = rawImg
     .replace(/\.[^.]+$/, '')
     .trim()
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
     .replace(/\s+/g, '-');
   const strictCodeMatch = normalizedImgCode.match(
-    /^((?:26RBS|26RSD|BSC|CBX|BS|SD|CB|PB|PC|LM|EX|CP|PX|RP|P)\d*-[A-Z0-9]+)/i
+    /^((?:26R[A-Z]+|27R[A-Z]+|BSC|CBX|BS|SD|CB|PB|PC|LM|EX|CP|RPX|RP|PX|SJ|KA|GX|KF|P|X)\d*[A-Z]?-[A-Z0-9]+(?:\([A-Z0-9]+\))?|(?:PX|EX|SJ)\d{2,3}[A-Z]?)/i
   );
 
   let setCode = cleanWikitextInline(
     extractTabberSegment(fields.set1 || '', isRevival)
   ).trim();
+  const isGenericPromoSet1 = /^(?:promo|promo cards|special|campaign|limited|event)$/i.test(setCode);
 
-  if (!setCode && fields.releasedjp) {
+  if ((!setCode || isGenericPromoSet1) && fields.releasedjp) {
     const relCodes = [
       ...cleanWikitextInline(fields.releasedjp).matchAll(
-        /\b(BSC\d+|BS\d+|SD\d+|CBX?\d+|PB\d+|PC\d+|LM\d+)\b/gi
+        /\b(BSC\d+|BS\d+|SD\d+|CBX?\d+|PB\d+|PC\d+|LM\d+[A-Z]?|PX\d*|RPX?\d+|CP\d+|SJ\d+|P\d+)\b/gi
       ),
     ].map((m) => m[1].toUpperCase());
     if (isRevival) {
       setCode =
         relCodes.find((c) => c === 'BSC22' || /^BS(?:3[5-9]|[4-7]\d)$/.test(c)) ||
         relCodes[relCodes.length - 1] ||
-        '';
-    } else {
-      setCode = relCodes[0] || '';
+        setCode;
+    } else if (relCodes[0]) {
+      setCode = relCodes[0];
     }
   }
-
-  if (!setCode && strictCodeMatch) {
-    setCode = strictCodeMatch[1].split('-')[0].toUpperCase();
-  }
-  if (!setCode) setCode = isRevival ? 'BSC22' : 'WIKI';
 
   let cardNumber = strictCodeMatch ? strictCodeMatch[1].toUpperCase() : '';
   if (!cardNumber && !isRevival) {
     const galleryNumMatch = wikitext.match(
-      /\b((?:BS|SD|BSC|CBX?|PB|PC)\d{2}-[A-Z0-9]+)\b/i
+      /\b((?:26R[A-Z]+|27R[A-Z]+|BS|SD|BSC|CBX?|PB|PC|LM|CP|RPX?|PX|SJ|KA|GX|KF|P)\d{1,3}[A-Z]?-[A-Z0-9]+(?:\([A-Z0-9]+\))?|X-\d+[A-Z]?|(?:PX|EX|SJ)\d{2,3}[A-Z]?)\b/i
     );
     if (galleryNumMatch) {
       cardNumber = galleryNumMatch[1].toUpperCase();
     }
   }
+
+  if ((!setCode || isGenericPromoSet1) && cardNumber) {
+    setCode = resolvePromoSubSeriesSetCode(cardNumber, setCode, setCode || 'PROMO');
+  } else if (!setCode && strictCodeMatch) {
+    setCode = strictCodeMatch[1].split('-')[0].toUpperCase();
+  }
+  if (!setCode) setCode = isRevival ? 'BSC22' : 'WIKI';
+
   if (!cardNumber) {
     cardNumber = `${setCode}-${fallbackSlug.slice(0, 6).toUpperCase()}`;
   }
@@ -2863,7 +3336,14 @@ export async function getWikiSet(
     return { set: baseMeta, cards: [], totalInSet: 0 };
   }
 
-  const rawCards = parseSetTableRows(wikitext, baseMeta);
+  const isSectionedPromoSeries =
+    /^(?:PX\d*|P\d{2}|CP\d{2}|RPX?\d*-STD)$/i.test(codeKey) &&
+    wikiTitle.includes('/');
+  const rawCards = parseSetTableRows(wikitext, baseMeta, {
+    sectionFilter: isSectionedPromoSeries ? codeKey : undefined,
+    resolveSubSeriesSets:
+      isSectionedPromoSeries || GENERIC_PROMO_HUB_CODES.has(codeKey),
+  });
   const enrichedSet = enrichSetMetadata(baseMeta, wikitext, rawCards);
 
   // Batch hydrate up to hydrateLimit cards right away (each 50 cards = 1 MediaWiki request)
@@ -2968,7 +3448,8 @@ function findMatchingSetCodesForQuery(rawQuery: string): string[] {
   ensureStoredSetRegistryHydrated();
   const trimmed = rawQuery.trim();
   if (!trimmed) return [];
-  const compactUpper = trimmed.toUpperCase().replace(/[\s-]+/g, '');
+  const normalizedDashes = trimmed.replace(/[\u2010-\u2015\u2212]/g, '-');
+  const compactUpper = normalizedDashes.toUpperCase().replace(/[\s-]+/g, '');
   const compactLower = compactUpper.toLowerCase();
   const matches: string[] = [];
   const pushIfValid = (code: string) => {
@@ -2978,11 +3459,21 @@ function findMatchingSetCodesForQuery(rawQuery: string): string[] {
     }
   };
 
-  // 1. Direct set code match (e.g. "bs 70" -> "BS70", "sd43" -> "SD43", "01" -> "01", "2026" -> "2026")
+  // 0. Card-number prefix resolution (e.g. "PX26-01", "PX25-06", "RPX26-01", "P25-01", "BS70-X01")
+  const cardPrefixM = normalizedDashes.toUpperCase().match(/^([A-Z0-9]{2,12})\s*-[A-Z0-9]+(?:\([A-Z0-9]+\))?$/);
+  if (cardPrefixM) {
+    const pref = cardPrefixM[1];
+    if (pref === 'RPX26') pushIfValid('PX26-STD');
+    if (pref === 'RP26') pushIfValid('RP26-STD');
+    if (pref === 'PX') pushIfValid('PX19');
+    pushIfValid(pref);
+  }
+
+  // 1. Direct set code match (e.g. "bs 70" -> "BS70", "sd43" -> "SD43", "px25" -> "PX25")
   pushIfValid(compactUpper);
 
   // 2. Normalized code stripped of optional prefix like "SET BS70" or "BS 1" -> "BS01"
-  const strippedSet = trimmed.replace(/^set\s+/i, '').trim();
+  const strippedSet = normalizedDashes.replace(/^set\s+/i, '').trim();
   const strippedCompact = strippedSet.replace(/[\s-]+/g, '').toUpperCase();
   pushIfValid(strippedCompact);
   const shortAlphaMatch = strippedCompact.match(/^(BS|SD|CB|BSC|PB|PC|RP|PX)(\d{1})$/);
@@ -2990,14 +3481,13 @@ function findMatchingSetCodesForQuery(rawQuery: string): string[] {
     pushIfValid(`${shortAlphaMatch[1]}0${shortAlphaMatch[2]}`);
   }
 
-  const setTokenMatch = trimmed.match(/\b([A-Za-z0-9]{2,4}[\s-]*\d{2})\b/);
+  const setTokenMatch = normalizedDashes.match(/\b([A-Za-z0-9]{2,5}[\s-]*\d{2})\b/);
   if (setTokenMatch) {
     pushIfValid(setTokenMatch[1].replace(/[\s-]+/g, ''));
   }
 
   // 3. Pure numeric query (1-4 digits, e.g. "7", "43", "01", "2026", "set 24")
-  // Check exact/padded/unpadded number-only sets first, then standard/eternal prefixed sets
-  const numOnly = trimmed.match(/^(?:set\s*)?(\d{1,4})$/i);
+  const numOnly = normalizedDashes.match(/^(?:set\s*)?(\d{1,4})$/i);
   if (numOnly) {
     const rawDigits = numOnly[1];
     const padded2 = rawDigits.length <= 2 ? rawDigits.padStart(2, '0') : rawDigits;
@@ -3013,14 +3503,13 @@ function findMatchingSetCodesForQuery(rawQuery: string): string[] {
     }
 
     if (rawDigits.length <= 2) {
-      const candidatePrefixes = ['BS', 'SD', 'CB', 'BSC', 'PB', 'PC', '26RBS', '26RSD'];
+      const candidatePrefixes = ['BS', 'SD', 'CB', 'BSC', 'PB', 'PC', '26RBS', '26RSD', 'PX', 'P'];
       for (const prefix of candidatePrefixes) {
         pushIfValid(`${prefix}${padded2}`);
         if (matches.length >= 4) break;
       }
     }
-  } else if (compactLower.length >= 3) {
-    // Fallback token lookup on synchronized set names / tokens
+  } else if (compactLower.length >= 2) {
     for (const [code, tokens] of storedSetTokens.entries()) {
       if (tokens.some((t) => t === compactLower || t === trimmed.toLowerCase())) {
         pushIfValid(code);
@@ -3030,6 +3519,87 @@ function findMatchingSetCodesForQuery(rawQuery: string): string[] {
   }
 
   return matches.slice(0, 4);
+}
+
+interface DynamicPromoHubSpec {
+  setCode: string;
+  wikiTitle: string;
+  sectionFilter: string;
+  name: string;
+  formats: GameFormat[];
+}
+
+function inferDynamicPromoHubSpec(rawQuery: string): DynamicPromoHubSpec | null {
+  const upper = rawQuery
+    .trim()
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .toUpperCase();
+  if (!upper) return null;
+
+  const rpxM = upper.match(/^RPX(\d{2})(?:-|$)/);
+  if (rpxM) {
+    return {
+      setCode: rpxM[1] === '26' ? 'PX26-STD' : `RPX${rpxM[1]}-STD`,
+      wikiTitle: 'Standard Promo Cards/Promo X-Rares',
+      sectionFilter: rpxM[1] === '26' ? 'PX26-STD' : `RPX${rpxM[1]}`,
+      name: `Standard Format Promo X-Rares (RPX${rpxM[1]})`,
+      formats: ['Standard', 'Eternal'],
+    };
+  }
+  const rpM = upper.match(/^RP(\d{2})(?:-|$)/);
+  if (rpM) {
+    return {
+      setCode: rpM[1] === '26' ? 'RP26-STD' : `RP${rpM[1]}-STD`,
+      wikiTitle: 'Standard Promo Cards/Regular Promos',
+      sectionFilter: rpM[1] === '26' ? 'RP26-STD' : `RP${rpM[1]}`,
+      name: `Standard Format Regular Promos (RP${rpM[1]})`,
+      formats: ['Standard', 'Eternal'],
+    };
+  }
+  const pxM = upper.match(/^PX\s*(\d{2})(?:-|$)/);
+  if (pxM) {
+    const code = `PX${pxM[1]}`;
+    return {
+      setCode: code,
+      wikiTitle: 'Promo Cards/Promo X-Rares',
+      sectionFilter: code,
+      name: `Promo X-Rares ${code}`,
+      formats: ['Eternal'],
+    };
+  }
+  if (/^PX(?:-|\d{2}$|$)/.test(upper)) {
+    const isPx19 = /^PX-\d+/i.test(upper);
+    return {
+      setCode: isPx19 ? 'PX19' : 'PX',
+      wikiTitle: 'Promo Cards/Promo X-Rares',
+      sectionFilter: isPx19 ? 'PX19' : 'PX',
+      name: isPx19 ? 'Promo X-Rares PX19' : 'Promo X-Rares (PX Original)',
+      formats: ['Eternal'],
+    };
+  }
+  const pM = upper.match(/^P\s*(\d{2})-(?!X)/);
+  if (pM) {
+    const code = `P${pM[1]}`;
+    return {
+      setCode: code,
+      wikiTitle: 'Promo Cards/Regular Promos',
+      sectionFilter: code,
+      name: `Regular Promos ${code}`,
+      formats: ['Eternal'],
+    };
+  }
+  const cpM = upper.match(/^CP\s*(\d{2})(?:-|$)/);
+  if (cpM) {
+    const code = `CP${cpM[1]}`;
+    return {
+      setCode: code,
+      wikiTitle: 'Promo Cards/Campaign Promos',
+      sectionFilter: code,
+      name: `Campaign Promos ${code}`,
+      formats: ['Eternal'],
+    };
+  }
+  return null;
 }
 
 async function fetchCategoryMemberTitles(categoryName: string): Promise<string[]> {
@@ -3060,6 +3630,12 @@ export async function searchWikiCards(
 
   await ensureBanListLoaded();
 
+  const normalizedQueryDashes = trimmed.replace(/[\u2010-\u2015\u2212]/g, '-');
+  const queryUpperCompact = normalizedQueryDashes.toUpperCase().replace(/\s+/g, '');
+  const isSpecificCardNumberQuery = /^[A-Z0-9]{1,10}-[A-Z0-9]+(?:\([A-Z0-9]+\))?$|^PX\d{2}[A-Z]?$/i.test(
+    queryUpperCompact
+  );
+
   const results: BattleSpiritsCard[] = [];
   const seenKeys = new Set<string>();
   const pushCard = (card: BattleSpiritsCard) => {
@@ -3077,24 +3653,96 @@ export async function searchWikiCards(
     }
   };
 
-  // 1. If query corresponds to one or more expansion set codes (e.g. "bs 70", "43", "12"), load full set rosters
+  // 1. If query corresponds to one or more expansion set codes or promo series (e.g. "bs 70", "px25", "px26-01")
   const matchedSets = findMatchingSetCodesForQuery(trimmed);
   if (matchedSets.length > 0) {
     const setBundles = await Promise.all(
       matchedSets.map((code) => getWikiSet(code, 500).catch(() => null))
     );
+    const matchingNumberCards: BattleSpiritsCard[] = [];
+    const otherCards: BattleSpiritsCard[] = [];
     for (const bundle of setBundles) {
       if (!bundle) continue;
       for (const c of bundle.cards) {
-        pushCard(c);
+        if (
+          isSpecificCardNumberQuery &&
+          c.cardNumber.toUpperCase().replace(/\s+/g, '').includes(queryUpperCompact)
+        ) {
+          matchingNumberCards.push(c);
+        } else {
+          otherCards.push(c);
+        }
       }
     }
-    if (results.length > 0 && (/^[A-Za-z0-9\s-]{2,10}$/.test(trimmed) && /\d/.test(trimmed))) {
+    if (isSpecificCardNumberQuery && matchingNumberCards.length > 0) {
+      for (const c of matchingNumberCards) pushCard(c);
+      return results;
+    }
+    for (const c of otherCards) pushCard(c);
+    if (results.length > 0 && (/^[A-Za-z0-9\s-]{2,12}$/.test(normalizedQueryDashes) && /\d/.test(normalizedQueryDashes))) {
       return results;
     }
   }
 
-  // 2. General / Family / Keyword Wiki search: combine multi-page full-text search + exact Wiki Category lookup
+  // 1b. Dynamic promo/PX hub lookup even if sub-series was not yet synced into DIRECTORY_MAP
+  const promoHubSpec = inferDynamicPromoHubSpec(trimmed);
+  if (promoHubSpec && results.length === 0) {
+    try {
+      const hubJson = (await fetchWikiJson({
+        action: 'query',
+        titles: promoHubSpec.wikiTitle,
+        prop: 'revisions',
+        rvprop: 'content',
+        rvslots: 'main',
+        redirects: '1',
+      })) as {
+        query?: {
+          pages?: Record<
+            string,
+            { revisions?: { slots?: { main?: { '*'?: string } } }[] }
+          >;
+        };
+      };
+      const wt = Object.values(hubJson.query?.pages || {})[0]?.revisions?.[0]?.slots?.main?.['*'] || '';
+      if (wt) {
+        const promoSetMeta = upsertStoredSetMetadata({
+          setCode: promoHubSpec.setCode,
+          wikiTitle: promoHubSpec.wikiTitle,
+          category: 'Promo',
+          name: promoHubSpec.name,
+          jpName: '',
+          productType: 'Promo Set',
+          releaseDate: promoHubSpec.formats.includes('Standard') ? '2026+' : 'All Eras',
+          formats: promoHubSpec.formats,
+          blockLabel: promoHubSpec.formats.includes('Standard') ? 'Standard Promo' : 'Eternal Promo',
+          tagline: `${promoHubSpec.name} from Battle Spirits Wiki.`,
+          featuredCardId: `${promoHubSpec.setCode.toLowerCase()}-01`,
+          colors: ALL_COLORS,
+          totalCardsInSet: 0,
+          wikiUrl: `${WIKI_BASE}${encodeURIComponent(promoHubSpec.wikiTitle.replace(/ /g, '_'))}`,
+        });
+        const parsedPromoCards = parseSetTableRows(wt, promoSetMeta, {
+          sectionFilter: promoHubSpec.sectionFilter,
+          resolveSubSeriesSets: true,
+        });
+        const filteredPromo = isSpecificCardNumberQuery
+          ? parsedPromoCards.filter((c) =>
+              c.cardNumber.toUpperCase().replace(/\s+/g, '').includes(queryUpperCompact)
+            )
+          : parsedPromoCards;
+        const targetCards = filteredPromo.length > 0 ? filteredPromo : parsedPromoCards;
+        if (targetCards.length > 0) {
+          const hydratedPromo = await hydrateWikiCardsBatch(targetCards.slice(0, 80));
+          for (const c of hydratedPromo) pushCard(c);
+          if (results.length > 0) return results;
+        }
+      }
+    } catch {
+      // continue cleanly to MediaWiki full-text search
+    }
+  }
+
+  // 2. General / Family / Keyword / Card Number Wiki search: combine multi-page full-text search + Category lookup
   const titleQuery = toWikiTitleCase(trimmed);
   const categoryCandidates = Array.from(
     new Set([
@@ -3108,14 +3756,14 @@ export async function searchWikiCards(
     fetchWikiJson({
       action: 'query',
       list: 'search',
-      srsearch: trimmed,
+      srsearch: normalizedQueryDashes,
       srlimit: '50',
     }).catch(() => ({})) as Promise<{ query?: { search?: { title: string }[] } }>,
-    trimmed.length >= 3
+    normalizedQueryDashes.length >= 3
       ? (fetchWikiJson({
           action: 'query',
           list: 'search',
-          srsearch: trimmed,
+          srsearch: normalizedQueryDashes,
           srlimit: '50',
           sroffset: '50',
         }).catch(() => ({})) as Promise<{ query?: { search?: { title: string }[] } }>)
@@ -3124,22 +3772,24 @@ export async function searchWikiCards(
   ]);
 
   const titleSet = new Set<string>();
+  const promoHubTitles = new Set<string>();
   for (const list of categoryLists) {
     for (const t of list) {
       if (t && !t.includes('/')) titleSet.add(t);
     }
   }
-  for (const item of searchPage1.query?.search || []) {
-    if (item.title && !item.title.includes('/')) titleSet.add(item.title);
-  }
-  for (const item of searchPage2.query?.search || []) {
-    if (item.title && !item.title.includes('/')) titleSet.add(item.title);
+  for (const item of [...(searchPage1.query?.search || []), ...(searchPage2.query?.search || [])]) {
+    const t = item.title || '';
+    if (!t) continue;
+    if (/^(?:Standard )?Promo Cards\//i.test(t) || t === 'Promo Cards') {
+      promoHubTitles.add(t);
+    } else if (!t.includes('/')) {
+      titleSet.add(t);
+    }
   }
 
   const titles = Array.from(titleSet).slice(0, 120);
-  if (titles.length === 0) return results;
-
-  const contents = await batchFetchWikiPages(titles);
+  const contents = titles.length > 0 ? await batchFetchWikiPages(titles) : new Map<string, WikiPageBundle>();
 
   for (const title of titles) {
     const bundle = contents.get(title);
@@ -3150,7 +3800,6 @@ export async function searchWikiCards(
     const originalBlock = taggedBlocks.find((t) => !t.isRevival);
     const revivalBlock = taggedBlocks.find((t) => t.isRevival);
 
-    // Emit distinct entries for Original (Non-Revival) and Revival blocks on Wiki pages
     const versionsToEmit: TaggedCardBlock[] = [];
     if (originalBlock) versionsToEmit.push(originalBlock);
     if (revivalBlock) {
@@ -3215,6 +3864,46 @@ export async function searchWikiCards(
         vBlock
       );
       pushCard(hydrated);
+    }
+  }
+
+  // 3. Fallback: if promo hub pages (e.g. Promo Cards/Promo X-Rares) appeared in search hits and card results are still sparse, inspect matching rows from those hubs
+  if (results.length < 5 && promoHubTitles.size > 0) {
+    const hubBundles = await batchFetchWikiPages(Array.from(promoHubTitles).slice(0, 3));
+    const qLower = trimmed.toLowerCase();
+    const matchedHubCards: BattleSpiritsCard[] = [];
+    for (const [hubTitle, bundle] of hubBundles.entries()) {
+      const dummyHubMeta: ProductSet = {
+        setCode: 'PROMO-PX',
+        wikiTitle: hubTitle,
+        category: 'Promo',
+        name: hubTitle,
+        jpName: '',
+        productType: 'Promo Set',
+        releaseDate: 'All Eras',
+        formats: /standard promo/i.test(hubTitle) ? ['Standard', 'Eternal'] : ['Eternal'],
+        blockLabel: /standard promo/i.test(hubTitle) ? 'Standard Promo' : 'Eternal Promo',
+        tagline: hubTitle,
+        featuredCardId: 'promo-01',
+        colors: ALL_COLORS,
+        totalCardsInSet: 0,
+        wikiUrl: `${WIKI_BASE}${encodeURIComponent(hubTitle.replace(/ /g, '_'))}`,
+      };
+      const rows = parseSetTableRows(bundle.wikitext, dummyHubMeta, { resolveSubSeriesSets: true });
+      for (const row of rows) {
+        const numCompact = row.cardNumber.toUpperCase().replace(/\s+/g, '');
+        if (
+          numCompact.includes(queryUpperCompact) ||
+          row.name.toLowerCase().includes(qLower) ||
+          row.setCode.toUpperCase() === queryUpperCompact
+        ) {
+          matchedHubCards.push(row);
+        }
+      }
+    }
+    if (matchedHubCards.length > 0) {
+      const hydratedHub = await hydrateWikiCardsBatch(matchedHubCards.slice(0, 30));
+      for (const c of hydratedHub) pushCard(c);
     }
   }
 

@@ -31,7 +31,7 @@ export interface DecklistImportResult {
 }
 
 const CARD_CODE_CORE_REGEX =
-  '(?:26R(?:BS|SD)\\d+(?:-[A-Z0-9]+)+|[A-Z]{1,5}\\d{1,4}(?:-[A-Z0-9]+)+|TK\\d{1,3}|[A-Z]{1,3}\\d{2}-\\d{2,3})';
+  '(?:26R(?:BS|SD|EB|DB|CB)\\d+(?:-[A-Z0-9]+)+|[A-Z]{1,5}\\d{0,4}(?:-[A-Z0-9]+)+(?:\\([A-Z0-9]+\\))?|PX\\d{2}|EX\\d{3}|XX\\d{2}|TK\\d{1,3}|[A-Z]{1,3}\\d{2}-\\d{2,3})';
 const CARD_CODE_STANDALONE_REGEX = new RegExp(`\\b(${CARD_CODE_CORE_REGEX})\\b`, 'i');
 const CARD_CODE_BRACKETED_REGEX = new RegExp(
   `[\\[(]\\s*(${CARD_CODE_CORE_REGEX})\\s*[\\])]`,
@@ -42,7 +42,12 @@ const SECTION_HEADER_REGEX =
   /^(?:spirits?|ultimates?|braves?|nexuses|nexus|magics?|tokens?|main\s*deck|side\s*deck|sideboard|deck\s*list|total)\b(?:\s*[:(\[]\s*\d*\s*[)\]]?)?:?$/i;
 
 export function normalizeCardNumber(num: string): string {
-  return num.trim().toUpperCase().replace(/\s+/g, '');
+  return (num || '')
+    .trim()
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .toUpperCase()
+    .replace(/\s*-\s*/g, '-')
+    .replace(/\s+/g, '');
 }
 
 export function compactCardNumber(num: string): string {
@@ -71,11 +76,20 @@ export function stripPunctuation(name: string): string {
 export function extractSetCodeFromCardNumber(cardNumber: string): string | null {
   const clean = normalizeCardNumber(cardNumber);
   if (!clean) return null;
+
+  // Unhyphenated promo formats (e.g. PX01..PX18, EX001)
+  if (/^PX\d{2}$/i.test(clean)) return 'PX';
+  if (/^EX\d{2,3}$/i.test(clean)) return 'EXPROMO';
+
   const dashIdx = clean.indexOf('-');
   if (dashIdx <= 0) return null;
-  let prefix = clean.slice(0, dashIdx);
-  // Map RP26-01 -> RP26-STD if needed, or return prefix directly
+  const prefix = clean.slice(0, dashIdx);
   if (prefix === 'RP26') return 'RP26-STD';
+  if (prefix === 'RPX26') return 'PX26-STD';
+  if (prefix === 'PX') return 'PX19';
+  if (prefix === 'X') return 'PROMO-X';
+  if (prefix === 'GX') return 'PROMO-ANM';
+  if (prefix === 'KF') return 'KFC';
   return prefix;
 }
 
