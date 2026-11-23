@@ -34,6 +34,7 @@ import {
   type ArtworkValidationRecord,
 } from './server/manualUrlValidator.ts';
 import { artworkValidationRouter } from './server/controllers/artworkValidationController.ts';
+import { requireAdminMiddleware } from './server/middleware/adminAuth.ts';
 import type { BattleSpiritsCard } from './src/types/card.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -256,6 +257,12 @@ async function startServer() {
       res.status(500).json({ error: message });
     }
   });
+
+  // Scheduled cron validation authenticates with X-Validation-Cron-Secret header
+  app.use(artworkValidationRouter);
+
+  // Enforce strict server-side Firebase Authentication & admin authorization on all other /api/admin/* routes
+  app.use('/api/admin', requireAdminMiddleware);
 
   // --- Admin Wiki Catalog Discovery, Comparison & Safe Import Routes ---
   app.get('/api/admin/catalog/status', (req, res) => {
@@ -493,8 +500,6 @@ async function startServer() {
       res.status(500).json({ ok: false, error: message });
     }
   });
-
-  app.use(artworkValidationRouter);
 
   // Return structured JSON 404 for unknown /api/* paths before SPA HTML fallback
   app.use('/api', (_req, res) => {

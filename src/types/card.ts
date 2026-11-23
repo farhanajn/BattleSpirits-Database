@@ -144,6 +144,7 @@ export interface FilterState {
   version: 'All' | 'Original' | 'Revival';
   color: ColorFilter;
   type: CardType[];
+  family: string | 'All';
   rarity: CardRarity[];
   setCode: string | 'All';
   costBracket: 'All' | '0-2' | '3-4' | '5-6' | '7+';

@@ -19,6 +19,13 @@ import type {
   GameFormat,
   ProductSet,
 } from '../types/card';
+import {
+  normalizeCardColors,
+  normalizeCardCost,
+  normalizeCardFamilies,
+  normalizeCardForCatalog,
+  normalizeCardTypes,
+} from './cardFilterNormalization';
 
 export interface ClientArtworkValidationRecord {
   mappingKey: string;
@@ -98,7 +105,7 @@ const VALID_SET_CATEGORIES = new Set<string>([
   'Token',
   'Revival',
 ]);
-const ADMIN_EMAILS = new Set(['farhana.jn2000@gmail.com']);
+export const ADMIN_EMAILS = new Set(['farhana.jn2000@gmail.com']);
 const BATCH_CHUNK_SIZE = 200;
 
 enum OperationType {
@@ -295,27 +302,32 @@ export async function fetchPublishedCatalogAdditions(): Promise<{
         try {
           const parsed = JSON.parse(data.payloadJson) as BattleSpiritsCard;
           if (parsed && parsed.id && parsed.name) {
-            cards.push(parsed);
+            cards.push(normalizeCardForCatalog(parsed));
             continue;
           }
         } catch {
           // fall back to structured summary fields
         }
       }
+      const parsedColors = normalizeCardColors({
+        color: data.color,
+        secondaryColor: data.secondaryColor,
+        colors: data.colors,
+      });
+      const parsedTypes = normalizeCardTypes({
+        type: data.type,
+        subtypeLabel: data.subtypeLabel,
+      });
+      const parsedCost = normalizeCardCost(data.cost);
       cards.push({
         id: String(data.id || d.id),
         cardNumber: String(data.cardNumber || d.id),
         name: String(data.name || d.id),
         jpName: String(data.jpName || ''),
-        color: VALID_COLORS.includes(data.color) ? data.color : 'Red',
-        ...(VALID_COLORS.includes(data.secondaryColor)
-          ? { secondaryColor: data.secondaryColor as CardColor }
-          : {}),
-        colors:
-          Array.isArray(data.colors) && data.colors.length > 0
-            ? (data.colors.filter((c) => VALID_COLORS.includes(c)) as CardColor[])
-            : ['Red'],
-        type: VALID_TYPES.includes(data.type) ? (data.type as CardType) : 'Spirit',
+        color: parsedColors[0] || 'Red',
+        ...(parsedColors[1] ? { secondaryColor: parsedColors[1] } : {}),
+        ...(parsedColors.length > 0 ? { colors: parsedColors } : {}),
+        type: parsedTypes[0] || 'Spirit',
         subtypeLabel: data.subtypeLabel ? String(data.subtypeLabel) : undefined,
         rarity: String(data.rarity || 'C') as BattleSpiritsCard['rarity'],
         setCode: String(data.setCode || 'WIKI'),
@@ -325,12 +337,14 @@ export async function fetchPublishedCatalogAdditions(): Promise<{
         restriction: String(data.restriction || 'Unlimited') as BattleSpiritsCard['restriction'],
         isRevival: Boolean(data.isRevival),
         isToken: Boolean(data.isToken),
-        cost: Math.max(0, Math.min(99, Math.round(Number(data.cost) || 0))),
+        cost: parsedCost !== null ? parsedCost : Number.NaN,
         reduction: {},
         symbols: {},
-        families: [],
+        families: normalizeCardFamilies(data.families),
         effects: [],
-        keywords: [],
+        keywords: Array.isArray(data.keywords)
+          ? data.keywords.map((k: unknown) => String(k || '').trim()).filter(Boolean)
+          : [],
         flavorText: '',
         illustrator: '',
         artworkImage: '',

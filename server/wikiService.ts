@@ -1085,12 +1085,21 @@ function stripWikiNoise(raw: string): string {
     .replace(/<ref[^/]*\/>/gi, '');
 }
 
+const JP_COLOR_ALIASES: [string, CardColor][] = [
+  ['赤', 'Red'],
+  ['紫', 'Purple'],
+  ['白', 'White'],
+  ['黄', 'Yellow'],
+  ['緑', 'Green'],
+  ['青', 'Blue'],
+];
+
 export function normalizeColor(raw: string): CardColor[] {
   const cleaned = stripWikiNoise(raw)
     .replace(/<[^>]+>/g, ' ')
     .replace(/\{\{|\}\}/g, ' ');
   const lower = cleaned.toLowerCase();
-  if (/\b(all|omni|rainbow)\b/.test(lower) || /6[\s-]*colors?/.test(lower)) {
+  if (/\b(all|omni|rainbow)\b/.test(lower) || /6[\s-]*colors?|全色/.test(lower)) {
     return [...ALL_COLORS];
   }
 
@@ -1101,6 +1110,11 @@ export function normalizeColor(raw: string): CardColor[] {
     const c = ALL_COLORS.find((col) => col.toLowerCase() === match![1].toLowerCase());
     if (c && !found.includes(c)) {
       found.push(c);
+    }
+  }
+  for (const [jp, en] of JP_COLOR_ALIASES) {
+    if (cleaned.includes(jp) && !found.includes(en)) {
+      found.push(en);
     }
   }
   return found.length > 0 ? found : ['Red'];
@@ -1115,15 +1129,15 @@ export function normalizeType(raw: string): { type: CardType; subtypeLabel?: str
   const lowerFull = cleaned.toLowerCase();
 
   let type: CardType = 'Spirit';
-  if (/\bultimate\b/.test(lowerPrimary)) type = 'Ultimate';
-  else if (/\bnexus\b/.test(lowerPrimary)) type = 'Nexus';
-  else if (/\bmagic\b/.test(lowerPrimary)) type = 'Magic';
-  else if (/\bbrave\b/.test(lowerPrimary)) type = 'Brave';
-  else if (/\bspirit\b/.test(lowerPrimary)) type = 'Spirit';
-  else if (/\bultimate\b/.test(lowerFull)) type = 'Ultimate';
-  else if (/\bnexus\b/.test(lowerFull)) type = 'Nexus';
-  else if (/\bmagic\b/.test(lowerFull)) type = 'Magic';
-  else if (/\bbrave\b/.test(lowerFull)) type = 'Brave';
+  if (/\bultimate\b/.test(lowerPrimary) || primarySegment.includes('アルティメット')) type = 'Ultimate';
+  else if (/\bnexus\b/.test(lowerPrimary) || primarySegment.includes('ネクサス')) type = 'Nexus';
+  else if (/\bmagic\b/.test(lowerPrimary) || primarySegment.includes('マジック')) type = 'Magic';
+  else if (/\bbrave\b/.test(lowerPrimary) || primarySegment.includes('ブレイヴ')) type = 'Brave';
+  else if (/\bspirit\b/.test(lowerPrimary) || primarySegment.includes('スピリット')) type = 'Spirit';
+  else if (/\bultimate\b/.test(lowerFull) || cleaned.includes('アルティメット')) type = 'Ultimate';
+  else if (/\bnexus\b/.test(lowerFull) || cleaned.includes('ネクサス')) type = 'Nexus';
+  else if (/\bmagic\b/.test(lowerFull) || cleaned.includes('マジック')) type = 'Magic';
+  else if (/\bbrave\b/.test(lowerFull) || cleaned.includes('ブレイヴ')) type = 'Brave';
 
   const subtypeLabel =
     cleaned &&
@@ -2003,12 +2017,26 @@ export function hydrateCardFromWikitext(
   );
   const symbols = parseColorCounts(extractTabberSegment(fields.symbols || '', isRevival));
 
-  const families = [
+  const rawFamilyFields = [
     cleanWikitextInline(extractTabberSegment(fields.family || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family2 || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family3 || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family4 || '', isRevival)),
   ].filter(Boolean);
+
+  const families: string[] = [];
+  const seenFamilies = new Set<string>();
+  for (const rawFam of rawFamilyFields) {
+    for (const part of rawFam.split(/[,/・、／]+/)) {
+      const cleanedFam = part.trim().replace(/\s+/g, ' ');
+      if (!cleanedFam || /^(?:-|—|–|none|n\/a)$/i.test(cleanedFam)) continue;
+      const key = cleanedFam.toLowerCase();
+      if (!seenFamilies.has(key)) {
+        seenFamilies.add(key);
+        families.push(cleanedFam);
+      }
+    }
+  }
 
   const resolvedSymbols: Partial<Record<BattleSymbolKind, number>> =
     Object.keys(symbols).length > 0

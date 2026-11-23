@@ -5,6 +5,8 @@ import { ALL_COLORS, ALL_RARITIES, ALL_TYPES, COLOR_META } from '../data/theme';
 import { SymbolIcon } from './SymbolIcon';
 import { normalizeSetIdentifier, sortSetsForFilterDropdown } from '../utils/setMetadataSync';
 
+import { canonicalizeFamilyLabel } from '../utils/cardFilterNormalization';
+
 interface SetOption {
   setCode: string;
   name: string;
@@ -14,6 +16,7 @@ interface SetOption {
 interface FilterControlsProps {
   filters: FilterState;
   availableSets: SetOption[];
+  availableFamilies: string[];
   availableKeywords: string[];
   onChange: (next: FilterState) => void;
   onReset: () => void;
@@ -22,6 +25,7 @@ interface FilterControlsProps {
 export const FilterControls: React.FC<FilterControlsProps> = ({
   filters,
   availableSets,
+  availableFamilies,
   availableKeywords,
   onChange,
   onReset,
@@ -39,6 +43,13 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
     );
     return matched ? matched.setCode : filters.setCode;
   }, [filters.setCode, sortedSets]);
+
+  const selectedFamilyValue = React.useMemo(() => {
+    if (!filters.family || filters.family === 'All') return 'All';
+    const targetCanonical = canonicalizeFamilyLabel(filters.family).toLowerCase();
+    const matched = availableFamilies.find((f) => f.toLowerCase() === targetCanonical);
+    return matched || filters.family;
+  }, [filters.family, availableFamilies]);
 
   const toggleType = (target: CardType) => {
     const exists = filters.type.includes(target);
@@ -308,6 +319,25 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
                 </option>
               );
             })}
+          </select>
+        </div>
+
+        <div>
+          <label htmlFor="filter-family" className="block text-xs font-semibold text-slate-500 mb-1">
+            Card Family
+          </label>
+          <select
+            id="filter-family"
+            value={selectedFamilyValue}
+            onChange={(e) => onChange({ ...filters, family: e.target.value })}
+            className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
+          >
+            <option value="All">All Families</option>
+            {availableFamilies.map((fam) => (
+              <option key={fam} value={fam}>
+                {fam}
+              </option>
+            ))}
           </select>
         </div>
 

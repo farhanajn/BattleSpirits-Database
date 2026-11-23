@@ -84,7 +84,9 @@ async function testConnection() {
   }
 }
 
-void testConnection();
+if (typeof document !== 'undefined') {
+  void testConnection();
+}
 
 export async function signInWithGoogle(): Promise<User | null> {
   const cred = await signInWithPopup(auth, googleProvider);

@@ -17,10 +17,10 @@ import {
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import type { BattleSpiritsCard, ProductSet } from '../types/card';
+import { useAdmin } from '../hooks/useAdmin';
 import {
   type ClientArtworkValidationRecord,
   fetchValidationRecordsFromFirestore,
-  isVerifiedAdminUser,
   publishCatalogAdditionsToFirestore,
   syncValidationRecordsToFirestore,
 } from '../utils/catalogCloudSync';
@@ -178,6 +178,7 @@ interface ImportValidationPreview {
 
 interface AdminCatalogSectionProps {
   currentUser: User | null;
+  authReady?: boolean;
   onCatalogImported?: (sets: ProductSet[], cards: BattleSpiritsCard[]) => void;
   onNotify?: (message: string) => void;
 }
@@ -241,12 +242,14 @@ function renderStatusBadge(status: string) {
 
 export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   currentUser,
+  authReady = true,
   onCatalogImported,
   onNotify,
 }) => {
+  const { isAdmin, loading: adminLoading } = useAdmin(currentUser, authReady);
   const [subTab, setSubTab] = useState<AdminSubTab>('overview');
   const [expanded, setExpanded] = useState(false);
-  const [isAdminCloud, setIsAdminCloud] = useState(false);
+  const isAdminCloud = Boolean(currentUser && !adminLoading && isAdmin);
 
   // Catalog state
   const [overview, setOverview] = useState<CatalogOverview | null>(null);
@@ -298,17 +301,42 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const [valBusy, setValBusy] = useState(false);
   const [checkingKey, setCheckingKey] = useState<string | null>(null);
 
+  const adminFetch = useCallback(
+    async (url: string, init: RequestInit = {}) => {
+      if (!currentUser || adminLoading || !isAdmin) {
+        throw new Error('Verified administrator authentication required');
+      }
+      const idToken = await currentUser.getIdToken();
+      const headers = new Headers(init.headers);
+      headers.set('Authorization', `Bearer ${idToken}`);
+      return fetch(url, { ...init, headers });
+    },
+    [currentUser, adminLoading, isAdmin]
+  );
+
+  // Synchronously fail closed and wipe cached admin diagnostics whenever user logs out or changes
   useEffect(() => {
-    let active = true;
-    void isVerifiedAdminUser(currentUser).then((ok) => {
-      if (active) setIsAdminCloud(ok);
-    });
-    return () => {
-      active = false;
-    };
-  }, [currentUser]);
+    if (!currentUser || adminLoading || !isAdmin) {
+      setExpanded(false);
+      setOverview(null);
+      setSets([]);
+      setReviewCards([]);
+      setTotalFilteredCards(0);
+      setErrorLogs([]);
+      setValidationPreview(null);
+      setRejectedCards([]);
+      setFailedImports([]);
+      setCloudSyncFailures(null);
+      setValSummary(null);
+      setValRecords([]);
+      setValScheduler(null);
+      setDeadLinkRecords([]);
+      rehydratedValidationRef.current = false;
+    }
+  }, [currentUser, adminLoading, isAdmin]);
 
   const loadCatalogStatus = useCallback(async () => {
+    if (!isAdminCloud) return;
     try {
       const qs = new URLSearchParams();
       if (setFilter !== 'all') qs.set('setFilter', setFilter);
@@ -318,7 +346,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       if (onlyIncompleteMeta) qs.set('onlyIncomplete', 'true');
       qs.set('limit', '120');
 
-      const res = await fetch(`/api/admin/catalog/status?${qs.toString()}`);
+      const res = await adminFetch(`/api/admin/catalog/status?${qs.toString()}`);
       if (!res.ok) return;
       const data = await res.json();
       setOverview(data.overview || null);
@@ -329,11 +357,12 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     } catch {
       // ignore transient network errors
     }
-  }, [setFilter, cardClassification, selectedSetCodeFilter, onlyMissingArt, onlyIncompleteMeta]);
+  }, [isAdminCloud, adminFetch, setFilter, cardClassification, selectedSetCodeFilter, onlyMissingArt, onlyIncompleteMeta]);
 
   const loadBrokenHealthAlert = useCallback(async () => {
+    if (!isAdminCloud) return;
     try {
-      const res = await fetch('/api/admin/validation/status?status=broken');
+      const res = await adminFetch('/api/admin/validation/status?status=broken');
       if (!res.ok) return;
       const data = await res.json();
       setValSummary((prev) => data.summary || prev);
@@ -342,14 +371,15 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     } catch {
       // ignore offline
     }
-  }, []);
+  }, [isAdminCloud, adminFetch]);
 
   const loadValidationStatus = useCallback(async () => {
+    if (!isAdminCloud) return;
     try {
       const qs = new URLSearchParams();
       if (valStatusFilter !== 'all') qs.set('status', valStatusFilter);
       if (valQuery.trim()) qs.set('q', valQuery.trim());
-      const res = await fetch(`/api/admin/validation/status?${qs.toString()}`);
+      const res = await adminFetch(`/api/admin/validation/status?${qs.toString()}`);
       if (!res.ok) return;
       const data = await res.json();
       setValSummary(data.summary || null);
@@ -367,17 +397,18 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     } catch {
       // ignore
     }
-  }, [valStatusFilter, valQuery, loadBrokenHealthAlert]);
+  }, [isAdminCloud, adminFetch, valStatusFilter, valQuery, loadBrokenHealthAlert]);
 
   useEffect(() => {
+    if (!isAdminCloud) return;
     void loadBrokenHealthAlert();
-  }, [loadBrokenHealthAlert]);
+  }, [isAdminCloud, loadBrokenHealthAlert]);
 
   useEffect(() => {
-    if (!expanded) return;
+    if (!expanded || !isAdminCloud) return;
     void loadCatalogStatus();
     void loadValidationStatus();
-  }, [expanded, loadCatalogStatus, loadValidationStatus]);
+  }, [expanded, isAdminCloud, loadCatalogStatus, loadValidationStatus]);
 
   // Rehydrate Firestore validation records into server state on admin open
   useEffect(() => {
@@ -386,7 +417,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     void fetchValidationRecordsFromFirestore().then(async (cloudRecords) => {
       if (!cloudRecords.length) return;
       try {
-        await fetch('/api/admin/validation/rehydrate', {
+        await adminFetch('/api/admin/validation/rehydrate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ records: cloudRecords }),
@@ -396,7 +427,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
         // non-fatal
       }
     });
-  }, [expanded, isAdminCloud, loadValidationStatus]);
+  }, [expanded, isAdminCloud, adminFetch, loadValidationStatus]);
 
   const filteredSets = useMemo(() => {
     const q = setSearchQuery.trim().toLowerCase();
@@ -423,7 +454,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleDiscoverSets = async () => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/discover-sets', { method: 'POST' });
+      const res = await adminFetch('/api/admin/catalog/discover-sets', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Discovery failed');
       onNotify?.(
@@ -440,7 +471,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleScanBatch = async (mode: 'all' | 'resume' | 'retry_failed') => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/scan', {
+      const res = await adminFetch('/api/admin/catalog/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode, maxSetsPerRun: 12 }),
@@ -463,7 +494,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleScanPromosSpecial = async () => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/scan', {
+      const res = await adminFetch('/api/admin/catalog/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'all', scope: 'promo_special', maxSetsPerRun: 40 }),
@@ -486,7 +517,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleScanSingleSet = async (setCode: string) => {
     setScanningSetCode(setCode);
     try {
-      const res = await fetch('/api/admin/catalog/scan', {
+      const res = await adminFetch('/api/admin/catalog/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ setCode }),
@@ -517,7 +548,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
           onNotify?.(`Auto-scan paused after ${totalProcessed} set(s). Click Resume Scan to continue.`);
           break;
         }
-        const res = await fetch('/api/admin/catalog/scan', {
+        const res = await adminFetch('/api/admin/catalog/scan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mode: nextMode, maxSetsPerRun: 12 }),
@@ -553,7 +584,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleCompareCatalog = async () => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/compare', { method: 'POST' });
+      const res = await adminFetch('/api/admin/catalog/compare', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Compare failed');
       onNotify?.(
@@ -569,7 +600,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
 
   const handleToggleApproval = async (discoveryKey: string, approved: boolean) => {
     try {
-      const res = await fetch('/api/admin/catalog/review', {
+      const res = await adminFetch('/api/admin/catalog/review', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ discoveryKey, approved }),
@@ -584,7 +615,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleValidateImport = async () => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/validate-import', {
+      const res = await adminFetch('/api/admin/catalog/validate-import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ includeMissing: true, includeApprovedUpdates: true }),
@@ -651,7 +682,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleReprocessAndRetry = async () => {
     setCatalogBusy(true);
     try {
-      const res = await fetch('/api/admin/catalog/reprocess', {
+      const res = await adminFetch('/api/admin/catalog/reprocess', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ autoImport: true, rehydrateSynthetic: true }),
@@ -705,7 +736,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     setCatalogBusy(true);
     if (setCodes?.length === 1) setImportingSetCode(setCodes[0]);
     try {
-      const res = await fetch('/api/admin/catalog/import', {
+      const res = await adminFetch('/api/admin/catalog/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -786,7 +817,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   }) => {
     setValBusy(true);
     try {
-      const res = await fetch('/api/admin/validation/run', {
+      const res = await adminFetch('/api/admin/validation/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(opts),
@@ -810,7 +841,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const handleCheckSingleUrl = async (mappingKey: string) => {
     setCheckingKey(mappingKey);
     try {
-      const res = await fetch('/api/admin/validation/check-one', {
+      const res = await adminFetch('/api/admin/validation/check-one', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mappingKey }),
@@ -844,6 +875,11 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       setValBusy(false);
     }
   };
+
+  // Strict fail-closed component guard: never render any Admin Tools DOM for non-admins or logged-out visitors
+  if (!currentUser || adminLoading || !isAdmin) {
+    return null;
+  }
 
   return (
     <section className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-6 space-y-4">
@@ -964,9 +1000,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
             <div className="flex items-center gap-2 text-[11px] text-slate-500">
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
               <span>
-                {isAdminCloud
-                  ? `Cloud Admin Verified (${currentUser?.email})`
-                  : 'Local Server Mode (sign in as verified Admin to also publish to Firestore)'}
+                {`Cloud Admin Verified (${currentUser.email || currentUser.uid})`}
               </span>
             </div>
           </div>

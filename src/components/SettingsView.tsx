@@ -19,10 +19,13 @@ import { RulingsView } from './RulingsView';
 import { PWAInstallButton } from './PWAControls';
 import { SymbolIcon } from './SymbolIcon';
 import { AdminCatalogSection } from './AdminCatalogSection';
+import { useAdmin } from '../hooks/useAdmin';
 
 interface SettingsViewProps {
   currentUser: User | null;
   authReady: boolean;
+  isAdmin?: boolean;
+  adminLoading?: boolean;
   signingIn: boolean;
   cloudSyncing: boolean;
   deckCount: number;
@@ -40,6 +43,8 @@ interface SettingsViewProps {
 export const SettingsView: React.FC<SettingsViewProps> = ({
   currentUser,
   authReady,
+  isAdmin: parentIsAdmin,
+  adminLoading: parentAdminLoading = false,
   signingIn,
   cloudSyncing,
   deckCount,
@@ -53,6 +58,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onCatalogImported,
   onNotify,
 }) => {
+  const { isAdmin: verifiedHookAdmin, loading: hookAdminLoading } = useAdmin(
+    currentUser,
+    authReady
+  );
+  const canRenderAdminTools = Boolean(
+    authReady &&
+      currentUser &&
+      !hookAdminLoading &&
+      !parentAdminLoading &&
+      verifiedHookAdmin &&
+      (parentIsAdmin === undefined || parentIsAdmin === true)
+  );
   const [bio, setBio] = useState(initialBio);
   const [favoriteColor, setFavoriteColor] = useState<CardColor>(initialFavoriteColor);
   const [savingProfile, setSavingProfile] = useState(false);
@@ -330,11 +347,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </section>
 
       {/* Admin Catalog Sync, Comparison, Safe Import & Manual Artwork URL Validation */}
-      <AdminCatalogSection
-        currentUser={currentUser}
-        onCatalogImported={onCatalogImported}
-        onNotify={onNotify}
-      />
+      {canRenderAdminTools && (
+        <AdminCatalogSection
+          currentUser={currentUser}
+          authReady={authReady}
+          onCatalogImported={onCatalogImported}
+          onNotify={onNotify}
+        />
+      )}
 
       {/* Official Rules, Format Guide, Turn Sequence & Reduction Cost Calculator */}
       <section className="pt-2 border-t border-slate-200">

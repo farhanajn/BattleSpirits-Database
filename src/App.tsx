@@ -74,15 +74,28 @@ import {
   resolveManualMappingArtworkUrl,
 } from './utils/ManualWikiMapping';
 import { useWikiImagePrefetch } from './hooks/useWikiImagePrefetch';
+import { useAdmin } from './hooks/useAdmin';
 import {
   loadFastCachedSets,
-  matchesIndexedSetQuery,
   normalizeSetIdentifier,
   saveFastCachedSets,
   sortSetsForFilterDropdown,
   synchronizeAndIndexSets,
 } from './utils/setMetadataSync';
 import { fetchPublishedCatalogAdditions } from './utils/catalogCloudSync';
+import {
+  extractAvailableFamilies,
+  filterCatalogCards,
+  getCardNumberPrefix,
+  INITIAL_FILTER_STATE,
+  matchesFormatFilter,
+  normalizeCardColors,
+  normalizeCardCost,
+  normalizeCardFamilies,
+  normalizeCardForCatalog,
+  normalizeCardTypes,
+  resolveSearchSetIntent,
+} from './utils/cardFilterNormalization';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'settings';
 
@@ -94,19 +107,7 @@ interface BanListSnapshot {
   byName: Record<string, CardRestrictionValue>;
 }
 
-const INITIAL_FILTERS: FilterState = {
-  search: '',
-  setQuery: '',
-  format: 'All',
-  version: 'All',
-  color: 'All',
-  type: [],
-  rarity: [],
-  setCode: 'All',
-  costBracket: 'All',
-  keyword: 'All',
-  sortBy: 'number',
-};
+const INITIAL_FILTERS: FilterState = INITIAL_FILTER_STATE;
 
 const VALID_TABS: AppTab[] = ['catalog', 'search', 'decks', 'settings'];
 const VALID_FORMATS: FormatFilter[] = ['All', 'Standard', 'Eternal'];
@@ -153,30 +154,6 @@ const VALID_SORTS: SortOption[] = [
   'bp-desc',
   'name',
 ];
-
-const RARITY_RANK: Record<string, number> = {
-  XX: 12,
-  XV: 11,
-  CX: 10,
-  AX: 9,
-  NX: 8,
-  TX: 7,
-  X: 6,
-  M: 5,
-  R: 4,
-  P: 3,
-  U: 2,
-  C: 1,
-};
-
-const COLOR_SORT_ORDER: Record<string, number> = {
-  Red: 1,
-  Purple: 2,
-  Green: 3,
-  White: 4,
-  Yellow: 5,
-  Blue: 6,
-};
 
 const MONTH_INDEX: Record<string, number> = {
   jan: 1,
@@ -236,70 +213,8 @@ function computeSetReleaseRank(s: ProductSet, idx: number, total: number): numbe
   return 20150000 + Math.max(0, total - idx);
 }
 
-interface SearchSetIntent {
-  exactSetCode?: string;
-  paddedSetNum?: string;
-  rawDigits?: string;
-}
-
-function resolveSearchSetIntent(
-  rawQuery: string,
-  knownSetCodes: Set<string>,
-  numericSetCodes?: Set<string>
-): SearchSetIntent | null {
-  const q = rawQuery.trim().toLowerCase();
-  if (!q) return null;
-
-  const explicitSetPrefix = /^set\s+/i.test(q);
-  const numOnly = q.match(/^(?:set\s*)?(\d{1,4})$/i);
-  if (numOnly) {
-    const rawDigits = numOnly[1];
-    const padded = rawDigits.length <= 2 ? rawDigits.padStart(2, '0') : rawDigits;
-    const unpadded = String(Number(rawDigits));
-    const exactNumCode = knownSetCodes.has(rawDigits)
-      ? rawDigits
-      : knownSetCodes.has(padded)
-      ? padded
-      : knownSetCodes.has(unpadded)
-      ? unpadded
-      : numericSetCodes?.has(rawDigits)
-      ? rawDigits
-      : numericSetCodes?.has(padded)
-      ? padded
-      : undefined;
-
-    // Preserve literal text search for 3-4 digit numbers (e.g. BP values) unless it matches a known/numeric set code or has "set " prefix
-    if (rawDigits.length <= 2 || exactNumCode || explicitSetPrefix) {
-      return {
-        ...(exactNumCode ? { exactSetCode: exactNumCode } : {}),
-        paddedSetNum: rawDigits.length <= 2 ? padded : rawDigits,
-        rawDigits,
-      };
-    }
-  }
-
-  const stripped = q.replace(/^set\s+/i, '').trim();
-  const compact = stripped.replace(/[\s-]+/g, '').toUpperCase();
-
-  // Normalize single-digit prefixes like "BS 1" -> "BS01", "SD 1" -> "SD01"
-  const shortCodeMatch = compact.match(/^(BS|SD|CB|BSC|PB|PC|RP|PX)(\d{1})$/);
-  const candidate = shortCodeMatch
-    ? `${shortCodeMatch[1]}0${shortCodeMatch[2]}`
-    : compact;
-
-  if (knownSetCodes.has(candidate)) {
-    return { exactSetCode: candidate };
-  }
-  return null;
-}
-
 export function normalizeSetCodeForClient(rawCode: string): string {
   return normalizeSetIdentifier(rawCode);
-}
-
-function getCardNumberPrefix(cardNumber: string): string {
-  const m = (cardNumber || '').trim().match(/^([A-Z0-9]+)-/i);
-  return m ? normalizeSetCodeForClient(m[1]) : '';
 }
 
 function parseStateFromUrl(): {
@@ -354,6 +269,7 @@ function parseStateFromUrl(): {
       version: rawVer && VALID_VERSIONS.includes(rawVer) ? rawVer : 'All',
       color: rawColor && VALID_COLORS.includes(rawColor) ? rawColor : 'All',
       type: parsedTypes,
+      family: params.get('fam')?.trim() || 'All',
       rarity: parsedRarities,
       setCode: (() => {
         const rawSetParam = (params.get('set') || '').trim();
@@ -374,6 +290,7 @@ function buildUrlSearch(tab: AppTab, filters: FilterState): string {
   if (filters.version !== 'All') params.set('ver', filters.version);
   if (filters.color !== 'All') params.set('color', filters.color);
   if (filters.type.length > 0) params.set('type', filters.type.join(','));
+  if (filters.family !== 'All') params.set('fam', filters.family);
   if (filters.rarity.length > 0) params.set('rarity', filters.rarity.join(','));
   if (filters.setCode !== 'All') params.set('set', filters.setCode);
   if (filters.costBracket !== 'All') params.set('cost', filters.costBracket);
@@ -386,23 +303,14 @@ function buildUrlSearch(tab: AppTab, filters: FilterState): string {
 }
 
 export function getCardColors(card: BattleSpiritsCard): CardColor[] {
-  if (card.colors && card.colors.length > 0) return card.colors;
-  if (card.secondaryColor && card.secondaryColor !== card.color) {
-    return [card.color, card.secondaryColor];
-  }
-  return [card.color];
+  const normalized = normalizeCardColors(card);
+  return normalized.length > 0 ? normalized : [card.color];
 }
 
 const STORAGE_DECKS_KEY = 'spiritsdex_decks_v1';
 const STORAGE_DECK_FOLDERS_KEY = 'spiritsdex_deck_folders_v1';
 const STORAGE_ACTIVE_DECK_KEY = 'spiritsdex_active_deck_v1';
 const STORAGE_WIKI_CARDS_KEY = 'spiritsdex_wiki_cards_v4';
-
-function matchesFormatFilter(formats: GameFormat[], filter: FormatFilter): boolean {
-  if (filter === 'All') return true;
-  if (filter === 'Standard') return formats.includes('Standard');
-  return !formats.includes('Standard') && formats.includes('Eternal');
-}
 
 function normalizeBanName(raw: string): string {
   return raw
@@ -587,6 +495,22 @@ export function mergeCardsIntoMap(
     const primary = options?.preferExisting && existing ? existing : c;
     const secondary = options?.preferExisting && existing ? c : existing;
 
+    const primaryColors = normalizeCardColors(primary);
+    const secondaryColors = secondary ? normalizeCardColors(secondary) : [];
+    const finalColors = primaryColors.length > 0 ? primaryColors : secondaryColors;
+
+    const primaryTypes = normalizeCardTypes(primary);
+    const secondaryTypes = secondary ? normalizeCardTypes(secondary) : [];
+    const finalType = primaryTypes[0] || secondaryTypes[0] || primary.type || secondary?.type || 'Spirit';
+
+    const primaryFamilies = normalizeCardFamilies(primary.families);
+    const secondaryFamilies = secondary ? normalizeCardFamilies(secondary.families) : [];
+    const finalFamilies = primaryFamilies.length > 0 ? primaryFamilies : secondaryFamilies;
+
+    const primaryCost = normalizeCardCost(primary.cost);
+    const secondaryCost = secondary ? normalizeCardCost(secondary.cost) : null;
+    const finalCost = primaryCost !== null ? primaryCost : secondaryCost !== null ? secondaryCost : Number.NaN;
+
     const merged: BattleSpiritsCard = {
       ...(secondary || {}),
       ...primary,
@@ -596,8 +520,9 @@ export function mergeCardsIntoMap(
       cardNumber: primary.cardNumber || secondary?.cardNumber || 'WIKI',
       setCode: primary.setCode || secondary?.setCode || 'BS01',
       setName: primary.setName || secondary?.setName || 'Battle Spirits',
-      color: primary.color && COLOR_META[primary.color] ? primary.color : secondary?.color || 'Red',
-      cost: Number.isFinite(Number(primary.cost)) ? Number(primary.cost) : secondary?.cost ?? 0,
+      color: finalColors[0] || 'Red',
+      secondaryColor: finalColors.length >= 2 ? finalColors[1] : undefined,
+      cost: finalCost,
       rarity: primary.rarity || secondary?.rarity || 'C',
       formats:
         Array.isArray(primary.formats) && primary.formats.length > 0
@@ -605,12 +530,12 @@ export function mergeCardsIntoMap(
           : Array.isArray(secondary?.formats) && secondary.formats.length > 0
           ? secondary.formats
           : ['Eternal'],
-      type: primary.type || secondary?.type || 'Spirit',
+      type: finalType,
       subtypeLabel: primary.subtypeLabel ?? secondary?.subtypeLabel,
       isRevival: isRev,
       isToken: options?.forceToken ?? primary.isToken ?? secondary?.isToken,
-      colors: primary.colors && primary.colors.length > 0 ? primary.colors : secondary?.colors,
-      families: primary.families && primary.families.length > 0 ? primary.families : secondary?.families || [],
+      colors: finalColors.length > 0 ? finalColors : undefined,
+      families: finalFamilies,
       levels: primary.levels && primary.levels.length > 0 ? primary.levels : secondary?.levels,
       braveCondition: primary.braveCondition ?? secondary?.braveCondition,
       braveBonusBp: primary.braveBonusBp ?? secondary?.braveBonusBp,
@@ -716,6 +641,7 @@ export default function App() {
   // Google Firebase Auth & Cloud Sync State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const { isAdmin, loading: adminLoading } = useAdmin(currentUser, authReady);
   const [signingIn, setSigningIn] = useState(false);
   const [cloudSyncing, setCloudSyncing] = useState(false);
   const [liveProfilesByUid, setLiveProfilesByUid] = useState<Record<string, PublicBuilderProfile>>({});
@@ -1221,6 +1147,11 @@ export default function App() {
     }));
   }, [syncedProductSets, filters.format]);
 
+  const availableFamilies = useMemo(
+    () => extractAvailableFamilies(allCardsList),
+    [allCardsList]
+  );
+
   const availableKeywords = useMemo(() => {
     const set = new Set<string>();
     allCardsList.forEach((c) => c.keywords.forEach((k) => set.add(k)));
@@ -1290,193 +1221,16 @@ export default function App() {
 
   const setLookupByCode = indexedSetDirectory.byCode;
 
-  const filteredCards = useMemo(() => {
-    const q = filters.search.trim().toLowerCase();
-    const qCompact = q.replace(/[\s-]+/g, '');
-    const qTokens = q ? q.split(/\s+/).filter(Boolean) : [];
-    const searchSetIntent = resolveSearchSetIntent(
-      q,
-      knownSetCodes,
-      indexedSetDirectory.numericSetCodes
-    );
-
-    const setQ = filters.setQuery.trim().toLowerCase();
-    const setQCompact = setQ.replace(/[\s-]+/g, '');
-    const setQIntent = resolveSearchSetIntent(
-      setQ,
-      knownSetCodes,
-      indexedSetDirectory.numericSetCodes
-    );
-
-    const matchesSetIntent = (card: BattleSpiritsCard, intent: SearchSetIntent) => {
-      const cardSetUpper = normalizeSetCodeForClient(card.setCode);
-      const cardPrefix = getCardNumberPrefix(card.cardNumber);
-      if (intent.exactSetCode) {
-        const normIntent = normalizeSetCodeForClient(intent.exactSetCode);
-        if (normIntent === 'TOKENS') return Boolean(card.isToken);
-        if (normIntent === 'REVIVAL') return Boolean(card.isRevival);
-        if (cardSetUpper === normIntent || cardPrefix === normIntent) {
-          return true;
-        }
-      }
-      if (intent.rawDigits && cardSetUpper === intent.rawDigits.toUpperCase()) {
-        return true;
-      }
-      if (intent.paddedSetNum) {
-        const endRegex = new RegExp(`(?:^|[^0-9])${intent.paddedSetNum}$`, 'i');
-        return (
-          cardSetUpper === intent.paddedSetNum ||
-          endRegex.test(cardSetUpper) ||
-          endRegex.test(cardPrefix)
-        );
-      }
-      return false;
-    };
-
-    const list = allCardsList.filter((card) => {
-      if (card.setCode.toUpperCase() === 'BSS01') return false;
-      if (!matchesFormatFilter(card.formats, filters.format)) return false;
-      if (filters.version === 'Original' && card.isRevival) return false;
-      if (filters.version === 'Revival' && !card.isRevival) return false;
-
-      if (filters.setCode !== 'All') {
-        const targetSetNorm = normalizeSetCodeForClient(filters.setCode);
-        if (targetSetNorm === 'TOKENS') {
-          if (!card.isToken) return false;
-        } else if (targetSetNorm === 'REVIVAL') {
-          if (!card.isRevival) return false;
-        } else if (normalizeSetCodeForClient(card.setCode) !== targetSetNorm) {
-          return false;
-        }
-      }
-
-      // Dedicated Set Code / Set Name input filter
-      if (setQ) {
-        if (setQIntent) {
-          if (!matchesSetIntent(card, setQIntent)) return false;
-        } else {
-          const matchedSet = setLookupByCode.get(card.setCode.toUpperCase());
-          const indexedMatch = matchedSet
-            ? matchesIndexedSetQuery(matchedSet, setQ, indexedSetDirectory.tokensByCode)
-            : false;
-          const setHay = `${card.setCode} ${card.setName} ${matchedSet?.jpName || ''} ${matchedSet?.tagline || ''}`.toLowerCase();
-          const setHayCompact = setHay.replace(/[\s-]+/g, '');
-          if (
-            !indexedMatch &&
-            !setHay.includes(setQ) &&
-            !(setQCompact.length >= 2 && setHayCompact.includes(setQCompact))
-          ) {
-            return false;
-          }
-        }
-      }
-
-      // General Search Input
-      if (q) {
-        if (searchSetIntent) {
-          if (!matchesSetIntent(card, searchSetIntent)) return false;
-        } else {
-          const hay = `${card.name} ${card.jpName} ${card.cardNumber} ${card.setCode} ${card.setName} ${card.subtypeLabel || ''} ${card.isToken ? 'token' : ''} ${card.isRevival ? 'revival' : ''} ${card.families.join(' ')} ${card.keywords.join(' ')} ${card.braveCondition || ''} ${card.summonCondition || ''} ${card.effects.map((e) => `${e.timing} ${e.text}`).join(' ')}`.toLowerCase();
-          const compactHay = hay.replace(/[\s-]+/g, '');
-          const matchesDirect = hay.includes(q) || (qCompact.length >= 2 && compactHay.includes(qCompact));
-          const matchesTokens =
-            qTokens.length > 1 &&
-            qTokens.every((tok) => hay.includes(tok) || compactHay.includes(tok.replace(/-/g, '')));
-          if (!matchesDirect && !matchesTokens) return false;
-        }
-      }
-
-      const cardColors = getCardColors(card);
-      if (filters.color === 'Multicolor') {
-        if (cardColors.length < 2) return false;
-      } else if (filters.color !== 'All') {
-        // Exclude multi-color cards from single-color search
-        if (cardColors.length !== 1 || cardColors[0] !== filters.color) return false;
-      }
-
-      if (filters.type.length > 0 && !filters.type.includes(card.type)) return false;
-      if (filters.rarity.length > 0 && !filters.rarity.includes(card.rarity)) return false;
-      if (filters.keyword !== 'All' && !card.keywords.includes(filters.keyword)) return false;
-
-      if (filters.costBracket === '0-2' && card.cost > 2) return false;
-      if (filters.costBracket === '3-4' && (card.cost < 3 || card.cost > 4)) return false;
-      if (filters.costBracket === '5-6' && (card.cost < 5 || card.cost > 6)) return false;
-      if (filters.costBracket === '7+' && card.cost < 7) return false;
-
-      return true;
-    });
-
-    // Deduplicate by normalized cardNumber + version so duplicate IDs never appear twice
-    // while keeping distinct card numbers even if they share a card name (e.g. reprints)
-    const seenKeys = new Set<string>();
-    const dedupedList = list.filter((card) => {
-      const numKey = normalizeCardNumber(card.cardNumber || '');
-      if (!numKey || numKey === 'WIKI') return true;
-      const key = `${numKey}|${card.isRevival ? 'rv' : 'orig'}`;
-      if (seenKeys.has(key)) return false;
-      seenKeys.add(key);
-      return true;
-    });
-
-    const getMaxBp = (c: BattleSpiritsCard) =>
-      c.levels && c.levels.length > 0 ? c.levels[c.levels.length - 1].bp : 0;
-
-    // Determine target set code priority for natural number ordering
-    const targetExactSet =
-      filters.setCode !== 'All'
-        ? normalizeSetCodeForClient(filters.setCode)
-        : setQIntent?.exactSetCode || searchSetIntent?.exactSetCode || '';
-    const targetPaddedNum = setQIntent?.paddedSetNum || searchSetIntent?.paddedSetNum || '';
-
-    const getNativePriority = (c: BattleSpiritsCard): number => {
-      const prefix = getCardNumberPrefix(c.cardNumber);
-      const cardSetNorm = normalizeSetCodeForClient(c.setCode);
-      if (targetExactSet) {
-        if (prefix === targetExactSet) return 0;
-        if (cardSetNorm === targetExactSet) return 1;
-        return 2;
-      }
-      if (targetPaddedNum) {
-        if (prefix === `BS${targetPaddedNum}`) return 0;
-        if (new RegExp(`(?:^|[^0-9])${targetPaddedNum}$`, 'i').test(prefix)) return 1;
-        return 2;
-      }
-      return prefix === cardSetNorm ? 0 : 1;
-    };
-
-    dedupedList.sort((a, b) => {
-      if (filters.sortBy === 'newest') {
-        const ra = releaseRankBySetCode.get(a.setCode.toUpperCase()) || 0;
-        const rb = releaseRankBySetCode.get(b.setCode.toUpperCase()) || 0;
-        return rb - ra || getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
-      }
-      if (filters.sortBy === 'rarity-desc') {
-        return (
-          (RARITY_RANK[b.rarity] || 0) - (RARITY_RANK[a.rarity] || 0) ||
-          a.cardNumber.localeCompare(b.cardNumber)
-        );
-      }
-      if (filters.sortBy === 'color') {
-        const ca = COLOR_SORT_ORDER[a.color] || 99;
-        const cb = COLOR_SORT_ORDER[b.color] || 99;
-        const multiA = getCardColors(a).length;
-        const multiB = getCardColors(b).length;
-        return (
-          ca - cb ||
-          multiA - multiB ||
-          a.cost - b.cost ||
-          a.cardNumber.localeCompare(b.cardNumber)
-        );
-      }
-      if (filters.sortBy === 'cost-asc') return a.cost - b.cost || a.cardNumber.localeCompare(b.cardNumber);
-      if (filters.sortBy === 'cost-desc') return b.cost - a.cost || a.cardNumber.localeCompare(b.cardNumber);
-      if (filters.sortBy === 'bp-desc') return getMaxBp(b) - getMaxBp(a) || a.cardNumber.localeCompare(b.cardNumber);
-      if (filters.sortBy === 'name') return a.name.localeCompare(b.name);
-      return getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
-    });
-
-    return dedupedList;
-  }, [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]);
+  const filteredCards = useMemo(
+    () =>
+      filterCatalogCards(allCardsList, filters, {
+        knownSetCodes,
+        indexedSetDirectory,
+        setLookupByCode,
+        releaseRankBySetCode,
+      }),
+    [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]
+  );
 
   useEffect(() => {
     setSearchAnchorIndex(0);
@@ -1524,7 +1278,9 @@ export default function App() {
         if (!res.ok) {
           throw new Error(data?.error || 'Live Wiki search failed');
         }
-        const incoming = Array.isArray(data?.cards) ? (data.cards as BattleSpiritsCard[]) : [];
+        const incoming = Array.isArray(data?.cards)
+          ? (data.cards as BattleSpiritsCard[]).map((c) => normalizeCardForCatalog(c))
+          : [];
         setWikiSearchResults(incoming);
         setWikiSearchQueryLoaded(trimmed);
       } catch (err) {
@@ -1631,6 +1387,7 @@ export default function App() {
     if (filters.version !== 'All') count++;
     if (filters.color !== 'All') count++;
     if (filters.type.length > 0) count++;
+    if (filters.family !== 'All') count++;
     if (filters.rarity.length > 0) count++;
     if (filters.setCode !== 'All') count++;
     if (filters.setQuery.trim()) count++;
@@ -2258,6 +2015,7 @@ export default function App() {
                 <FilterControls
                   filters={filters}
                   availableSets={availableSets}
+                  availableFamilies={availableFamilies}
                   availableKeywords={availableKeywords}
                   onChange={updateFilters}
                   onReset={() => setFilters(INITIAL_FILTERS)}
@@ -2567,7 +2325,9 @@ export default function App() {
                             onSelect={setSelectedCard}
                             onAddToDeck={() =>
                               showToast(
-                                'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                                isAdmin && !adminLoading
+                                  ? 'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                                  : 'Live Wiki preview — not yet imported into the Spiritsdex deck catalog'
                               )
                             }
                           />
@@ -2634,7 +2394,9 @@ export default function App() {
                                 onSelect={setSelectedCard}
                                 onAddToDeck={() =>
                                   showToast(
-                                    'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                                    isAdmin && !adminLoading
+                                      ? 'Live Wiki preview — import via Settings > Admin Tools to add to decks'
+                                      : 'Live Wiki preview — not yet imported into the Spiritsdex deck catalog'
                                   )
                                 }
                               />
@@ -2692,6 +2454,8 @@ export default function App() {
             <SettingsView
               currentUser={currentUser}
               authReady={authReady}
+              isAdmin={isAdmin}
+              adminLoading={adminLoading}
               signingIn={signingIn}
               cloudSyncing={cloudSyncing}
               deckCount={decks.length}
@@ -2702,7 +2466,7 @@ export default function App() {
               onSignOutGoogle={() => void handleGoogleSignOut()}
               onSyncNow={() => void handleManualCloudSync()}
               onSaveProfile={handleUpdateOwnProfile}
-              onCatalogImported={applyImportedCatalogAdditions}
+              onCatalogImported={isAdmin && !adminLoading ? applyImportedCatalogAdditions : undefined}
               onNotify={showToast}
             />
           </ErrorBoundary>
@@ -2899,6 +2663,7 @@ export default function App() {
         resultCount={filteredCards.length}
         filters={filters}
         availableSets={availableSets}
+        availableFamilies={availableFamilies}
         availableKeywords={availableKeywords}
         onChange={updateFilters}
         onReset={() => setFilters(INITIAL_FILTERS)}
