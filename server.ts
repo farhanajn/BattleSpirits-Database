@@ -26,6 +26,12 @@ import {
   validateCatalogImport,
 } from './server/catalogSyncService.ts';
 import {
+  auditCatalogRecords,
+  getCatalogRepairStatus,
+  runCatalogRepairBatch,
+  type RepairMode,
+} from './server/catalogRepairService.ts';
+import {
   getValidationDashboardSnapshot,
   mergeFirestoreValidationRecords,
   runManualValidationJob,
@@ -427,6 +433,76 @@ async function startServer() {
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Catalog reprocessing failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.get('/api/admin/catalog/audit', async (req, res) => {
+    try {
+      const setCodes = req.query.setCodes
+        ? String(req.query.setCodes)
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+      const verifyArtworkOnline =
+        req.query.verifyArtworkOnline === 'true' || req.query.verifyArtworkOnline === '1';
+      const maxOnlineVerifyCount = req.query.maxOnlineVerifyCount
+        ? Math.min(2500, Math.max(50, Number(req.query.maxOnlineVerifyCount)))
+        : 600;
+      const report = await auditCatalogRecords({
+        setCodes,
+        verifyArtworkOnline,
+        maxOnlineVerifyCount,
+      });
+      res.json(report);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog audit failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.get('/api/admin/catalog/repair/status', (_req, res) => {
+    try {
+      const status = getCatalogRepairStatus();
+      res.json(status);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load repair status';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/admin/catalog/repair', async (req, res) => {
+    try {
+      const rawMode = String(req.body?.mode || 'all_incomplete');
+      const allowedModes: RepairMode[] = [
+        'all_incomplete',
+        'artwork_only',
+        'effects_only',
+        'retry_matching',
+        'reprocess_rejected',
+        'resume',
+      ];
+      const mode: RepairMode = allowedModes.includes(rawMode as RepairMode)
+        ? (rawMode as RepairMode)
+        : 'all_incomplete';
+      const setCodes = Array.isArray(req.body?.setCodes)
+        ? req.body.setCodes.map((s: unknown) => String(s).trim()).filter(Boolean)
+        : undefined;
+      const batchSize =
+        typeof req.body?.batchSize === 'number' && req.body.batchSize > 0
+          ? Math.min(400, Math.floor(req.body.batchSize))
+          : 120;
+      const result = await runCatalogRepairBatch({
+        mode,
+        setCodes,
+        batchSize,
+        updatePublicCardsJson: req.body?.updatePublicCardsJson !== false,
+        autoImportRecovered: Boolean(req.body?.autoImportRecovered),
+      });
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Catalog repair failed';
       res.status(500).json({ error: message });
     }
   });

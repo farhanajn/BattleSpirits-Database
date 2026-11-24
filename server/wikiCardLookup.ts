@@ -89,8 +89,18 @@ export function isNonCardWikiIcon(fileTitleOrUrl: string): boolean {
   return false;
 }
 
+function safeDecodeFilename(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!/%[0-9A-Fa-f]{2}/.test(trimmed)) return trimmed;
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
 export function isCardArtworkFile(fileRaw: string): boolean {
-  const clean = fileRaw
+  const clean = safeDecodeFilename(fileRaw)
     .replace(/^(?:File|Image):/i, '')
     .replace(/\u00A0/g, ' ')
     .trim();
@@ -108,7 +118,7 @@ export function expandWikiFileCandidates(
   const isSideB = Boolean(options?.isSideB || /\(B\)$/i.test(cleanNum));
 
   const pushUnique = (val: string) => {
-    const cleaned = val
+    const cleaned = safeDecodeFilename(val)
       .trim()
       .replace(/^\/+images\//i, '')
       .replace(/^File:/i, '')
@@ -120,7 +130,7 @@ export function expandWikiFileCandidates(
     }
   };
 
-  const cleanFile = (fileName || '')
+  const cleanFile = safeDecodeFilename(fileName || '')
     .trim()
     .replace(/^\/+images\//i, '')
     .replace(/^File:/i, '');

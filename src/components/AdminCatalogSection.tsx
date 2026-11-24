@@ -24,6 +24,7 @@ import {
   publishCatalogAdditionsToFirestore,
   syncValidationRecordsToFirestore,
 } from '../utils/catalogCloudSync';
+import { isCloudWriteCooldownActive } from '../utils/cloudSync';
 
 type AdminSubTab = 'overview' | 'review' | 'validation';
 
@@ -176,6 +177,57 @@ interface ImportValidationPreview {
   rejectedCards?: RejectedCatalogCardRow[];
 }
 
+type RepairModeOption =
+  | 'all_incomplete'
+  | 'artwork_only'
+  | 'effects_only'
+  | 'retry_matching'
+  | 'reprocess_rejected'
+  | 'resume';
+
+interface CatalogAuditSummary {
+  auditedAt: string;
+  verifiedArtworkOnline: boolean;
+  totalInspectedCards: number;
+  completeVerifiedCount: number;
+  partialCount: number;
+  incompleteCount: number;
+  needsReviewCount: number;
+  categories: {
+    missingArtworkUrl: number;
+    placeholderArtwork: number;
+    brokenArtworkUrl: number;
+    missingEffectText: number;
+    unavailableEffectText: number;
+    vanillaNoPrintedEffect: number;
+    missingMetadata: number;
+    mismatchedWikiPage: number;
+    skippedOrRejectedEntries: number;
+    incompleteDespiteSuccess: number;
+  };
+}
+
+interface CatalogRepairSummaryState {
+  jobStatus: 'idle' | 'running' | 'paused' | 'completed';
+  mode: RepairModeOption | null;
+  totalQueueCount: number;
+  processedCount: number;
+  remainingIds: string[];
+  stats: {
+    repairedCards: number;
+    repairedArtwork: number;
+    repairedEffects: number;
+    repairedMetadata: number;
+    repairedMatches: number;
+    recoveredRejected: number;
+    flaggedManualReview: number;
+    markedUnavailable: number;
+    manualMappingsPreserved: number;
+    stillUnresolved: number;
+  };
+  lastAuditReport?: CatalogAuditSummary;
+}
+
 interface AdminCatalogSectionProps {
   currentUser: User | null;
   authReady?: boolean;
@@ -301,6 +353,11 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const [valBusy, setValBusy] = useState(false);
   const [checkingKey, setCheckingKey] = useState<string | null>(null);
 
+  // Audit & Repair state
+  const [auditReport, setAuditReport] = useState<CatalogAuditSummary | null>(null);
+  const [repairState, setRepairState] = useState<CatalogRepairSummaryState | null>(null);
+  const [repairBusy, setRepairBusy] = useState(false);
+
   const adminFetch = useCallback(
     async (url: string, init: RequestInit = {}) => {
       if (!currentUser || adminLoading || !isAdmin) {
@@ -331,6 +388,8 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       setValRecords([]);
       setValScheduler(null);
       setDeadLinkRecords([]);
+      setAuditReport(null);
+      setRepairState(null);
       rehydratedValidationRef.current = false;
     }
   }, [currentUser, adminLoading, isAdmin]);
@@ -404,11 +463,27 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
     void loadBrokenHealthAlert();
   }, [isAdminCloud, loadBrokenHealthAlert]);
 
+  const loadRepairStatus = useCallback(async () => {
+    if (!isAdminCloud) return;
+    try {
+      const res = await adminFetch('/api/admin/catalog/repair/status');
+      if (!res.ok) return;
+      const data = (await res.json()) as CatalogRepairSummaryState;
+      setRepairState(data);
+      if (data.lastAuditReport) {
+        setAuditReport(data.lastAuditReport);
+      }
+    } catch {
+      // ignore transient error
+    }
+  }, [isAdminCloud, adminFetch]);
+
   useEffect(() => {
     if (!expanded || !isAdminCloud) return;
     void loadCatalogStatus();
     void loadValidationStatus();
-  }, [expanded, isAdminCloud, loadCatalogStatus, loadValidationStatus]);
+    void loadRepairStatus();
+  }, [expanded, isAdminCloud, loadCatalogStatus, loadValidationStatus, loadRepairStatus]);
 
   // Rehydrate Firestore validation records into server state on admin open
   useEffect(() => {
@@ -579,6 +654,52 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
 
   const handleStopAutoScan = () => {
     stopAutoScanRef.current = true;
+  };
+
+  const handleRunAudit = async (verifyOnline = false) => {
+    setRepairBusy(true);
+    try {
+      const res = await adminFetch(
+        `/api/admin/catalog/audit?verifyArtworkOnline=${verifyOnline ? 'true' : 'false'}`
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Catalog audit failed');
+      setAuditReport(data);
+      onNotify?.(
+        `Catalog Audit: ${data.totalInspectedCards} cards · ${data.completeVerifiedCount} complete, ${data.categories?.missingArtworkUrl ?? 0} missing art, ${data.categories?.missingEffectText ?? 0} missing effect`
+      );
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Catalog audit failed');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const handleRunRepairBatch = async (mode: RepairModeOption) => {
+    setRepairBusy(true);
+    try {
+      const res = await adminFetch('/api/admin/catalog/repair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode,
+          batchSize: 120,
+          updatePublicCardsJson: true,
+          autoImportRecovered: mode === 'reprocess_rejected',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Repair batch failed');
+      if (data.repairState) setRepairState(data.repairState);
+      onNotify?.(
+        `Repair (${mode}): processed ${data.batchProcessedCount}, repaired ${data.stats?.repairedCards ?? 0}, ${data.remainingCount ?? 0} remaining`
+      );
+      await Promise.all([loadCatalogStatus(), loadRepairStatus()]);
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Catalog repair failed');
+    } finally {
+      setRepairBusy(false);
+    }
   };
 
   const handleCompareCatalog = async () => {
@@ -827,7 +948,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       onNotify?.(
         `Validation complete: ${data.summary?.healthy ?? 0} healthy, ${data.summary?.broken ?? 0} broken, ${data.summary?.redirected ?? 0} redirected`
       );
-      if (isAdminCloud && Array.isArray(data.records) && data.records.length > 0) {
+      if (isAdminCloud && !isCloudWriteCooldownActive() && Array.isArray(data.records) && data.records.length > 0) {
         void syncValidationRecordsToFirestore(data.records).catch(() => {});
       }
       await loadValidationStatus();
@@ -848,7 +969,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Single URL check failed');
-      if (isAdminCloud && data.record) {
+      if (isAdminCloud && !isCloudWriteCooldownActive() && data.record) {
         void syncValidationRecordsToFirestore([data.record]).catch(() => {});
       }
       await loadValidationStatus();
@@ -1196,6 +1317,125 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                   </div>
                 </div>
               )}
+
+              {/* Catalog Audit Breakdown & Targeted Resumable Repair Controls */}
+              <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-bold text-slate-900">
+                      Catalog Completeness Audit &amp; Non-Destructive Repair Engine
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Audits artwork, English effect text, metadata, Wiki matches &amp; rejected entries with ManualWikiMapping protection.
+                    </div>
+                  </div>
+                  {repairState && repairState.jobStatus !== 'idle' && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[11px] font-semibold text-slate-700 shrink-0">
+                      <span className="capitalize">{repairState.jobStatus}</span>
+                      <span>·</span>
+                      <span className="font-mono tabular-nums">
+                        {repairState.processedCount}/{repairState.totalQueueCount}
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {auditReport && (
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
+                    {[
+                      { label: 'Verified Complete', val: auditReport.completeVerifiedCount },
+                      { label: 'Missing / Unverified Art', val: auditReport.categories.missingArtworkUrl + auditReport.categories.brokenArtworkUrl + auditReport.categories.placeholderArtwork },
+                      { label: 'Missing / Sentinel Effect', val: auditReport.categories.missingEffectText },
+                      { label: 'Missing Metadata', val: auditReport.categories.missingMetadata },
+                      { label: 'Skipped / Rejected', val: auditReport.categories.skippedOrRejectedEntries },
+                    ].map((stat) => (
+                      <div
+                        key={stat.label}
+                        className="p-2.5 rounded-xl bg-white border border-slate-200/80"
+                      >
+                        <div className="font-mono text-sm font-bold text-slate-900 tabular-nums">
+                          {stat.val}
+                        </div>
+                        <div className="text-[10px] font-medium text-slate-500 leading-tight mt-0.5">
+                          {stat.label}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunAudit(false)}
+                    className="min-h-[36px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    {repairBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                    <span>Audit Catalog</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunRepairBatch('all_incomplete')}
+                    className="min-h-[36px] px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Repair All Incomplete</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunRepairBatch('artwork_only')}
+                    className="min-h-[36px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    <span>Repair Artwork Only</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunRepairBatch('effects_only')}
+                    className="min-h-[36px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <span>Repair Effects Only</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunRepairBatch('retry_matching')}
+                    className="min-h-[36px] px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Retry Unmatched Wiki</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={repairBusy || catalogBusy}
+                    onClick={() => void handleRunRepairBatch('reprocess_rejected')}
+                    className="min-h-[36px] px-3 rounded-xl border border-amber-300 bg-amber-50 hover:bg-amber-100 text-xs font-semibold text-amber-950 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <span>Reprocess Rejected</span>
+                  </button>
+
+                  {repairState && repairState.remainingIds.length > 0 && (
+                    <button
+                      type="button"
+                      disabled={repairBusy || catalogBusy}
+                      onClick={() => void handleRunRepairBatch('resume')}
+                      className="min-h-[36px] px-3 rounded-xl bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      <span>Resume Repair ({repairState.remainingIds.length})</span>
+                    </button>
+                  )}
+                </div>
+              </div>
 
               {/* Honest Source-Coverage Accounting Breakdown */}
               {overview && Array.isArray(overview.sourceCoverage) && overview.sourceCoverage.length > 0 && (

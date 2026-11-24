@@ -338,6 +338,16 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidFeaturedCardsConfig(data, configId) {
+      return data.keys().hasAll(['id', 'mode', 'updatedByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'mode', 'updatedByUid', 'createdAt', 'updatedAt'])
+        && data.id is string && data.id == configId && data.id == 'featuredCards'
+        && data.mode is string && data.mode.size() <= 16 && data.mode in ['random', 'latest']
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // --- 1. Private User Account (PII Isolated) & Cloud Decks/Folders/Bookmarks ---
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwner(userId);
@@ -402,7 +412,7 @@ service cloud.firestore {
 
     // --- 2. Public Builder Profiles & Followers (Zero PII) ---
     match /publicProfiles/{userId} {
-      allow get: if isValidId(userId) && existing().isPublic == true;
+      allow get: if isValidId(userId) && (isOwner(userId) || (resource != null && existing().isPublic == true));
       allow list: if existing().isPublic == true;
       allow create: if isVerified() && isOwner(userId) && isValidId(userId)
         && isValidPublicProfile(incoming(), userId)
@@ -457,7 +467,7 @@ service cloud.firestore {
 
     // --- 3. Public Community Deck & Tournament Feed ---
     match /posts/{postId} {
-      allow get: if isValidId(postId) && existing().isPublic == true;
+      allow get: if isValidId(postId) && resource != null && existing().isPublic == true;
       allow list: if existing().isPublic == true;
       allow create: if isVerified() && isValidId(postId)
         && isValidPost(incoming(), postId)
@@ -550,8 +560,8 @@ service cloud.firestore {
 
     // --- 4. Published Catalog Sets & Cards (Public Read, Admin Write) ---
     match /catalogSets/{setCode} {
-      allow get: if isValidId(setCode) && existing().isPublished == true;
-      allow list: if existing().isPublished == true;
+      allow get: if isValidId(setCode) && (isAdmin() || (resource != null && existing().isPublished == true));
+      allow list: if existing().isPublished == true || isAdmin();
       allow create: if isAdmin() && isValidId(setCode)
         && isValidCatalogSet(incoming(), setCode)
         && incoming().createdAt == request.time
@@ -565,8 +575,8 @@ service cloud.firestore {
     }
 
     match /catalogCards/{cardId} {
-      allow get: if isValidId(cardId) && existing().isPublished == true;
-      allow list: if existing().isPublished == true;
+      allow get: if isValidId(cardId) && (isAdmin() || (resource != null && existing().isPublished == true));
+      allow list: if existing().isPublished == true || isAdmin();
       allow create: if isAdmin() && isValidId(cardId)
         && isValidCatalogCard(incoming(), cardId)
         && incoming().createdAt == request.time
@@ -593,7 +603,24 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidId(mappingKey);
     }
 
-    // --- 6. Immutable Admin Role Marker ---
+    // --- 6. Global Shared Featured Cards Config (Public Get, Admin-Only Write) ---
+    match /appConfig/{configId} {
+      allow get: if isValidId(configId) && configId == 'featuredCards';
+      allow list: if false;
+      allow create: if isAdmin() && isValidId(configId) && configId == 'featuredCards'
+        && isValidFeaturedCardsConfig(incoming(), configId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(configId) && configId == 'featuredCards'
+        && isValidFeaturedCardsConfig(incoming(), configId)
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['mode', 'updatedByUid', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // --- 7. Immutable Admin Role Marker ---
     match /admins/{userId} {
       allow get: if isValidId(userId) && isOwner(userId);
       allow list: if false;

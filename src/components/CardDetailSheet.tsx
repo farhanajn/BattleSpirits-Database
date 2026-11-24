@@ -993,7 +993,13 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   ))
                 ) : (
                   <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-500">
-                    No effect text recorded for this card.
+                    {c.effectStatus === 'no_printed_effect'
+                      ? 'No printed effect (Vanilla card).'
+                      : c.effectStatus === 'unavailable'
+                      ? 'English effect text unavailable on Battle Spirits Wiki.'
+                      : c.needsManualReview
+                      ? 'Card data requires manual Wiki review.'
+                      : 'English effect text not yet recorded for this card.'}
                   </div>
                 )}
               </div>
@@ -1568,6 +1574,13 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                     </button>
                   </div>
 
+                  {!card.artworkVerified &&
+                    (card.artworkStatus === 'unavailable' || card.artworkStatus === 'broken') && (
+                      <p className="text-[11px] text-slate-500 text-center px-1">
+                        Artwork unavailable on Battle Spirits Wiki — displaying elemental emblem.
+                      </p>
+                    )}
+
                   {gallery.length > 1 && (
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between gap-2 text-[11px]">
@@ -1874,7 +1887,13 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
                   </div>
                 ) : (
                   <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-500">
-                    No effect text recorded for this card.
+                    {card.effectStatus === 'no_printed_effect'
+                      ? 'No printed effect (Vanilla card).'
+                      : card.effectStatus === 'unavailable'
+                      ? 'English effect text unavailable on Battle Spirits Wiki.'
+                      : card.needsManualReview
+                      ? 'Card data requires manual Wiki review.'
+                      : 'English effect text not yet recorded for this card.'}
                   </div>
                 )}
               </div>

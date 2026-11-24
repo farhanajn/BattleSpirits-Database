@@ -26,6 +26,13 @@ import {
   normalizeCardForCatalog,
   normalizeCardTypes,
 } from './cardFilterNormalization';
+import { isPlaceholderArtworkUrl } from './cardCompletion';
+import {
+  isCloudQuotaCooldownActive,
+  isCloudWriteCooldownActive,
+  isFirestoreQuotaError,
+  markCloudQuotaExhausted,
+} from './firestoreQuota';
 
 export interface ClientArtworkValidationRecord {
   mappingKey: string;
@@ -162,6 +169,15 @@ function classifyFirestoreError(error: unknown): {
 } {
   const message = normalizeErrorMessage(error);
   const lower = message.toLowerCase();
+  if (isFirestoreQuotaError(error)) {
+    return {
+      diagnosticCategory: 'database_write_failure',
+      recoverable: false,
+      recommendedAction:
+        'Firestore daily free-tier quota limit reached. Quota resets tomorrow; local catalog data remains intact.',
+      message,
+    };
+  }
   if (lower.includes('permission') || lower.includes('insufficient') || lower.includes('unauthenticated')) {
     return {
       diagnosticCategory: 'permission_failure',
@@ -173,7 +189,6 @@ function classifyFirestoreError(error: unknown): {
   if (
     lower.includes('unavailable') ||
     lower.includes('deadline-exceeded') ||
-    lower.includes('resource-exhausted') ||
     lower.includes('aborted') ||
     lower.includes('offline') ||
     lower.includes('network') ||
@@ -182,7 +197,7 @@ function classifyFirestoreError(error: unknown): {
     return {
       diagnosticCategory: 'temporary_retryable',
       recoverable: true,
-      recommendedAction: 'Transient network/Firestore quota issue — click Retry Cloud Sync to retry automatically.',
+      recommendedAction: 'Transient network issue — click Retry Cloud Sync to retry automatically.',
       message,
     };
   }
@@ -209,6 +224,10 @@ async function withTransientFirestoreRetry<T>(fn: () => Promise<T>, maxAttempts 
       return await fn();
     } catch (err) {
       lastErr = err;
+      if (isFirestoreQuotaError(err)) {
+        markCloudQuotaExhausted();
+        throw err;
+      }
       const classified = classifyFirestoreError(err);
       if (classified.diagnosticCategory !== 'temporary_retryable' || attempt === maxAttempts - 1) {
         throw err;
@@ -256,12 +275,73 @@ export async function isVerifiedAdminUser(user: User | null): Promise<boolean> {
   }
 }
 
-export async function fetchPublishedCatalogAdditions(): Promise<{
+const PUBLISHED_CATALOG_CACHE_KEY = 'spiritsdex_published_catalog_cache_v1';
+const PUBLISHED_CATALOG_CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface PublishedCatalogCachePayload {
+  fetchedAt: number;
+  sets: ProductSet[];
+  cards: BattleSpiritsCard[];
+}
+
+function readPublishedCatalogCache(): PublishedCatalogCachePayload | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(PUBLISHED_CATALOG_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PublishedCatalogCachePayload;
+    if (!parsed || !Array.isArray(parsed.sets) || !Array.isArray(parsed.cards)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePublishedCatalogCache(sets: ProductSet[], cards: BattleSpiritsCard[]): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const payload: PublishedCatalogCachePayload = {
+      fetchedAt: Date.now(),
+      sets,
+      cards,
+    };
+    localStorage.setItem(PUBLISHED_CATALOG_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore quota/storage errors
+  }
+}
+
+export function invalidatePublishedCatalogCache(): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(PUBLISHED_CATALOG_CACHE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export async function fetchPublishedCatalogAdditions(options?: {
+  forceRefresh?: boolean;
+}): Promise<{
   sets: ProductSet[];
   cards: BattleSpiritsCard[];
 }> {
+  const cached = readPublishedCatalogCache();
+  if (isCloudQuotaCooldownActive()) {
+    return cached ? { sets: cached.sets, cards: cached.cards } : { sets: [], cards: [] };
+  }
+  if (
+    !options?.forceRefresh &&
+    cached &&
+    Date.now() - cached.fetchedAt < PUBLISHED_CATALOG_CACHE_TTL_MS
+  ) {
+    return { sets: cached.sets, cards: cached.cards };
+  }
+
   const sets: ProductSet[] = [];
   const cards: BattleSpiritsCard[] = [];
+  let hadError = false;
 
   try {
     const setsSnap = await getDocs(
@@ -288,7 +368,12 @@ export async function fetchPublishedCatalogAdditions(): Promise<{
         isNumberOnly: Boolean(data.isNumberOnly),
       });
     }
-  } catch {
+  } catch (err) {
+    hadError = true;
+    if (isFirestoreQuotaError(err)) {
+      markCloudQuotaExhausted();
+      return cached ? { sets: cached.sets, cards: cached.cards } : { sets: [], cards: [] };
+    }
     // Non-fatal on offline or fresh project
   }
 
@@ -296,13 +381,41 @@ export async function fetchPublishedCatalogAdditions(): Promise<{
     const cardsSnap = await getDocs(
       query(collection(db, 'catalogCards'), where('isPublished', '==', true))
     );
+    const extractDocTimestampIso = (rawTs: unknown): string | undefined => {
+      if (!rawTs) return undefined;
+      if (typeof rawTs === 'string' && rawTs.trim()) return rawTs.trim();
+      if (typeof rawTs === 'number' && Number.isFinite(rawTs) && rawTs > 0) {
+        return new Date(rawTs).toISOString();
+      }
+      if (typeof rawTs === 'object') {
+        const tsObj = rawTs as { toMillis?: () => number; seconds?: number };
+        if (typeof tsObj.toMillis === 'function') {
+          const ms = tsObj.toMillis();
+          if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString();
+        }
+        if (typeof tsObj.seconds === 'number' && Number.isFinite(tsObj.seconds)) {
+          return new Date(tsObj.seconds * 1000).toISOString();
+        }
+      }
+      return undefined;
+    };
+
     for (const d of cardsSnap.docs) {
       const data = d.data();
+      const docCreatedIso = extractDocTimestampIso(data.createdAt);
+      const docImportedIso = extractDocTimestampIso(data.importedAt);
       if (typeof data.payloadJson === 'string' && data.payloadJson.trim()) {
         try {
           const parsed = JSON.parse(data.payloadJson) as BattleSpiritsCard;
           if (parsed && parsed.id && parsed.name) {
-            cards.push(normalizeCardForCatalog(parsed));
+            const normalized = normalizeCardForCatalog(parsed);
+            if (!normalized.createdAt && docCreatedIso) {
+              normalized.createdAt = docCreatedIso;
+            }
+            if (!normalized.importedAt && docImportedIso) {
+              normalized.importedAt = docImportedIso;
+            }
+            cards.push(normalized);
             continue;
           }
         } catch {
@@ -351,13 +464,23 @@ export async function fetchPublishedCatalogAdditions(): Promise<{
         artVariant: 'dragon',
         wikiUrl: '',
         isWikiLoaded: false,
+        ...(docCreatedIso ? { createdAt: docCreatedIso } : {}),
+        ...(docImportedIso ? { importedAt: docImportedIso } : {}),
         rulings: [],
       });
     }
-  } catch {
+  } catch (err) {
+    hadError = true;
+    if (isFirestoreQuotaError(err)) {
+      markCloudQuotaExhausted();
+      return cached ? { sets: cached.sets, cards: cached.cards } : { sets: [], cards: [] };
+    }
     // Non-fatal on offline or fresh project
   }
 
+  if (!hadError) {
+    writePublishedCatalogCache(sets, cards);
+  }
   return { sets, cards };
 }
 
@@ -412,23 +535,31 @@ export async function publishCatalogAdditionsToFirestore(
   const failedCards: PublishCatalogResult['failedCards'] = [];
   const failures: FirestoreSyncFailureDetail[] = [];
 
-  // Pre-fetch ALL existing document IDs (including unpublished docs) so batches know create vs update accurately
-  const existingSetIds = new Set<string>();
-  const existingCardIds = new Set<string>();
-  if (sets.length > 0) {
+  // Pre-fetch ALL existing document data (including unpublished docs) so batches know create vs update AND skip unchanged docs
+  const existingSetsById = new Map<string, Record<string, unknown>>();
+  const existingCardsById = new Map<string, Record<string, unknown>>();
+  if (sets.length > 0 && !isCloudQuotaCooldownActive()) {
     try {
       const snap = await withTransientFirestoreRetry(() => getDocs(collection(db, 'catalogSets')));
-      for (const d of snap.docs) existingSetIds.add(d.id);
+      for (const d of snap.docs) existingSetsById.set(d.id, d.data() as Record<string, unknown>);
     } catch (err) {
-      logStructuredFirestoreError(err, OperationType.LIST, 'catalogSets');
+      if (isFirestoreQuotaError(err)) {
+        markCloudQuotaExhausted();
+      } else {
+        logStructuredFirestoreError(err, OperationType.LIST, 'catalogSets');
+      }
     }
   }
-  if (cards.length > 0) {
+  if (cards.length > 0 && !isCloudQuotaCooldownActive()) {
     try {
       const snap = await withTransientFirestoreRetry(() => getDocs(collection(db, 'catalogCards')));
-      for (const d of snap.docs) existingCardIds.add(d.id);
+      for (const d of snap.docs) existingCardsById.set(d.id, d.data() as Record<string, unknown>);
     } catch (err) {
-      logStructuredFirestoreError(err, OperationType.LIST, 'catalogCards');
+      if (isFirestoreQuotaError(err)) {
+        markCloudQuotaExhausted();
+      } else {
+        logStructuredFirestoreError(err, OperationType.LIST, 'catalogCards');
+      }
     }
   }
 
@@ -455,45 +586,65 @@ export async function publishCatalogAdditionsToFirestore(
       ? String(s.category)
       : 'Supplementary';
 
+    const basePayload: Record<string, unknown> = {
+      setCode: safeCode,
+      wikiTitle: String(s.wikiTitle || s.name || safeCode).slice(0, 200) || safeCode,
+      name: String(s.name || safeCode).slice(0, 160) || safeCode,
+      jpName: String(s.jpName || '').slice(0, 200),
+      category: safeCategory,
+      productType: String(s.productType || 'Set').slice(0, 80) || 'Set',
+      releaseDate: String(s.releaseDate || '').slice(0, 60),
+      formats,
+      blockLabel: String(s.blockLabel || 'Wiki').slice(0, 80),
+      tagline: String(s.tagline || '').slice(0, 500),
+      featuredCardId: String(s.featuredCardId || '').slice(0, 128),
+      colors,
+      totalCardsInSet: Math.max(0, Math.round(Number(s.totalCardsInSet) || 0)),
+      wikiUrl: String(s.wikiUrl || '').slice(0, 500),
+      sources,
+      isNumberOnly: Boolean(s.isNumberOnly),
+      scanStatus: ['pending', 'scanning', 'completed', 'failed'].includes(String(s.scanStatus))
+        ? String(s.scanStatus)
+        : 'completed',
+      discoveredCount: Math.max(0, Math.round(Number(s.discoveredCount) || 0)),
+      existingCount: Math.max(0, Math.round(Number(s.existingCount) || 0)),
+      missingCount: Math.max(0, Math.round(Number(s.missingCount) || 0)),
+      lastScanAt: String(s.lastScanAt || new Date().toISOString()).slice(0, 40),
+      isPublished: true,
+      updatedByUid: safeAdminUid,
+    };
+
+    const existingSet = existingSetsById.get(safeCode);
+    if (existingSet) {
+      const unchanged =
+        String(existingSet.name || '') === String(basePayload.name) &&
+        String(existingSet.jpName || '') === String(basePayload.jpName) &&
+        String(existingSet.category || '') === String(basePayload.category) &&
+        String(existingSet.productType || '') === String(basePayload.productType) &&
+        String(existingSet.releaseDate || '') === String(basePayload.releaseDate) &&
+        JSON.stringify(existingSet.formats || []) === JSON.stringify(basePayload.formats) &&
+        JSON.stringify(existingSet.colors || []) === JSON.stringify(basePayload.colors) &&
+        Number(existingSet.totalCardsInSet || 0) === Number(basePayload.totalCardsInSet) &&
+        Number(existingSet.discoveredCount || 0) === Number(basePayload.discoveredCount) &&
+        Boolean(existingSet.isPublished) === true;
+      if (unchanged) continue;
+    }
+
     setEntries.push({
       safeCode,
-      basePayload: {
-        setCode: safeCode,
-        wikiTitle: String(s.wikiTitle || s.name || safeCode).slice(0, 200) || safeCode,
-        name: String(s.name || safeCode).slice(0, 160) || safeCode,
-        jpName: String(s.jpName || '').slice(0, 200),
-        category: safeCategory,
-        productType: String(s.productType || 'Set').slice(0, 80) || 'Set',
-        releaseDate: String(s.releaseDate || '').slice(0, 60),
-        formats,
-        blockLabel: String(s.blockLabel || 'Wiki').slice(0, 80),
-        tagline: String(s.tagline || '').slice(0, 500),
-        featuredCardId: String(s.featuredCardId || '').slice(0, 128),
-        colors,
-        totalCardsInSet: Math.max(0, Math.round(Number(s.totalCardsInSet) || 0)),
-        wikiUrl: String(s.wikiUrl || '').slice(0, 500),
-        sources,
-        isNumberOnly: Boolean(s.isNumberOnly),
-        scanStatus: ['pending', 'scanning', 'completed', 'failed'].includes(String(s.scanStatus))
-          ? String(s.scanStatus)
-          : 'completed',
-        discoveredCount: Math.max(0, Math.round(Number(s.discoveredCount) || 0)),
-        existingCount: Math.max(0, Math.round(Number(s.existingCount) || 0)),
-        missingCount: Math.max(0, Math.round(Number(s.missingCount) || 0)),
-        lastScanAt: String(s.lastScanAt || new Date().toISOString()).slice(0, 40),
-        isPublished: true,
-        updatedByUid: safeAdminUid,
-      },
+      basePayload,
     });
   }
 
-  for (let i = 0; i < setEntries.length; i += BATCH_CHUNK_SIZE) {
+  let quotaHit = isCloudWriteCooldownActive();
+
+  for (let i = 0; i < setEntries.length && !quotaHit; i += BATCH_CHUNK_SIZE) {
     const chunk = setEntries.slice(i, i + BATCH_CHUNK_SIZE);
     const commitChunk = async () => {
       const batch = writeBatch(db);
       for (const item of chunk) {
         const ref = doc(db, 'catalogSets', item.safeCode);
-        if (existingSetIds.has(item.safeCode)) {
+        if (existingSetsById.has(item.safeCode)) {
           batch.update(ref, {
             ...item.basePayload,
             updatedAt: serverTimestamp(),
@@ -511,11 +662,35 @@ export async function publishCatalogAdditionsToFirestore(
 
     try {
       await withTransientFirestoreRetry(commitChunk);
-      for (const item of chunk) existingSetIds.add(item.safeCode);
+      for (const item of chunk) existingSetsById.set(item.safeCode, item.basePayload);
       pushedSets += chunk.length;
-    } catch {
+    } catch (chunkErr) {
+      if (isFirestoreQuotaError(chunkErr)) {
+        markCloudQuotaExhausted();
+        quotaHit = true;
+        const info = classifyFirestoreError(chunkErr);
+        for (const item of chunk) {
+          failedSets.push({
+            setCode: item.safeCode,
+            error: info.message,
+            diagnosticCategory: info.diagnosticCategory,
+            recoverable: info.recoverable,
+            recommendedAction: info.recommendedAction,
+          });
+        }
+        failures.push({
+          id: chunk[0]?.safeCode || 'catalogSets',
+          entityType: 'set',
+          error: info.message,
+          diagnosticCategory: info.diagnosticCategory,
+          recoverable: info.recoverable,
+          recommendedAction: info.recommendedAction,
+        });
+        break;
+      }
       // Fallback per-doc isolation with retry so one bad doc never aborts the chunk
       for (const item of chunk) {
+        if (quotaHit) break;
         const ref = doc(db, 'catalogSets', item.safeCode);
         try {
           await withTransientFirestoreRetry(async () => {
@@ -533,9 +708,13 @@ export async function publishCatalogAdditionsToFirestore(
               });
             }
           });
-          existingSetIds.add(item.safeCode);
+          existingSetsById.set(item.safeCode, item.basePayload);
           pushedSets++;
         } catch (err) {
+          if (isFirestoreQuotaError(err)) {
+            markCloudQuotaExhausted();
+            quotaHit = true;
+          }
           logStructuredFirestoreError(err, OperationType.WRITE, `catalogSets/${item.safeCode}`);
           const info = classifyFirestoreError(err);
           failedSets.push({
@@ -578,43 +757,63 @@ export async function publishCatalogAdditionsToFirestore(
     const cardType: CardType = VALID_TYPES.includes(c.type) ? c.type : 'Spirit';
     const payloadJson = buildCompactCardPayloadJson(c, safeId);
 
+    const basePayload: Record<string, unknown> = {
+      id: safeId,
+      cardNumber: String(c.cardNumber || safeId).slice(0, 48) || safeId,
+      name: String(c.name || c.jpName || safeId).slice(0, 160) || safeId,
+      jpName: String(c.jpName || '').slice(0, 200),
+      color: primaryColor,
+      secondaryColor,
+      colors: colors.length > 0 ? colors : [primaryColor],
+      type: cardType,
+      subtypeLabel: String(c.subtypeLabel || '').slice(0, 80),
+      rarity: String(c.rarity || 'C').slice(0, 16) || 'C',
+      setCode: String(c.setCode || 'WIKI').slice(0, 48) || 'WIKI',
+      setName: String(c.setName || '').slice(0, 200),
+      formats,
+      blockIcon: String(c.blockIcon || 'Wiki').slice(0, 64),
+      restriction: String(c.restriction || 'Unlimited').slice(0, 32),
+      isRevival: Boolean(c.isRevival),
+      isToken: Boolean(c.isToken),
+      cost: Math.max(0, Math.min(99, Math.round(Number(c.cost) || 0))),
+      payloadJson,
+      sourceTag: String(c.wikiTitle || c.setCode || 'wiki-sync').slice(0, 120),
+      missingArtwork:
+        !c.artworkVerified &&
+        (!c.artworkImage ||
+          isPlaceholderArtworkUrl(c.artworkImage) ||
+          c.artworkStatus === 'broken' ||
+          c.artworkStatus === 'unavailable' ||
+          c.artworkStatus === 'missing') &&
+        (!c.galleryImages || c.galleryImages.length === 0),
+      isPublished: true,
+      importedByUid: safeAdminUid,
+    };
+
+    const existingCard = existingCardsById.get(safeId);
+    if (existingCard) {
+      const unchanged =
+        String(existingCard.payloadJson || '') === payloadJson &&
+        String(existingCard.name || '') === String(basePayload.name) &&
+        String(existingCard.setCode || '') === String(basePayload.setCode) &&
+        String(existingCard.restriction || '') === String(basePayload.restriction) &&
+        Boolean(existingCard.isPublished) === true;
+      if (unchanged) continue;
+    }
+
     cardEntries.push({
       safeId,
-      basePayload: {
-        id: safeId,
-        cardNumber: String(c.cardNumber || safeId).slice(0, 48) || safeId,
-        name: String(c.name || c.jpName || safeId).slice(0, 160) || safeId,
-        jpName: String(c.jpName || '').slice(0, 200),
-        color: primaryColor,
-        secondaryColor,
-        colors: colors.length > 0 ? colors : [primaryColor],
-        type: cardType,
-        subtypeLabel: String(c.subtypeLabel || '').slice(0, 80),
-        rarity: String(c.rarity || 'C').slice(0, 16) || 'C',
-        setCode: String(c.setCode || 'WIKI').slice(0, 48) || 'WIKI',
-        setName: String(c.setName || '').slice(0, 200),
-        formats,
-        blockIcon: String(c.blockIcon || 'Wiki').slice(0, 64),
-        restriction: String(c.restriction || 'Unlimited').slice(0, 32),
-        isRevival: Boolean(c.isRevival),
-        isToken: Boolean(c.isToken),
-        cost: Math.max(0, Math.min(99, Math.round(Number(c.cost) || 0))),
-        payloadJson,
-        sourceTag: String(c.wikiTitle || c.setCode || 'wiki-sync').slice(0, 120),
-        missingArtwork: !c.artworkImage && (!c.galleryImages || c.galleryImages.length === 0),
-        isPublished: true,
-        importedByUid: safeAdminUid,
-      },
+      basePayload,
     });
   }
 
-  for (let i = 0; i < cardEntries.length; i += BATCH_CHUNK_SIZE) {
+  for (let i = 0; i < cardEntries.length && !quotaHit; i += BATCH_CHUNK_SIZE) {
     const chunk = cardEntries.slice(i, i + BATCH_CHUNK_SIZE);
     const commitChunk = async () => {
       const batch = writeBatch(db);
       for (const item of chunk) {
         const ref = doc(db, 'catalogCards', item.safeId);
-        if (existingCardIds.has(item.safeId)) {
+        if (existingCardsById.has(item.safeId)) {
           batch.update(ref, {
             ...item.basePayload,
             updatedAt: serverTimestamp(),
@@ -632,11 +831,35 @@ export async function publishCatalogAdditionsToFirestore(
 
     try {
       await withTransientFirestoreRetry(commitChunk);
-      for (const item of chunk) existingCardIds.add(item.safeId);
+      for (const item of chunk) existingCardsById.set(item.safeId, item.basePayload);
       pushedCards += chunk.length;
-    } catch {
+    } catch (chunkErr) {
+      if (isFirestoreQuotaError(chunkErr)) {
+        markCloudQuotaExhausted();
+        quotaHit = true;
+        const info = classifyFirestoreError(chunkErr);
+        for (const item of chunk) {
+          failedCards.push({
+            cardId: item.safeId,
+            error: info.message,
+            diagnosticCategory: info.diagnosticCategory,
+            recoverable: info.recoverable,
+            recommendedAction: info.recommendedAction,
+          });
+        }
+        failures.push({
+          id: chunk[0]?.safeId || 'catalogCards',
+          entityType: 'card',
+          error: info.message,
+          diagnosticCategory: info.diagnosticCategory,
+          recoverable: info.recoverable,
+          recommendedAction: info.recommendedAction,
+        });
+        break;
+      }
       // Fallback per-doc isolation with transient retry so one bad card never aborts valid cards
       for (const item of chunk) {
+        if (quotaHit) break;
         const ref = doc(db, 'catalogCards', item.safeId);
         try {
           await withTransientFirestoreRetry(async () => {
@@ -654,9 +877,13 @@ export async function publishCatalogAdditionsToFirestore(
               });
             }
           });
-          existingCardIds.add(item.safeId);
+          existingCardsById.set(item.safeId, item.basePayload);
           pushedCards++;
         } catch (err) {
+          if (isFirestoreQuotaError(err)) {
+            markCloudQuotaExhausted();
+            quotaHit = true;
+          }
           logStructuredFirestoreError(err, OperationType.WRITE, `catalogCards/${item.safeId}`);
           const info = classifyFirestoreError(err);
           failedCards.push({
@@ -679,6 +906,10 @@ export async function publishCatalogAdditionsToFirestore(
     }
   }
 
+  if (pushedSets > 0 || pushedCards > 0) {
+    invalidatePublishedCatalogCache();
+  }
+
   return { pushedSets, pushedCards, failedSets, failedCards, failures };
 }
 
@@ -687,6 +918,16 @@ export async function syncValidationRecordsToFirestore(
 ): Promise<SyncValidationResult> {
   let syncedCount = 0;
   const failedKeys: Array<{ mappingKey: string; error: string }> = [];
+
+  if (isCloudWriteCooldownActive()) {
+    return {
+      syncedCount,
+      failedKeys: records.slice(0, 1).map((r) => ({
+        mappingKey: sanitizeFirestoreId(r.mappingKey, 'val'),
+        error: 'Firestore daily free-tier write quota cooldown active.',
+      })),
+    };
+  }
 
   const entries: Array<{ safeKey: string; payload: Record<string, unknown> }> = [];
   const seenKeys = new Set<string>();
@@ -727,7 +968,8 @@ export async function syncValidationRecordsToFirestore(
     });
   }
 
-  for (let i = 0; i < entries.length; i += BATCH_CHUNK_SIZE) {
+  let quotaHit = false;
+  for (let i = 0; i < entries.length && !quotaHit; i += BATCH_CHUNK_SIZE) {
     const chunk = entries.slice(i, i + BATCH_CHUNK_SIZE);
     const batch = writeBatch(db);
     for (const item of chunk) {
@@ -737,12 +979,26 @@ export async function syncValidationRecordsToFirestore(
     try {
       await batch.commit();
       syncedCount += chunk.length;
-    } catch {
+    } catch (chunkErr) {
+      if (isFirestoreQuotaError(chunkErr)) {
+        markCloudQuotaExhausted();
+        quotaHit = true;
+        failedKeys.push({
+          mappingKey: chunk[0]?.safeKey || 'artworkValidations',
+          error: normalizeErrorMessage(chunkErr),
+        });
+        break;
+      }
       for (const item of chunk) {
+        if (quotaHit) break;
         try {
           await setDoc(doc(db, 'artworkValidations', item.safeKey), item.payload);
           syncedCount++;
         } catch (err) {
+          if (isFirestoreQuotaError(err)) {
+            markCloudQuotaExhausted();
+            quotaHit = true;
+          }
           failedKeys.push({
             mappingKey: item.safeKey,
             error: normalizeErrorMessage(err),
@@ -756,6 +1012,7 @@ export async function syncValidationRecordsToFirestore(
 }
 
 export async function fetchValidationRecordsFromFirestore(): Promise<ClientArtworkValidationRecord[]> {
+  if (isCloudQuotaCooldownActive()) return [];
   try {
     const snap = await getDocs(collection(db, 'artworkValidations'));
     const out: ClientArtworkValidationRecord[] = [];
@@ -788,7 +1045,10 @@ export async function fetchValidationRecordsFromFirestore(): Promise<ClientArtwo
       });
     }
     return out;
-  } catch {
+  } catch (err) {
+    if (isFirestoreQuotaError(err)) {
+      markCloudQuotaExhausted();
+    }
     return [];
   }
 }

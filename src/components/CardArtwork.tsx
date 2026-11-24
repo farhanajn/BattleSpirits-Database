@@ -11,6 +11,7 @@ import {
   markCardSessionLookupFailed,
   markWikiImageError,
   markWikiImageLoaded,
+  resolveCardArtworkSequential,
 } from '../utils/wikiImageClient';
 import { getManualWikiMapping } from '../utils/ManualWikiMapping';
 
@@ -36,6 +37,7 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
   const fallbackSrc = useMemo(() => buildFallbackWikiImageUrl(card), [card]);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const mountedRef = useRef(true);
   const [inView, setInView] = useState<boolean>(
     () =>
       eager ||
@@ -43,14 +45,25 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
       getCachedWikiImageStatus(primarySrc) === 'loaded'
   );
   const [useFallback, setUseFallback] = useState<boolean>(false);
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<boolean>(false);
   const [finalError, setFinalError] = useState<boolean>(false);
+  const sequentialAttemptedRef = useRef<boolean>(false);
 
   const meta = COLOR_META[card.color] || COLOR_META.Red;
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    sequentialAttemptedRef.current = false;
+    setResolvedSrc(null);
     const hasManual = Boolean(getManualWikiMapping(card));
-    if (!imageUrl && !hasManual && isCardSessionLookupFailed(card)) {
+    if (!imageUrl && !hasManual && (isCardSessionLookupFailed(card) || card.artworkStatus === 'unavailable')) {
       setUseFallback(false);
       setFinalError(true);
       setLoaded(false);
@@ -115,7 +128,7 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
     return () => observer.disconnect();
   }, [eager, inView]);
 
-  const activeSrc = useFallback ? fallbackSrc : primarySrc;
+  const activeSrc = resolvedSrc || (useFallback ? fallbackSrc : primarySrc);
   const shouldRenderImg = Boolean(activeSrc && !finalError && (eager || inView));
 
   const handleLoad = () => {
@@ -126,13 +139,38 @@ export const CardArtwork: React.FC<CardArtworkProps> = ({
 
   const handleError = () => {
     if (activeSrc) markWikiImageError(activeSrc);
-    if (!useFallback && fallbackSrc && fallbackSrc !== primarySrc) {
+    if (!resolvedSrc && !useFallback && fallbackSrc && fallbackSrc !== primarySrc) {
       const fbStatus = getCachedWikiImageStatus(fallbackSrc);
       if (fbStatus !== 'error') {
         setUseFallback(true);
         setLoaded(false);
         return;
       }
+    }
+    if (!sequentialAttemptedRef.current && !imageUrl && !resolvedSrc) {
+      sequentialAttemptedRef.current = true;
+      void resolveCardArtworkSequential(card).then((res) => {
+        if (!mountedRef.current) return;
+        const candidateUrl = res.proxyUrl || res.url;
+        if (
+          res.ok &&
+          candidateUrl &&
+          candidateUrl !== primarySrc &&
+          candidateUrl !== fallbackSrc &&
+          getCachedWikiImageStatus(candidateUrl) !== 'error'
+        ) {
+          clearCardSessionLookupFailure(card);
+          setResolvedSrc(candidateUrl);
+          setFinalError(false);
+          setLoaded(false);
+          return;
+        }
+        if (!getManualWikiMapping(card)) {
+          markCardSessionLookupFailed(card, res.failureReason || 'Artwork unavailable on Wiki');
+        }
+        setFinalError(true);
+      });
+      return;
     }
     if (!imageUrl && !getManualWikiMapping(card)) {
       markCardSessionLookupFailed(card);

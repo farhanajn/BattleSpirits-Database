@@ -3,6 +3,11 @@ import { onAuthStateChanged, type IdTokenResult, type User } from 'firebase/auth
 import { doc, getDoc } from 'firebase/firestore';
 import { auth, db } from '../firebase';
 import { ADMIN_EMAILS } from '../utils/catalogCloudSync';
+import {
+  isCloudQuotaCooldownActive,
+  isFirestoreQuotaError,
+  markCloudQuotaExhausted,
+} from '../utils/firestoreQuota';
 
 export interface AdminStatusState {
   isAdmin: boolean;
@@ -19,6 +24,9 @@ async function defaultHasFirestoreAdminRecord(uid: string): Promise<boolean> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     return false;
   }
+  if (isCloudQuotaCooldownActive()) {
+    return false;
+  }
   try {
     const marker = await Promise.race([
       getDoc(doc(db, 'admins', uid)),
@@ -26,7 +34,10 @@ async function defaultHasFirestoreAdminRecord(uid: string): Promise<boolean> {
     ]);
     if (!marker) return false;
     return marker.exists() && marker.data()?.role === 'admin';
-  } catch {
+  } catch (err) {
+    if (isFirestoreQuotaError(err)) {
+      markCloudQuotaExhausted();
+    }
     return false;
   }
 }

@@ -222,7 +222,6 @@ describe('Admin Access Control & Fail-Closed Authorization', () => {
           onSignInGoogle: () => {},
           onSignOutGoogle: () => {},
           onSyncNow: () => {},
-          onSaveProfile: async () => true,
         })
       );
 

@@ -12,6 +12,11 @@ import type {
   ProductSet,
   SetCategory,
 } from '../src/types/card.ts';
+import {
+  evaluateCardCompleteness,
+  isLikelyNonCardWikiTitle,
+  sanitizeEffectsArray,
+} from '../src/utils/cardCompletion.ts';
 import { WIKI_SET_METADATA } from './setMetadata.ts';
 import {
   findManualCardMapping,
@@ -1525,10 +1530,18 @@ function cleanImageFieldValue(raw: string): string {
   if (fileLink) {
     cleaned = fileLink[1].trim();
   }
-  return cleaned
+  cleaned = cleaned
     .replace(/^(?:File|Image):/i, '')
     .split('|')[0]
     .trim();
+  if (/%[0-9A-Fa-f]{2}/.test(cleaned)) {
+    try {
+      cleaned = decodeURIComponent(cleaned).trim();
+    } catch {
+      // keep raw
+    }
+  }
+  return cleaned;
 }
 
 function extractGalleryImages(
@@ -1923,7 +1936,23 @@ export function hydrateCardFromWikitext(
   const taggedBlocks = extractTaggedCardTableBlocks(wikitext);
   const chosenTagged = forcedTaggedBlock || pickBestTaggedCardBlock(taggedBlocks, base);
   if (!chosenTagged) {
-    return { ...base, isWikiLoaded: true };
+    const trimmedWt = (wikitext || '').trim();
+    const isNonCardPage = Boolean(trimmedWt.length > 0);
+    const cleanedEffects = sanitizeEffectsArray(base.effects);
+    const comp = evaluateCardCompleteness(
+      { ...base, effects: cleanedEffects, isWikiLoaded: false },
+      {
+        hasCardTable: false,
+        wikitextEmpty: !trimmedWt,
+        isNonCardPage,
+      }
+    );
+    return {
+      ...base,
+      effects: cleanedEffects,
+      isWikiLoaded: false,
+      ...comp,
+    };
   }
 
   const block = chosenTagged.block;
@@ -2004,7 +2033,16 @@ export function hydrateCardFromWikitext(
     ? fields.bimage || fields.image_b || fields.imageb || ''
     : '';
   const rawImage = cleanImageFieldValue(
-    extractTabberSegment(sideBRawField || fields.image || '', isRevival)
+    extractTabberSegment(
+      sideBRawField ||
+        fields.image ||
+        fields.image1 ||
+        fields.aimage ||
+        fields.altimage ||
+        fields.secretimage ||
+        '',
+      isRevival
+    )
   );
 
   const costNum = Number(
@@ -2018,7 +2056,10 @@ export function hydrateCardFromWikitext(
   const symbols = parseColorCounts(extractTabberSegment(fields.symbols || '', isRevival));
 
   const rawFamilyFields = [
-    cleanWikitextInline(extractTabberSegment(fields.family || '', isRevival)),
+    cleanWikitextInline(
+      extractTabberSegment(fields.family || fields.families || fields.tribe || '', isRevival)
+    ),
+    cleanWikitextInline(extractTabberSegment(fields.family1 || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family2 || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family3 || '', isRevival)),
     cleanWikitextInline(extractTabberSegment(fields.family4 || '', isRevival)),
@@ -2055,8 +2096,24 @@ export function hydrateCardFromWikitext(
 
   const rawLevelStr = extractTabberSegment(fields.level || '', isRevival);
   const levels = parseLevels(rawLevelStr);
-  const rawEffect = extractTabberSegment(fields.effect || '', isRevival);
-  const effects = parseEffects(rawEffect);
+  const primaryEffectRaw = extractTabberSegment(
+    fields.effect ||
+      fields.effect1 ||
+      fields.eneffect ||
+      fields.englisheffect ||
+      fields.cardtext ||
+      fields.text ||
+      '',
+    isRevival
+  );
+  const secondaryEffectParts = [
+    fields.effect2 ? extractTabberSegment(fields.effect2, isRevival) : '',
+    fields.flasheffect ? extractTabberSegment(fields.flasheffect, isRevival) : '',
+    fields.bursteffect ? extractTabberSegment(fields.bursteffect, isRevival) : '',
+    fields.mirageeffect ? extractTabberSegment(fields.mirageeffect, isRevival) : '',
+  ].filter((part) => part && part.trim() && part.trim() !== primaryEffectRaw.trim());
+  const rawEffect = [primaryEffectRaw, ...secondaryEffectParts].filter(Boolean).join('\n\n');
+  const effects = sanitizeEffectsArray(parseEffects(rawEffect));
 
   const keywordsRaw = [
     cleanWikitextInline(fields.keyword || ''),
@@ -2134,11 +2191,14 @@ export function hydrateCardFromWikitext(
   const flavorText =
     cleanWikitextInline(fields.enflavor1 || '') ||
     cleanWikitextInline(fields.enflavor || '') ||
+    cleanWikitextInline(fields.flavor || '') ||
+    cleanWikitextInline(fields.flavortext || '') ||
     base.flavorText;
 
   const illustrator =
     cleanWikitextInline(fields.artist1 || '') ||
     cleanWikitextInline(fields.artist || '') ||
+    cleanWikitextInline(fields.illustrator || '') ||
     base.illustrator;
 
   const blockVal =
@@ -2207,7 +2267,7 @@ export function hydrateCardFromWikitext(
 
   let galleryImages = extractGalleryImages(
     imageSourceWikitext,
-    rawImage || `${base.cardNumber}.png`,
+    rawImage,
     base.cardNumber,
     base.name,
     scopedPageImages,
@@ -2253,9 +2313,11 @@ export function hydrateCardFromWikitext(
     }
   }
 
-  const primaryArtUrl =
-    galleryImages[0]?.url ||
-    `/api/wiki/image?file=${encodeURIComponent(`${base.cardNumber}.png`)}&fallback=${encodeURIComponent(base.cardNumber)}&title=${encodeURIComponent(base.wikiTitle || base.name)}`;
+  const preservedDirectArt =
+    base.artworkImage && /^https?:\/\//i.test(base.artworkImage) && !isNonCardWikiIcon(base.artworkImage)
+      ? base.artworkImage
+      : '';
+  const primaryArtUrl = galleryImages[0]?.url || preservedDirectArt || '';
 
   const restriction = resolveCardRestriction(
     base.cardNumber,
@@ -2269,7 +2331,15 @@ export function hydrateCardFromWikitext(
       ? `${base.name} (Revival)`
       : base.name;
 
-  return {
+  const hasNoPrintedEffectCategory =
+    /\[\[Category:No printed effect\]\]/i.test(wikitext) ||
+    /^(?:-|—|–|none)$/i.test(rawEffect.trim());
+  const hasJpEffectOnly =
+    effects.length === 0 &&
+    Boolean(cleanWikitextInline(fields.jpeffect || fields.jp || '').trim()) &&
+    !hasNoPrintedEffectCategory;
+
+  const hydratedDraft: BattleSpiritsCard = {
     ...base,
     name: resolvedName,
     jpName,
@@ -2288,15 +2358,7 @@ export function hydrateCardFromWikitext(
     braveBonusBp,
     braveCondition: braveCond,
     summonCondition: summonCond,
-    effects:
-      effects.length > 0
-        ? effects
-        : [
-            {
-              timing: 'Card Text',
-              text: 'No English effect text listed on this card.',
-            },
-          ],
+    effects,
     keywords: Array.from(new Set([...keywordsRaw, ...base.keywords])),
     flavorText,
     illustrator,
@@ -2307,6 +2369,20 @@ export function hydrateCardFromWikitext(
     blockIcon,
     restriction,
     isWikiLoaded: true,
+  };
+
+  const completeness = evaluateCardCompleteness(hydratedDraft, {
+    hasCardTable: true,
+    hasNoPrintedEffectCategory,
+    hasJpEffectOnly,
+    wikiMatchConfidence: 100,
+    ...(primaryArtUrl ? {} : { artworkFailureReason: 'missing' }),
+  });
+
+  return {
+    ...hydratedDraft,
+    ...completeness,
+    recordSaved: true,
   };
 }
 
@@ -2806,7 +2882,7 @@ export function parseSetTableRows(
         const numRaw = cleanWikitextInline(cells[numberIdx] || '')
           .replace(/[\u2010-\u2015\u2212]/g, '-')
           .replace(/\s+/g, '');
-        if (!numRaw || numRaw.length > 28 || /^(?:card)?number$/i.test(numRaw)) continue;
+        if (!numRaw || numRaw.length > 28 || /^(?:card)?number$|^introduction$|^contents$|^external\s*articles$/i.test(numRaw)) continue;
 
         const nameCellRaw = cells[detectedNameIdx] || '';
         const linkMatch = nameCellRaw.match(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/);
@@ -2814,7 +2890,12 @@ export function parseSetTableRows(
 
         const wikiTitle = linkMatch[1].trim();
         const baseDisplayName = (linkMatch[2] || linkMatch[1]).trim();
-        if (!wikiTitle || wikiTitle.startsWith('File:') || wikiTitle.startsWith('Category:')) {
+        if (
+          !wikiTitle ||
+          wikiTitle.startsWith('File:') ||
+          wikiTitle.startsWith('Category:') ||
+          isLikelyNonCardWikiTitle(wikiTitle)
+        ) {
           continue;
         }
 
@@ -2893,7 +2974,6 @@ export function parseSetTableRows(
         const id = `${resolvedSetCode.toLowerCase()}-${fullNumber
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, '-')}${isRevival ? '-rv' : ''}`;
-        const defaultFile = `${fullNumber}.jpg`;
 
         const defaultSymbols: Partial<Record<BattleSymbolKind, number>> =
           type === 'Magic' || isToken
@@ -2928,7 +3008,14 @@ export function parseSetTableRows(
           keywords: [],
           flavorText: '',
           illustrator: '',
-          artworkImage: `/api/wiki/image?file=${encodeURIComponent(defaultFile)}&fallback=${encodeURIComponent(fullNumber)}&title=${encodeURIComponent(wikiTitle)}`,
+          artworkImage: '',
+          artworkVerified: false,
+          artworkStatus: 'missing',
+          effectVerified: false,
+          effectStatus: 'missing',
+          metadataVerified: false,
+          metadataStatus: 'incomplete',
+          completionStatus: 'incomplete',
           artVariant: defaultVariant(type, colors[0]),
           wikiTitle,
           wikiUrl: `${WIKI_BASE}${encodeURIComponent(wikiTitle.replace(/ /g, '_'))}`,
@@ -3443,9 +3530,19 @@ export async function getWikiCardDetail(
     rulings: fallbackBase?.rulings || [],
   };
 
-  return wikitext
-    ? hydrateCardFromWikitext(base, wikitext, bundle?.pageImages || [])
-    : { ...base, isWikiLoaded: true };
+  if (wikitext) {
+    return hydrateCardFromWikitext(base, wikitext, bundle?.pageImages || []);
+  }
+  const comp = evaluateCardCompleteness(base, {
+    wikitextEmpty: true,
+    hasCardTable: false,
+    artworkFailureReason: 'unavailable_on_wiki',
+  });
+  return {
+    ...base,
+    ...comp,
+    isWikiLoaded: false,
+  };
 }
 
 export async function hydrateWikiCardsBatch(
@@ -4495,6 +4592,89 @@ export async function resolveWikiImageUrl(fileNames: string[]): Promise<string |
 
   inflightImageUrl.set(batchKey, task);
   return task;
+}
+
+export async function batchVerifyWikiFilesExist(
+  fileNames: string[],
+  fetchFn: (params: Record<string, string>) => Promise<Record<string, unknown>> = fetchWikiJson
+): Promise<Map<string, string | null>> {
+  const results = new Map<string, string | null>();
+  const cleanSet = new Set<string>();
+  for (const raw of fileNames) {
+    let f = (raw || '').replace(/^File:/i, '').trim();
+    if (/%[0-9A-Fa-f]{2}/.test(f)) {
+      try {
+        f = decodeURIComponent(f).trim();
+      } catch {
+        // keep raw
+      }
+    }
+    if (!f || isNonCardWikiIcon(f)) continue;
+    cleanSet.add(f);
+  }
+
+  const now = Date.now();
+  const uncached: string[] = [];
+  for (const name of cleanSet) {
+    const key = name.toLowerCase();
+    const cached = imageUrlCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      results.set(key, cached.value);
+    } else {
+      uncached.push(name);
+    }
+  }
+
+  for (let i = 0; i < uncached.length; i += 45) {
+    const chunk = uncached.slice(i, i + 45);
+    try {
+      const json = (await fetchFn({
+        action: 'query',
+        titles: chunk.map((f) => `File:${f}`).join('|'),
+        prop: 'imageinfo',
+        iiprop: 'url',
+      })) as {
+        query?: {
+          normalized?: { from: string; to: string }[];
+          pages?: Record<
+            string,
+            { title?: string; missing?: string; imageinfo?: { url?: string }[] }
+          >;
+        };
+      };
+
+      const foundByTitle = new Map<string, string>();
+      for (const page of Object.values(json.query?.pages || {})) {
+        const url = page.imageinfo?.[0]?.url;
+        if (page.title && url && !isNonCardWikiIcon(url)) {
+          foundByTitle.set(page.title.replace(/^File:/i, '').toLowerCase(), url);
+        }
+      }
+      for (const norm of json.query?.normalized || []) {
+        const fromKey = norm.from.replace(/^File:/i, '').toLowerCase();
+        const toKey = norm.to.replace(/^File:/i, '').toLowerCase();
+        const url = foundByTitle.get(toKey);
+        if (url) foundByTitle.set(fromKey, url);
+      }
+
+      for (const name of chunk) {
+        const key = name.toLowerCase();
+        const resolved = foundByTitle.get(key) || null;
+        results.set(key, resolved);
+        pruneImageUrlCache();
+        imageUrlCache.set(key, {
+          value: resolved,
+          expiresAt: Date.now() + (resolved ? CACHE_TTL_MS * 12 : NEGATIVE_IMAGE_TTL_MS),
+        });
+      }
+    } catch {
+      for (const name of chunk) {
+        results.set(name.toLowerCase(), null);
+      }
+    }
+  }
+
+  return results;
 }
 
 export async function resolveCardArtworkWithTrace(

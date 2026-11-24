@@ -2,27 +2,42 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowRight,
   Calendar,
+  Clock,
   ExternalLink,
   LayoutGrid,
   LayoutList,
   Search,
+  Shuffle,
 } from 'lucide-react';
+import type { User } from 'firebase/auth';
 import {
   BattleSpiritsCard,
-  ColorFilter,
   FormatFilter,
   ProductSet,
 } from '../types/card';
-import { ALL_COLORS, COLOR_META } from '../data/theme';
+import { COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { CardThumbnail } from './CardThumbnail';
 import { SymbolIcon } from './SymbolIcon';
 import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
+import { useAdmin } from '../hooks/useAdmin';
 import {
   buildSetSearchTokens,
   matchesIndexedSetQuery,
   normalizeSetIdentifier,
 } from '../utils/setMetadataSync';
+import {
+  DEFAULT_FEATURED_MODE,
+  FeaturedCardsMode,
+  getMillisecondsUntilNextWibRotation,
+  getWibRotationWindow,
+  selectFeaturedCards,
+} from '../utils/featuredCards';
+import {
+  readCachedSharedFeaturedConfig,
+  subscribeToSharedFeaturedConfig,
+  updateSharedFeaturedMode,
+} from '../utils/featuredConfigSync';
 
 type SetCategoryTab =
   | 'all'
@@ -45,9 +60,16 @@ interface CatalogMenuViewProps {
   cardsById: Record<string, BattleSpiritsCard>;
   activeDeckQtyMap: Record<string, number>;
   activeFormat: FormatFilter;
+  currentUser?: User | null;
+  authReady?: boolean;
+  isAdmin?: boolean;
+  adminLoading?: boolean;
+  sharedFeaturedMode?: FeaturedCardsMode;
+  onChangeSharedFeaturedMode?: (mode: FeaturedCardsMode) => Promise<void>;
+  onNotify?: (message: string) => void;
+  rotationNowMs?: number;
   onChangeFormat: (format: FormatFilter) => void;
   onOpenSetInSearch: (setCode: string) => void;
-  onOpenColorInSearch: (color: ColorFilter) => void;
   onOpenSearch: () => void;
   onSelectCard: (card: BattleSpiritsCard) => void;
   onAddToDeck: (card: BattleSpiritsCard) => void;
@@ -59,22 +81,76 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
   cardsById,
   activeDeckQtyMap,
   activeFormat,
+  currentUser = null,
+  authReady = false,
+  isAdmin: parentIsAdmin,
+  adminLoading: parentAdminLoading = false,
+  sharedFeaturedMode: controlledFeaturedMode,
+  onChangeSharedFeaturedMode,
+  onNotify,
+  rotationNowMs,
   onChangeFormat,
   onOpenSetInSearch,
-  onOpenColorInSearch,
   onOpenSearch,
   onSelectCard,
   onAddToDeck,
 }) => {
+  const { isAdmin: verifiedHookAdmin, loading: hookAdminLoading } = useAdmin(
+    currentUser,
+    authReady
+  );
+  const canManageFeaturedMode = Boolean(
+    authReady &&
+      currentUser &&
+      !hookAdminLoading &&
+      !parentAdminLoading &&
+      verifiedHookAdmin &&
+      (parentIsAdmin === undefined || parentIsAdmin === true)
+  );
+
   const [setCategory, setSetCategory] = useState<SetCategoryTab>('all');
   const [setQuery, setSetQuery] = useState('');
   const [setViewMode, setSetViewMode] = useState<SetViewMode>('list');
   const [visibleGridLimit, setVisibleGridLimit] = useState(36);
+  const [internalFeaturedMode, setInternalFeaturedMode] = useState<FeaturedCardsMode>(
+    () => readCachedSharedFeaturedConfig().mode ?? DEFAULT_FEATURED_MODE
+  );
+  const [updatingFeaturedMode, setUpdatingFeaturedMode] = useState(false);
+  const [liveNowMs, setLiveNowMs] = useState<number>(() => rotationNowMs ?? Date.now());
+
+  const featuredMode = controlledFeaturedMode ?? internalFeaturedMode;
+  const effectiveNowMs = rotationNowMs ?? liveNowMs;
+
+  useEffect(() => {
+    if (controlledFeaturedMode !== undefined) return;
+    const unsub = subscribeToSharedFeaturedConfig((cfg) => {
+      setInternalFeaturedMode(cfg.mode);
+    });
+    return () => unsub();
+  }, [controlledFeaturedMode]);
+
+  useEffect(() => {
+    if (rotationNowMs !== undefined) return;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    const scheduleNextBoundary = () => {
+      const delayMs = getMillisecondsUntilNextWibRotation(Date.now());
+      timerId = setTimeout(() => {
+        setLiveNowMs(Date.now());
+        scheduleNextBoundary();
+      }, delayMs);
+    };
+    scheduleNextBoundary();
+    return () => {
+      if (timerId !== null) clearTimeout(timerId);
+    };
+  }, [rotationNowMs]);
 
   useEffect(() => {
     setSetCategory('all');
     setVisibleGridLimit(36);
   }, [activeFormat]);
+
+  const wibWindow = useMemo(() => getWibRotationWindow(effectiveNowMs), [effectiveNowMs]);
 
   const matchesFormat = (formats: ('Standard' | 'Eternal')[]) => {
     if (activeFormat === 'All') return true;
@@ -107,23 +183,46 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
     cards.find((c) => matchesFormat(c.formats)) ||
     cards[0];
 
-  const newestCards = useMemo(() => {
-    const filtered = cards.filter((c) => {
-      if (activeFormat === 'Standard') return c.formats.includes('Standard');
-      if (activeFormat === 'Eternal') {
-        return !c.formats.includes('Standard') && c.formats.includes('Eternal');
+  const handleChangeFeaturedMode = async (nextMode: FeaturedCardsMode) => {
+    if (!canManageFeaturedMode || updatingFeaturedMode || nextMode === featuredMode) {
+      return;
+    }
+    setUpdatingFeaturedMode(true);
+    try {
+      if (onChangeSharedFeaturedMode) {
+        await onChangeSharedFeaturedMode(nextMode);
+      } else {
+        const updated = await updateSharedFeaturedMode(nextMode, currentUser);
+        setInternalFeaturedMode(updated.mode);
       }
-      return true;
+      onNotify?.(
+        `Shared Featured Cards mode updated to ${nextMode === 'latest' ? 'Latest' : 'Random'} for all users.`
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to update Featured Cards mode.';
+      onNotify?.(message);
+    } finally {
+      setUpdatingFeaturedMode(false);
+    }
+  };
+
+  const featuredCards = useMemo(() => {
+    return selectFeaturedCards(cards, {
+      mode: featuredMode,
+      format: activeFormat,
+      count: 8,
+      window: wibWindow,
+      productSets,
     });
-    return filtered.slice(0, 8);
-  }, [cards, activeFormat]);
+  }, [cards, featuredMode, activeFormat, wibWindow, productSets]);
 
   const catalogPrefetchList = useMemo(
     () =>
       latestFeaturedCard
-        ? [latestFeaturedCard, ...newestCards.filter((c) => c.id !== latestFeaturedCard.id)]
-        : newestCards,
-    [latestFeaturedCard, newestCards]
+        ? [latestFeaturedCard, ...featuredCards.filter((c) => c.id !== latestFeaturedCard.id)]
+        : featuredCards,
+    [latestFeaturedCard, featuredCards]
   );
 
   useWikiImagePrefetch({
@@ -408,9 +507,9 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
         </div>
       </section>
 
-      {/* Newest Release Cards Preview */}
-      <section className="space-y-3.5">
-        <div className="flex items-end justify-between gap-3">
+      {/* Shared 6-Hour Rotation Featured Cards Preview (Random or Latest) */}
+      <section className="space-y-3.5" aria-label="Featured Cards">
+        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
           <div>
             <h2 className="font-display text-lg sm:text-xl font-bold text-slate-900">
               {activeFormat === 'Standard'
@@ -420,21 +519,78 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
                 : 'Featured Cards'}
             </h2>
             <p className="text-xs sm:text-sm text-slate-500">
-              Tap any card for English effects, all card artworks, and deck builder controls.
+              {featuredMode === 'random'
+                ? `Shared 6-hour random rotation (${wibWindow.windowStartLabel} – ${wibWindow.nextRotationLabel}) — tap any card for English effects, artworks, and deck controls.`
+                : `Newest imported cards on the 6-hour rotation (${wibWindow.windowStartLabel} – ${wibWindow.nextRotationLabel}) — tap any card for English effects and details.`}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => onOpenSetInSearch(latestSet.setCode)}
-            className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <span>Explore {latestSet.setCode}</span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
+
+          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto shrink-0">
+            <span
+              data-testid="featured-rotation-schedule"
+              className="text-xs font-medium text-slate-500 inline-flex items-center gap-1.5 px-2 py-1"
+            >
+              {featuredMode === 'latest' ? (
+                <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              ) : (
+                <Shuffle className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              )}
+              <span>
+                {featuredMode === 'latest' ? 'Latest Mode' : 'Random Rotation'} · Next{' '}
+                {wibWindow.nextRotationLabel}
+              </span>
+            </span>
+
+            {canManageFeaturedMode && (
+              <div
+                role="group"
+                aria-label="Featured cards display mode"
+                className="inline-flex items-center gap-1 p-1 bg-slate-200/80 rounded-xl"
+              >
+                <button
+                  type="button"
+                  disabled={updatingFeaturedMode}
+                  onClick={() => void handleChangeFeaturedMode('random')}
+                  aria-pressed={featuredMode === 'random'}
+                  className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-60 ${
+                    featuredMode === 'random'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Shuffle className="w-3.5 h-3.5" />
+                  <span>Random</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={updatingFeaturedMode}
+                  onClick={() => void handleChangeFeaturedMode('latest')}
+                  aria-pressed={featuredMode === 'latest'}
+                  className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-60 ${
+                    featuredMode === 'latest'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>Latest</span>
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => onOpenSetInSearch(latestSet.setCode)}
+              className="min-h-[40px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <span>Explore {latestSet.setCode}</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
-          {newestCards.map((card) => (
+          {featuredCards.map((card) => (
             <CardThumbnail
               key={card.id}
               card={card}
@@ -443,37 +599,6 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
               onAddToDeck={onAddToDeck}
             />
           ))}
-        </div>
-      </section>
-
-      {/* Quick Browse by Attribute */}
-      <section className="space-y-3">
-        <h2 className="font-display text-lg sm:text-xl font-bold text-slate-900">
-          Browse by Attribute
-        </h2>
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5">
-          {ALL_COLORS.map((color) => (
-            <button
-              key={color}
-              type="button"
-              onClick={() => onOpenColorInSearch(color)}
-              className="min-h-[52px] px-3 py-2.5 rounded-2xl bg-white border border-slate-200 hover:border-slate-300 flex items-center justify-center gap-2 text-xs font-semibold transition-colors cursor-pointer"
-            >
-              <SymbolIcon color={color} size="sm" variant="gem" />
-              <span className={COLOR_META[color].text}>{color}</span>
-            </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => onOpenColorInSearch('Multicolor')}
-            className="min-h-[52px] px-3 py-2.5 rounded-2xl bg-white border border-slate-200 hover:border-slate-300 flex items-center justify-center gap-2 text-xs font-semibold transition-colors cursor-pointer"
-          >
-            <span className="inline-flex items-center -space-x-1">
-              <SymbolIcon color="Red" size="xs" variant="gem" />
-              <SymbolIcon color="Blue" size="xs" variant="gem" />
-            </span>
-            <span className="text-slate-800">Multi-Color</span>
-          </button>
         </div>
       </section>
 

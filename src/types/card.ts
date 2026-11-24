@@ -53,6 +53,28 @@ export interface CardGalleryImage {
   caption: string;
 }
 
+export type CardArtworkStatus =
+  | 'verified'
+  | 'missing'
+  | 'placeholder'
+  | 'broken'
+  | 'unavailable';
+
+export type CardEffectStatus =
+  | 'verified'
+  | 'no_printed_effect'
+  | 'missing'
+  | 'unavailable'
+  | 'failed';
+
+export type CardMetadataStatus = 'verified' | 'incomplete' | 'unavailable';
+
+export type CardCompletionStatus =
+  | 'complete'
+  | 'partial'
+  | 'incomplete'
+  | 'needs_review';
+
 export interface BattleSpiritsCard {
   id: string;
   cardNumber: string;
@@ -101,7 +123,23 @@ export interface BattleSpiritsCard {
   wikiTitle?: string;
   wikiUrl: string;
   isWikiLoaded?: boolean;
+  createdAt?: string | number;
+  importedAt?: string | number;
   rulings: CardRuling[];
+  recordSaved?: boolean;
+  artworkVerified?: boolean;
+  artworkStatus?: CardArtworkStatus;
+  effectVerified?: boolean;
+  effectStatus?: CardEffectStatus;
+  metadataVerified?: boolean;
+  metadataStatus?: CardMetadataStatus;
+  wikiMatchConfidence?: number;
+  unavailableFields?: string[];
+  failedFields?: string[];
+  needsManualReview?: boolean;
+  completionStatus?: CardCompletionStatus;
+  lastAuditAt?: string;
+  lastRepairedAt?: string;
 }
 
 export interface DeckEntry {
@@ -137,6 +175,20 @@ export type SortOption =
   | 'bp-desc'
   | 'name';
 
+export type CostBracketFilter =
+  | 'All'
+  | '0'
+  | '1'
+  | '2'
+  | '3'
+  | '4'
+  | '5'
+  | '6'
+  | '7'
+  | '8'
+  | '9'
+  | '10+';
+
 export interface FilterState {
   search: string;
   setQuery: string;
@@ -147,7 +199,7 @@ export interface FilterState {
   family: string | 'All';
   rarity: CardRarity[];
   setCode: string | 'All';
-  costBracket: 'All' | '0-2' | '3-4' | '5-6' | '7+';
+  costBracket: CostBracketFilter;
   keyword: string | 'All';
   sortBy: SortOption;
 }

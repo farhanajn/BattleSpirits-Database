@@ -12,6 +12,11 @@ import {
   getFirestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
+import {
+  isCloudQuotaCooldownActive,
+  isFirestoreQuotaError,
+  markCloudQuotaExhausted,
+} from './utils/firestoreQuota';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -72,9 +77,14 @@ export function handleFirestoreError(
 }
 
 async function testConnection() {
+  if (isCloudQuotaCooldownActive()) return;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
+    if (isFirestoreQuotaError(error)) {
+      markCloudQuotaExhausted();
+      return;
+    }
     if (
       error instanceof Error &&
       error.message.includes('the client is offline')

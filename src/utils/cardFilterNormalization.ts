@@ -4,6 +4,7 @@ import {
   CardColor,
   CardType,
   ColorFilter,
+  CostBracketFilter,
   FilterState,
   FormatFilter,
   GameFormat,
@@ -15,6 +16,21 @@ import {
   normalizeSetIdentifier,
   type IndexedSetDirectory,
 } from './setMetadataSync';
+
+export const COST_BRACKET_OPTIONS: readonly CostBracketFilter[] = [
+  'All',
+  '0',
+  '1',
+  '2',
+  '3',
+  '4',
+  '5',
+  '6',
+  '7',
+  '8',
+  '9',
+  '10+',
+] as const;
 
 export const INITIAL_FILTER_STATE: FilterState = {
   search: '',
@@ -201,18 +217,58 @@ export function normalizeCardColors(card: Partial<BattleSpiritsCard>): CardColor
 
 export function matchesColorFilter(
   card: Partial<BattleSpiritsCard>,
-  colorFilter: ColorFilter
+  colorFilter: ColorFilter | ColorFilter[]
 ): boolean {
-  if (!colorFilter || colorFilter === 'All') return true;
+  if (!colorFilter) return true;
   const cardColors = normalizeCardColors(card);
-  if (colorFilter === 'Multicolor') {
+
+  if (Array.isArray(colorFilter)) {
+    if (colorFilter.length === 0) return true;
+    if (colorFilter.some((c) => typeof c === 'string' && c.trim().toLowerCase() === 'all')) {
+      return true;
+    }
+
+    const wantsMulticolor = colorFilter.some(
+      (c) => typeof c === 'string' && /^multi[\s-]*color$/i.test(c.trim())
+    );
+    const requestedColors: CardColor[] = [];
+    for (const item of colorFilter) {
+      if (typeof item === 'string' && /^multi[\s-]*color$/i.test(item.trim())) continue;
+      extractColorsFromToken(item, requestedColors);
+    }
+
+    if (wantsMulticolor && cardColors.length < 2) {
+      return false;
+    }
+    if (requestedColors.length > 0) {
+      return requestedColors.some((c) => cardColors.includes(c));
+    }
+    return wantsMulticolor;
+  }
+
+  const trimmed = String(colorFilter).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'all') return true;
+  if (/^multi[\s-]*color$/i.test(trimmed)) {
     return cardColors.length >= 2;
   }
-  return cardColors.includes(colorFilter);
+
+  const normalizedSingle = normalizeSingleColor(trimmed);
+  if (normalizedSingle) {
+    return cardColors.includes(normalizedSingle);
+  }
+
+  const requestedColors: CardColor[] = [];
+  extractColorsFromToken(trimmed, requestedColors);
+  if (requestedColors.length === 0) return false;
+  return requestedColors.some((c) => cardColors.includes(c));
 }
 
 function normalizeStructuredTypeSegment(rawSegment: string): CardType | null {
-  const cleaned = rawSegment.trim().replace(/\s+/g, ' ');
+  const cleaned = rawSegment
+    .trim()
+    .replace(/\s*(?:\([^)]*\)|【[^】]*】)\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!cleaned) return null;
   const lower = cleaned.toLowerCase();
 
@@ -240,11 +296,17 @@ function normalizeStructuredTypeSegment(rawSegment: string): CardType | null {
 }
 
 function collectStructuredTypesFromField(rawField: unknown, out: CardType[]): void {
+  if (Array.isArray(rawField)) {
+    for (const item of rawField) {
+      collectStructuredTypesFromField(item, out);
+    }
+    return;
+  }
   if (typeof rawField !== 'string') return;
   const trimmed = rawField.trim();
   if (!trimmed) return;
 
-  const segments = trimmed.split(/[/,&・、|]+/).map((s) => s.trim()).filter(Boolean);
+  const segments = trimmed.split(/[/,&・、|+]+/).map((s) => s.trim()).filter(Boolean);
   for (const segment of segments) {
     const mapped = normalizeStructuredTypeSegment(segment);
     if (mapped && !out.includes(mapped)) {
@@ -255,6 +317,8 @@ function collectStructuredTypesFromField(rawField: unknown, out: CardType[]): vo
 
 export function normalizeCardTypes(card: Partial<BattleSpiritsCard>): CardType[] {
   const result: CardType[] = [];
+  const cardWithExtra = card as Partial<BattleSpiritsCard> & { types?: unknown };
+  collectStructuredTypesFromField(cardWithExtra.types, result);
   collectStructuredTypesFromField(card.type, result);
   collectStructuredTypesFromField(card.subtypeLabel, result);
   return result;
@@ -262,11 +326,25 @@ export function normalizeCardTypes(card: Partial<BattleSpiritsCard>): CardType[]
 
 export function matchesTypeFilter(
   card: Partial<BattleSpiritsCard>,
-  selectedTypes: CardType[]
+  selectedTypes: CardType[] | CardType | 'All'
 ): boolean {
-  if (!selectedTypes || selectedTypes.length === 0) return true;
+  const rawList = Array.isArray(selectedTypes)
+    ? selectedTypes
+    : selectedTypes
+    ? [selectedTypes]
+    : [];
+  if (rawList.length === 0) return true;
+  if (rawList.some((t) => typeof t === 'string' && t.trim().toLowerCase() === 'all')) {
+    return true;
+  }
+
+  const normalizedRequested: CardType[] = [];
+  collectStructuredTypesFromField(rawList, normalizedRequested);
+  if (normalizedRequested.length === 0) return false;
+
   const cardTypes = normalizeCardTypes(card);
-  return cardTypes.some((t) => selectedTypes.includes(t));
+  if (cardTypes.length === 0) return false;
+  return normalizedRequested.some((reqType) => cardTypes.includes(reqType));
 }
 
 export function canonicalizeFamilyLabel(raw: string): string {
@@ -323,20 +401,37 @@ export function extractAvailableFamilies(cards: Partial<BattleSpiritsCard>[]): s
 
 export function matchesFamilyFilter(
   card: Partial<BattleSpiritsCard>,
-  selectedFamily: string | 'All'
+  selectedFamily: string | string[] | 'All'
 ): boolean {
-  if (!selectedFamily || selectedFamily === 'All') return true;
-  const targetCanonical = canonicalizeFamilyLabel(selectedFamily);
-  if (!targetCanonical) return true;
-  const targetKey = targetCanonical.toLowerCase();
+  if (!selectedFamily) return true;
   const cardFamilies = normalizeCardFamilies(card.families);
+
+  if (Array.isArray(selectedFamily)) {
+    if (selectedFamily.length === 0) return true;
+    if (selectedFamily.some((f) => typeof f === 'string' && f.trim().toLowerCase() === 'all')) {
+      return true;
+    }
+    const targetKeys = selectedFamily
+      .map((f) => canonicalizeFamilyLabel(String(f || '')).toLowerCase())
+      .filter(Boolean);
+    if (targetKeys.length === 0) return false;
+    return cardFamilies.some((cf) => targetKeys.includes(cf.toLowerCase()));
+  }
+
+  const trimmed = String(selectedFamily).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'all') return true;
+  const targetCanonical = canonicalizeFamilyLabel(trimmed);
+  if (!targetCanonical) return false;
+  const targetKey = targetCanonical.toLowerCase();
   return cardFamilies.some((f) => f.toLowerCase() === targetKey);
 }
 
 export function normalizeCardCost(rawCost: unknown): number | null {
   if (typeof rawCost === 'number') {
-    if (!Number.isFinite(rawCost) || rawCost < 0 || rawCost > 99) return null;
-    return Math.trunc(rawCost);
+    if (!Number.isFinite(rawCost) || !Number.isInteger(rawCost) || rawCost < 0 || rawCost > 99) {
+      return null;
+    }
+    return rawCost;
   }
   if (typeof rawCost === 'string') {
     const trimmed = rawCost.trim();
@@ -352,14 +447,16 @@ export function matchesCostBracket(
   card: Partial<BattleSpiritsCard>,
   bracket: FilterState['costBracket']
 ): boolean {
-  if (!bracket || bracket === 'All') return true;
+  if (!bracket) return true;
+  const trimmed = String(bracket).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'all') return true;
   const cost = normalizeCardCost(card.cost);
   if (cost === null) return false;
-  if (bracket === '0-2') return cost >= 0 && cost <= 2;
-  if (bracket === '3-4') return cost >= 3 && cost <= 4;
-  if (bracket === '5-6') return cost >= 5 && cost <= 6;
-  if (bracket === '7+') return cost >= 7;
-  return true;
+  if (trimmed === '10+') return cost >= 10;
+  if (/^[0-9]$/.test(trimmed)) {
+    return cost === Number.parseInt(trimmed, 10);
+  }
+  return false;
 }
 
 export function normalizeCardForCatalog(card: BattleSpiritsCard): BattleSpiritsCard {
@@ -491,10 +588,14 @@ export function cardMatchesFilters(
   filters: FilterState,
   context: CatalogFilterContext = {}
 ): boolean {
-  if ((card.setCode || '').toUpperCase() === 'BSS01') return false;
-  if (!matchesFormatFilter(Array.isArray(card.formats) ? card.formats : ['Eternal'], filters.format)) {
-    return false;
-  }
+  if (normalizeSetIdentifier(card.setCode || '') === 'BSS01') return false;
+
+  const formatMatches = matchesFormatFilter(
+    Array.isArray(card.formats) ? card.formats : ['Eternal'],
+    filters.format
+  );
+  if (!formatMatches) return false;
+
   if (filters.version === 'Original' && card.isRevival) return false;
   if (filters.version === 'Revival' && !card.isRevival) return false;
 
@@ -556,24 +657,29 @@ export function cardMatchesFilters(
     }
   }
 
-  if (!matchesColorFilter(card, filters.color)) return false;
-  if (!matchesTypeFilter(card, filters.type)) return false;
-  if (!matchesFamilyFilter(card, filters.family)) return false;
-  if (
-    filters.rarity.length > 0 &&
-    !filters.rarity.includes((card.rarity || '').trim().toUpperCase() as BattleSpiritsCard['rarity'])
-  ) {
-    return false;
-  }
-  if (
-    filters.keyword !== 'All' &&
-    !(card.keywords || []).some((k) => k.trim().toLowerCase() === filters.keyword.trim().toLowerCase())
-  ) {
-    return false;
-  }
-  if (!matchesCostBracket(card, filters.costBracket)) return false;
+  const normalizedRarities = (filters.rarity || [])
+    .map((r) => String(r || '').trim().toUpperCase())
+    .filter(Boolean);
+  const rarityMatches =
+    normalizedRarities.length === 0 ||
+    normalizedRarities.includes((card.rarity || '').trim().toUpperCase());
 
-  return true;
+  const keywordMatches =
+    !filters.keyword ||
+    filters.keyword === 'All' ||
+    (card.keywords || []).some(
+      (k) => k.trim().toLowerCase() === filters.keyword.trim().toLowerCase()
+    );
+
+  // Strict AND combination across all active facet filters
+  return (
+    matchesColorFilter(card, filters.color) &&
+    matchesTypeFilter(card, filters.type) &&
+    matchesFamilyFilter(card, filters.family) &&
+    matchesCostBracket(card, filters.costBracket) &&
+    rarityMatches &&
+    keywordMatches
+  );
 }
 
 export function filterCatalogCards(

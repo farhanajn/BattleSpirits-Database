@@ -5,6 +5,7 @@ import path from 'node:path';
 import { BATTLE_SPIRITS_CARDS, PRODUCT_SETS } from '../src/data/cards';
 import type { BattleSpiritsCard, CardColor, CardType, FilterState } from '../src/types/card';
 import {
+  COST_BRACKET_OPTIONS,
   extractAvailableFamilies,
   filterCatalogCards,
   INITIAL_FILTER_STATE,
@@ -257,37 +258,91 @@ test('Card Family filter normalizes comma-separated families and excludes cards 
   assert.equal(matchesFamilyFilter(syntheticDeck[3], 'Dragon'), false);
 });
 
-test('Cost Bracket filter enforces strict integer bounds and blocks null, NaN, empty string, and non-numeric costs', () => {
-  const b02 = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: '0-2' }));
-  const b34 = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: '3-4' }));
-  const b56 = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: '5-6' }));
-  const b7p = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: '7+' }));
+test('Cost Bracket filter supports All, 0 through 9, and 10+ on printed base cost only', () => {
+  assert.deepEqual(COST_BRACKET_OPTIONS, [
+    'All',
+    '0',
+    '1',
+    '2',
+    '3',
+    '4',
+    '5',
+    '6',
+    '7',
+    '8',
+    '9',
+    '10+',
+  ]);
 
-  for (const c of b02) assert.ok(c.cost >= 0 && c.cost <= 2);
-  for (const c of b34) assert.ok(c.cost >= 3 && c.cost <= 4);
-  for (const c of b56) assert.ok(c.cost >= 5 && c.cost <= 6);
-  for (const c of b7p) assert.ok(c.cost >= 7);
+  let totalMatchedAcrossBuckets = 0;
+  for (const bracket of COST_BRACKET_OPTIONS) {
+    if (bracket === 'All') continue;
+    const matched = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: bracket }));
+    assert.ok(matched.length > 0, `Expected real dataset cards for Cost Bracket "${bracket}"`);
+    for (const c of matched) {
+      if (bracket === '10+') {
+        assert.ok(c.cost >= 10, `Card ${c.cardNumber} cost ${c.cost} leaked into 10+`);
+      } else {
+        const expected = Number.parseInt(bracket, 10);
+        assert.equal(
+          c.cost,
+          expected,
+          `Card ${c.cardNumber} cost ${c.cost} leaked into ${bracket}`
+        );
+      }
+    }
+    totalMatchedAcrossBuckets += matched.length;
+  }
 
-  // Deduplicated counts across mutually exclusive brackets equal deduplicated All count
+  // Deduplicated counts across mutually exclusive 0..9 + 10+ equal deduplicated All count
   const dedupedAll = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ costBracket: 'All' }));
-  assert.equal(b02.length + b34.length + b56.length + b7p.length, dedupedAll.length);
+  assert.equal(totalMatchedAcrossBuckets, dedupedAll.length);
+
+  // Uses printed base cost ONLY — ignores reduction symbols, card symbols, levels/BP, and effect text
+  const reducedCard = makeCard({
+    id: 'reduced-cost-5',
+    cardNumber: 'EX-RED-5',
+    cost: 5,
+    reduction: { Red: 3 },
+    symbols: { Red: 2 },
+    levels: [{ level: 1, cores: 1, bp: 3000 }],
+    effects: [{ timing: 'Main', text: 'Treat this card as Cost 2 while in hand.' }],
+  });
+  assert.equal(matchesCostBracket(reducedCard, '5'), true);
+  assert.equal(matchesCostBracket(reducedCard, '2'), false, 'Must NOT match reduced cost (5 - 3 = 2)');
+  assert.equal(matchesCostBracket(reducedCard, '3'), false, 'Must NOT match reduction count (3)');
+  assert.equal(matchesCostBracket(reducedCard, '1'), false, 'Must NOT match level/core count');
+
+  // Cost 10+ includes 10, 11, 12, 13+ and excludes 9
+  const cost9 = makeCard({ id: 'c9', cost: 9 });
+  const cost10 = makeCard({ id: 'c10', cost: 10 });
+  const cost12 = makeCard({ id: 'c12', cost: 12 });
+  assert.equal(matchesCostBracket(cost9, '9'), true);
+  assert.equal(matchesCostBracket(cost9, '10+'), false);
+  assert.equal(matchesCostBracket(cost10, '10+'), true);
+  assert.equal(matchesCostBracket(cost12, '10+'), true);
+  assert.equal(matchesCostBracket(cost10, '9'), false);
 
   // Malformed costs must NEVER leak into any specific bracket
-  const malformedCosts: unknown[] = [undefined, null, '', '   ', Number.NaN, 'X', '-', 'abc', -1];
+  const malformedCosts: unknown[] = [undefined, null, '', '   ', Number.NaN, 'X', '-', 'abc', -1, 4.5];
   for (const badCost of malformedCosts) {
     assert.equal(normalizeCardCost(badCost), null);
     const badCard = makeCard({ cost: badCost as unknown as number });
     assert.equal(matchesCostBracket(badCard, 'All'), true);
-    assert.equal(matchesCostBracket(badCard, '0-2'), false, `Cost ${String(badCost)} leaked into 0-2`);
-    assert.equal(matchesCostBracket(badCard, '3-4'), false, `Cost ${String(badCost)} leaked into 3-4`);
-    assert.equal(matchesCostBracket(badCard, '5-6'), false, `Cost ${String(badCost)} leaked into 5-6`);
-    assert.equal(matchesCostBracket(badCard, '7+'), false, `Cost ${String(badCost)} leaked into 7+`);
+    for (const bracket of COST_BRACKET_OPTIONS) {
+      if (bracket === 'All') continue;
+      assert.equal(
+        matchesCostBracket(badCard, bracket),
+        false,
+        `Malformed cost ${String(badCost)} leaked into "${bracket}"`
+      );
+    }
   }
 
   // Numeric string cost parses cleanly
   const strCostCard = makeCard({ cost: '4' as unknown as number });
-  assert.equal(matchesCostBracket(strCostCard, '3-4'), true);
-  assert.equal(matchesCostBracket(strCostCard, '0-2'), false);
+  assert.equal(matchesCostBracket(strCostCard, '4'), true);
+  assert.equal(matchesCostBracket(strCostCard, '3'), false);
 });
 
 test('Combined AND logic filters across Format, Color, Type, Family, Cost Bracket, Search, and Set simultaneously', () => {
@@ -299,7 +354,7 @@ test('Combined AND logic filters across Format, Color, Type, Family, Cost Bracke
     setLookupByCode: indexedDirectory.byCode,
   };
 
-  // Multi-condition query: Red + Spirit + Terra Dragon + Cost 3-4 + Eternal
+  // Multi-condition query: Red + Spirit + Terra Dragon + Cost 4 + Eternal
   const multi = filterCatalogCards(
     combinedInput,
     makeFilters({
@@ -307,27 +362,27 @@ test('Combined AND logic filters across Format, Color, Type, Family, Cost Bracke
       color: 'Red',
       type: ['Spirit'],
       family: 'Terra Dragon',
-      costBracket: '3-4',
+      costBracket: '4',
     }),
     context
   );
-  assert.ok(multi.length > 0, 'Expected matches for Red + Spirit + Terra Dragon + Cost 3-4 + Eternal');
+  assert.ok(multi.length > 0, 'Expected matches for Red + Spirit + Terra Dragon + Cost 4 + Eternal');
   for (const c of multi) {
     assert.ok(normalizeCardColors(c).includes('Red'));
     assert.ok(normalizeCardTypes(c).includes('Spirit'));
     assert.ok(normalizeCardFamilies(c.families).includes('Terra Dragon'));
-    assert.ok(c.cost >= 3 && c.cost <= 4);
+    assert.equal(c.cost, 4);
     assert.ok(!c.formats.includes('Standard') && c.formats.includes('Eternal'));
   }
 
-  // Conflicting combination -> strictly empty result (e.g. Purple + Terra Dragon + 0-2 if contradictory or specific non-matching query)
+  // Conflicting combination -> strictly empty result
   const impossible = filterCatalogCards(
     combinedInput,
     makeFilters({
       color: 'Purple',
       type: ['Magic'],
       family: 'Terra Dragon',
-      costBracket: '7+',
+      costBracket: '10+',
       search: 'ImpossibleCardNameXYZ999',
     }),
     context
@@ -341,7 +396,7 @@ test('Combined AND logic filters across Format, Color, Type, Family, Cost Bracke
       setCode: 'BS01',
       color: 'Red',
       type: ['Spirit'],
-      costBracket: '5-6',
+      costBracket: '5',
     }),
     context
   );
@@ -350,7 +405,7 @@ test('Combined AND logic filters across Format, Color, Type, Family, Cost Bracke
     assert.equal(c.setCode.toUpperCase(), 'BS01');
     assert.ok(normalizeCardColors(c).includes('Red'));
     assert.ok(normalizeCardTypes(c).includes('Spirit'));
-    assert.ok(c.cost >= 5 && c.cost <= 6);
+    assert.equal(c.cost, 5);
   }
 });
 
@@ -388,4 +443,84 @@ test('normalizeCardForCatalog and Wiki hydration normalize imported color, type,
   assert.equal(clientNorm.secondaryColor, 'Blue');
   assert.deepEqual(clientNorm.families, ['Dragon', 'Terra Dragon']);
   assert.equal(clientNorm.cost, 5);
+});
+
+test('filterCatalogCards normalizes multi-color & multi-type arrays and rejects false-positive matches under strict AND logic', () => {
+  const dualMultiCard = makeCard({
+    id: 'dual-1',
+    cardNumber: 'EX-001',
+    name: 'Crimson Azure Twin',
+    color: 'red / blue' as unknown as CardColor,
+    colors: ['赤', '青'] as unknown as CardColor[],
+    type: 'Spirit / Brave' as unknown as CardType,
+    subtypeLabel: 'Contract Spirit (Revival)',
+    families: ['Terra Dragon, Astral Dragon'],
+    cost: 6,
+  });
+
+  const monoSpiritWrongColor = makeCard({
+    id: 'mono-purple',
+    cardNumber: 'EX-002',
+    name: 'Shadow Spirit',
+    color: 'Purple',
+    type: 'Spirit',
+    families: ['Terra Dragon'],
+    cost: 6,
+  });
+
+  const rightColorWrongCost = makeCard({
+    id: 'wrong-cost',
+    cardNumber: 'EX-003',
+    name: 'Baby Red Dragon',
+    color: 'Red',
+    type: 'Spirit',
+    families: ['Terra Dragon'],
+    cost: 2,
+  });
+
+  const fractionalInvalidCost = makeCard({
+    id: 'frac-cost',
+    cardNumber: 'EX-004',
+    name: 'Glitch Dragon',
+    color: 'Red',
+    type: 'Spirit',
+    families: ['Terra Dragon'],
+    cost: 5.5,
+  });
+
+  const pool = [dualMultiCard, monoSpiritWrongColor, rightColorWrongCost, fractionalInvalidCost];
+
+  // Strict AND: Color=Blue + Type=['Brave'] + Family='Astral Dragon' + Cost='6' -> ONLY dualMultiCard
+  const strictMatches = filterCatalogCards(
+    pool,
+    makeFilters({
+      color: 'blue' as unknown as FilterState['color'],
+      type: ['brave' as unknown as CardType],
+      family: 'astral dragon',
+      costBracket: '6',
+    })
+  );
+  assert.deepEqual(
+    strictMatches.map((c) => c.id),
+    ['dual-1']
+  );
+
+  // Array color & invalid filter inputs never false-positive
+  assert.equal(matchesColorFilter(dualMultiCard, ['Purple', 'Green']), false);
+  assert.equal(matchesColorFilter(dualMultiCard, ['InvalidColor' as unknown as CardColor]), false);
+  assert.equal(matchesColorFilter(dualMultiCard, ['Multicolor', 'Blue']), true);
+  assert.equal(matchesColorFilter(dualMultiCard, ['Multicolor', 'Purple']), false);
+
+  // Requested type array normalization (lowercase & Japanese) without false positives
+  assert.equal(matchesTypeFilter(dualMultiCard, ['ブレイヴ' as unknown as CardType]), true);
+  assert.equal(matchesTypeFilter(dualMultiCard, ['nexus', 'magic'] as unknown as CardType[]), false);
+  assert.equal(matchesTypeFilter(dualMultiCard, ['UnknownType' as unknown as CardType]), false);
+
+  // Invalid/sentinel family & cost bracket strings never false-positive
+  assert.equal(matchesFamilyFilter(dualMultiCard, '-'), false);
+  assert.equal(matchesCostBracket(fractionalInvalidCost, '5'), false);
+  assert.equal(
+    matchesCostBracket(dualMultiCard, 'bad-bracket' as unknown as FilterState['costBracket']),
+    false
+  );
 });

@@ -45,15 +45,15 @@ import { CatalogMenuView } from './components/CatalogMenuView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { OfflineIndicator } from './components/PWAControls';
 import { auth, signInWithGoogle, signOutGoogle } from './firebase';
-import type { PublicBuilderProfile } from './types/social';
 import {
   deleteCloudDeck,
   deleteCloudFolder,
-  fetchPublicProfiles,
   fetchUserCloudLibrary,
+  isCloudWriteCooldownActive,
+  isFirestoreQuotaError,
+  markCloudQuotaExhausted,
   syncAllDecksAndFoldersToCloud,
   syncUserAccountsOnSignIn,
-  updatePublicProfileBio,
 } from './utils/cloudSync';
 import { getMaxCardCopies, isTokenCard } from './utils/cardRules';
 import { decodeSharedDeck, SharedDeckPayload } from './utils/deckShare';
@@ -70,11 +70,25 @@ import {
 } from './utils/offlineCardStore';
 import { buildWikiImageUrl } from './utils/wikiImageClient';
 import {
+  evaluateCardCompleteness,
+  isPlaceholderArtworkUrl,
+  sanitizeEffectsArray,
+} from './utils/cardCompletion';
+import {
   getManualWikiMapping,
   resolveManualMappingArtworkUrl,
 } from './utils/ManualWikiMapping';
 import { useWikiImagePrefetch } from './hooks/useWikiImagePrefetch';
 import { useAdmin } from './hooks/useAdmin';
+import {
+  DEFAULT_FEATURED_MODE,
+  FeaturedCardsMode,
+} from './utils/featuredCards';
+import {
+  readCachedSharedFeaturedConfig,
+  subscribeToSharedFeaturedConfig,
+  updateSharedFeaturedMode,
+} from './utils/featuredConfigSync';
 import {
   loadFastCachedSets,
   normalizeSetIdentifier,
@@ -84,6 +98,7 @@ import {
 } from './utils/setMetadataSync';
 import { fetchPublishedCatalogAdditions } from './utils/catalogCloudSync';
 import {
+  COST_BRACKET_OPTIONS,
   extractAvailableFamilies,
   filterCatalogCards,
   getCardNumberPrefix,
@@ -143,7 +158,7 @@ const VALID_RARITIES: CardRarity[] = [
   'XV',
   'P',
 ];
-const VALID_COSTS: FilterState['costBracket'][] = ['All', '0-2', '3-4', '5-6', '7+'];
+const VALID_COSTS: readonly FilterState['costBracket'][] = COST_BRACKET_OPTIONS;
 const VALID_SORTS: SortOption[] = [
   'number',
   'newest',
@@ -511,6 +526,25 @@ export function mergeCardsIntoMap(
     const secondaryCost = secondary ? normalizeCardCost(secondary.cost) : null;
     const finalCost = primaryCost !== null ? primaryCost : secondaryCost !== null ? secondaryCost : Number.NaN;
 
+    const primaryCleanEffects = sanitizeEffectsArray(primary.effects);
+    const secondaryCleanEffects = secondary ? sanitizeEffectsArray(secondary.effects) : [];
+    const mergedEffects =
+      primaryCleanEffects.length > 0 ? primaryCleanEffects : secondaryCleanEffects;
+
+    const primaryArtUsable =
+      Boolean(primary.artworkImage?.trim()) &&
+      !isPlaceholderArtworkUrl(primary.artworkImage) &&
+      primary.artworkStatus !== 'broken';
+    const secondaryArtUsable =
+      Boolean(secondary?.artworkImage?.trim()) &&
+      !isPlaceholderArtworkUrl(secondary?.artworkImage) &&
+      secondary?.artworkStatus !== 'broken';
+    const preferredRawArtwork = primaryArtUsable
+      ? primary.artworkImage
+      : secondaryArtUsable
+      ? secondary?.artworkImage || ''
+      : primary.artworkImage || secondary?.artworkImage || '';
+
     const merged: BattleSpiritsCard = {
       ...(secondary || {}),
       ...primary,
@@ -548,7 +582,7 @@ export function mergeCardsIntoMap(
         primary.reduction && Object.keys(primary.reduction).length > 0
           ? primary.reduction
           : secondary?.reduction || {},
-      effects: primary.effects && primary.effects.length > 0 ? primary.effects : secondary?.effects || [],
+      effects: mergedEffects,
       keywords: primary.keywords && primary.keywords.length > 0 ? primary.keywords : secondary?.keywords || [],
       flavorText: primary.flavorText || secondary?.flavorText || '',
       illustrator: primary.illustrator || secondary?.illustrator || '',
@@ -560,6 +594,25 @@ export function mergeCardsIntoMap(
       rulings: primary.rulings && primary.rulings.length > 0 ? primary.rulings : secondary?.rulings || [],
       wikiTitle: primary.wikiTitle || secondary?.wikiTitle,
       isWikiLoaded: Boolean(primary.isWikiLoaded || secondary?.isWikiLoaded),
+      artworkVerified: Boolean(primary.artworkVerified || secondary?.artworkVerified),
+      artworkStatus: primaryArtUsable
+        ? primary.artworkStatus
+        : secondaryArtUsable
+        ? secondary?.artworkStatus
+        : primary.artworkStatus ?? secondary?.artworkStatus,
+      effectStatus:
+        mergedEffects.length > 0
+          ? 'verified'
+          : primary.effectStatus === 'no_printed_effect' ||
+            secondary?.effectStatus === 'no_printed_effect'
+          ? 'no_printed_effect'
+          : primary.effectStatus ?? secondary?.effectStatus,
+      effectVerified:
+        mergedEffects.length > 0 ||
+        primary.effectStatus === 'no_printed_effect' ||
+        secondary?.effectStatus === 'no_printed_effect',
+      createdAt: primary.createdAt ?? secondary?.createdAt,
+      importedAt: primary.importedAt ?? secondary?.importedAt,
     };
 
     const manualMapping = getManualWikiMapping(merged);
@@ -572,6 +625,8 @@ export function mergeCardsIntoMap(
         merged.wikiTitle = manualMapping.wikiTitle;
       }
       merged.artworkImage = manualArtworkUrl;
+      merged.artworkVerified = true;
+      merged.artworkStatus = 'verified';
       if (merged.galleryImages && merged.galleryImages.length > 0) {
         const mappedRest = merged.galleryImages
           .map((g) => ({
@@ -588,10 +643,9 @@ export function mergeCardsIntoMap(
         ];
       }
     } else {
-      merged.artworkImage = buildWikiImageUrl(
-        merged,
-        primary.artworkImage || secondary?.artworkImage || ''
-      );
+      merged.artworkImage = preferredRawArtwork
+        ? buildWikiImageUrl(merged, preferredRawArtwork)
+        : '';
       if (merged.galleryImages && merged.galleryImages.length > 0) {
         merged.galleryImages = merged.galleryImages.map((g) => ({
           ...g,
@@ -599,6 +653,20 @@ export function mergeCardsIntoMap(
         }));
       }
     }
+
+    const evaluatedComp = evaluateCardCompleteness(merged, {
+      hasNoPrintedEffectCategory: merged.effectStatus === 'no_printed_effect',
+    });
+    merged.artworkVerified = evaluatedComp.artworkVerified;
+    merged.artworkStatus = evaluatedComp.artworkStatus;
+    merged.effectVerified = evaluatedComp.effectVerified;
+    merged.effectStatus = evaluatedComp.effectStatus;
+    merged.metadataVerified = evaluatedComp.metadataVerified;
+    merged.metadataStatus = evaluatedComp.metadataStatus;
+    merged.completionStatus = evaluatedComp.completionStatus;
+    merged.unavailableFields = evaluatedComp.unavailableFields;
+    merged.failedFields = evaluatedComp.failedFields;
+    merged.needsManualReview = evaluatedComp.needsManualReview;
 
     if (options?.banList) {
       merged.restriction = resolveBanRestriction(merged, options.banList);
@@ -642,12 +710,31 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const { isAdmin, loading: adminLoading } = useAdmin(currentUser, authReady);
+  const [sharedFeaturedMode, setSharedFeaturedMode] = useState<FeaturedCardsMode>(
+    () => readCachedSharedFeaturedConfig().mode ?? DEFAULT_FEATURED_MODE
+  );
   const [signingIn, setSigningIn] = useState(false);
   const [cloudSyncing, setCloudSyncing] = useState(false);
-  const [liveProfilesByUid, setLiveProfilesByUid] = useState<Record<string, PublicBuilderProfile>>({});
   const cloudHydratedUidRef = useRef<string | null>(null);
+  const lastSyncedLibrarySignatureRef = useRef<string>('');
   const decksRef = useRef<Deck[]>([]);
   const foldersRef = useRef<DeckFolder[]>([]);
+
+  const buildLibrarySyncSignature = useCallback((foldersList: DeckFolder[], decksList: Deck[]) => {
+    return JSON.stringify({
+      f: foldersList.map((f) => [f.id, f.name, f.color || '', f.createdAt || '']),
+      d: decksList.map((d) => [
+        d.id,
+        d.name,
+        d.format,
+        d.archetype || '',
+        d.folderId || '',
+        d.category || '',
+        d.updatedAt || '',
+        d.entries.map((e) => [e.cardId, e.quantity]),
+      ]),
+    });
+  }, []);
 
   const [cardsMap, setCardsMap] = useState<Record<string, BattleSpiritsCard>>(() => {
     const { next: initial } = mergeCardsIntoMap({}, BATTLE_SPIRITS_CARDS);
@@ -871,6 +958,16 @@ export default function App() {
 
       if (!user) {
         cloudHydratedUidRef.current = null;
+        lastSyncedLibrarySignatureRef.current = '';
+        return;
+      }
+
+      if (isCloudWriteCooldownActive()) {
+        lastSyncedLibrarySignatureRef.current = buildLibrarySyncSignature(
+          foldersRef.current,
+          decksRef.current
+        );
+        cloudHydratedUidRef.current = user.uid;
         return;
       }
 
@@ -900,37 +997,61 @@ export default function App() {
         }
 
         if (localUnsavedDecks.length > 0 || localUnsavedFolders.length > 0) {
-          await syncAllDecksAndFoldersToCloud(user.uid, mergedFolders, mergedDecks);
+          await syncAllDecksAndFoldersToCloud(user.uid, localUnsavedFolders, localUnsavedDecks);
         }
 
+        lastSyncedLibrarySignatureRef.current = buildLibrarySyncSignature(
+          mergedFolders.length > 0 ? mergedFolders : foldersRef.current,
+          mergedDecks.length > 0 ? mergedDecks : decksRef.current
+        );
         cloudHydratedUidRef.current = user.uid;
-
-        const profs = await fetchPublicProfiles().catch(() => ({}));
-        if (Object.keys(profs).length > 0) {
-          setLiveProfilesByUid((prev) => ({ ...prev, ...profs }));
-        }
       } catch (err) {
-        console.warn('Cloud library sync warning:', err);
+        if (isFirestoreQuotaError(err)) {
+          markCloudQuotaExhausted();
+          lastSyncedLibrarySignatureRef.current = buildLibrarySyncSignature(
+            foldersRef.current,
+            decksRef.current
+          );
+          cloudHydratedUidRef.current = user.uid;
+          showToast('Firestore daily free-tier quota limit reached — decks remain available locally');
+        } else {
+          console.warn('Cloud library sync warning:', err);
+        }
       } finally {
         setCloudSyncing(false);
       }
     });
 
     return () => unsub();
-  }, []);
+  }, [buildLibrarySyncSignature]);
 
   // Debounced auto-save decks & folders to Firestore whenever signed-in user edits
   useEffect(() => {
     if (!currentUser || cloudHydratedUidRef.current !== currentUser.uid) return;
+    if (isCloudWriteCooldownActive()) return;
+    const currentSignature = buildLibrarySyncSignature(deckFolders, decks);
+    if (currentSignature === lastSyncedLibrarySignatureRef.current) return;
+
     const uid = currentUser.uid;
     const timer = window.setTimeout(() => {
+      if (isCloudWriteCooldownActive()) return;
       setCloudSyncing(true);
       syncAllDecksAndFoldersToCloud(uid, deckFolders, decks)
-        .catch((err) => console.warn('Cloud auto-save error:', err))
+        .then(() => {
+          lastSyncedLibrarySignatureRef.current = currentSignature;
+        })
+        .catch((err) => {
+          if (isFirestoreQuotaError(err)) {
+            markCloudQuotaExhausted();
+            showToast('Firestore daily free-tier quota limit reached — decks saved locally');
+          } else {
+            console.warn('Cloud auto-save error:', err);
+          }
+        })
         .finally(() => setCloudSyncing(false));
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [currentUser, decks, deckFolders]);
+  }, [currentUser, decks, deckFolders, buildLibrarySyncSignature]);
 
   // Automatically strip any Token cards from saved decks once card metadata is loaded
   useEffect(() => {
@@ -1104,6 +1225,24 @@ export default function App() {
   const showToast = (msg: string) => {
     setToastMsg(msg);
   };
+
+  useEffect(() => {
+    const unsub = subscribeToSharedFeaturedConfig((cfg) => {
+      setSharedFeaturedMode(cfg.mode);
+    });
+    return () => unsub();
+  }, []);
+
+  const handleChangeSharedFeaturedMode = useCallback(
+    async (nextMode: FeaturedCardsMode) => {
+      if (!authReady || adminLoading || !isAdmin || !currentUser) {
+        throw new Error('Only authenticated administrators can change the Featured Cards mode.');
+      }
+      const updated = await updateSharedFeaturedMode(nextMode, currentUser);
+      setSharedFeaturedMode(updated.mode);
+    },
+    [authReady, adminLoading, isAdmin, currentUser]
+  );
 
   useEffect(() => {
     const handleOfflineReady = () => {
@@ -1791,11 +1930,6 @@ export default function App() {
     }
   };
 
-  const openColorInSearch = (color: ColorFilter) => {
-    setFilters((prev) => ({ ...INITIAL_FILTERS, format: prev.format, color }));
-    setActiveTab('search');
-  };
-
   const activeSetMeta = useMemo(() => {
     if (filters.setCode !== 'All') {
       return indexedSetDirectory.byCode.get(filters.setCode.toUpperCase());
@@ -1846,46 +1980,18 @@ export default function App() {
     if (!currentUser || cloudSyncing) return;
     setCloudSyncing(true);
     try {
-      await syncAllDecksAndFoldersToCloud(currentUser.uid, deckFolders, decks);
+      await syncAllDecksAndFoldersToCloud(currentUser.uid, deckFolders, decks, { force: true });
+      lastSyncedLibrarySignatureRef.current = buildLibrarySyncSignature(deckFolders, decks);
       showToast(`Saved ${decks.length} decks to Google Cloud`);
-    } catch {
-      showToast('Cloud sync failed — please retry');
+    } catch (err) {
+      if (isFirestoreQuotaError(err)) {
+        markCloudQuotaExhausted();
+        showToast('Firestore daily free-tier quota limit reached — decks remain saved locally');
+      } else {
+        showToast('Cloud sync failed — please retry');
+      }
     } finally {
       setCloudSyncing(false);
-    }
-  };
-
-  const handleUpdateOwnProfile = async (
-    bio: string,
-    favoriteColor: CardColor
-  ): Promise<boolean> => {
-    if (!currentUser) return false;
-    try {
-      await updatePublicProfileBio(currentUser.uid, bio, favoriteColor);
-      setLiveProfilesByUid((prev) => {
-        const curr = prev[currentUser.uid] || {
-          uid: currentUser.uid,
-          displayName: currentUser.displayName || 'Player',
-          photoURL: currentUser.photoURL || '',
-          bio: '',
-          favoriteColor: 'Red' as CardColor,
-          followersCount: 0,
-          isPublic: true,
-        };
-        return {
-          ...prev,
-          [currentUser.uid]: {
-            ...curr,
-            bio: bio.trim(),
-            favoriteColor,
-          },
-        };
-      });
-      showToast('Updated player profile');
-      return true;
-    } catch {
-      showToast('Could not update profile');
-      return false;
     }
   };
 
@@ -1901,7 +2007,6 @@ export default function App() {
   ];
 
   const centerNavItems = navItems.filter((item) => item.id !== 'settings');
-  const ownProfile = currentUser ? liveProfilesByUid[currentUser.uid] : undefined;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F7F8FA] text-[#111318]">
@@ -1981,9 +2086,15 @@ export default function App() {
             cardsById={cardsMap}
             activeDeckQtyMap={activeDeckQtyMap}
             activeFormat={filters.format}
+            currentUser={currentUser}
+            authReady={authReady}
+            isAdmin={isAdmin}
+            adminLoading={adminLoading}
+            sharedFeaturedMode={sharedFeaturedMode}
+            onChangeSharedFeaturedMode={isAdmin ? handleChangeSharedFeaturedMode : undefined}
+            onNotify={showToast}
             onChangeFormat={handleFormatSwitch}
             onOpenSetInSearch={openSetInSearch}
-            onOpenColorInSearch={openColorInSearch}
             onOpenSearch={openSearchTab}
             onSelectCard={setSelectedCard}
             onAddToDeck={handleQuickAddToDeck}
@@ -2460,12 +2571,9 @@ export default function App() {
               cloudSyncing={cloudSyncing}
               deckCount={decks.length}
               folderCount={deckFolders.length}
-              initialBio={ownProfile?.bio || ''}
-              initialFavoriteColor={ownProfile?.favoriteColor || 'Red'}
               onSignInGoogle={() => void handleGoogleSignIn()}
               onSignOutGoogle={() => void handleGoogleSignOut()}
               onSyncNow={() => void handleManualCloudSync()}
-              onSaveProfile={handleUpdateOwnProfile}
               onCatalogImported={isAdmin && !adminLoading ? applyImportedCatalogAdditions : undefined}
               onNotify={showToast}
             />

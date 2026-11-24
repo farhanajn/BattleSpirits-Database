@@ -10,6 +10,15 @@ import type {
 } from '../src/types/card.ts';
 import { getManualWikiMapping } from '../src/utils/ManualWikiMapping.ts';
 import {
+  evaluateCardCompleteness,
+  extractArtworkFileParam,
+  hasMeaningfulEffects,
+  isLikelyNonCardWikiTitle,
+  isPlaceholderArtworkUrl,
+  sanitizeEffectsArray,
+} from '../src/utils/cardCompletion.ts';
+import { isCardArtworkFile } from './wikiCardLookup.ts';
+import {
   batchFetchWikiPages,
   cleanWikitextInline,
   defaultVariant,
@@ -800,19 +809,22 @@ export function loadCatalogScanState(stateFilePath = DEFAULT_STATE_FILE): Catalo
   };
 }
 
+let inMemoryState: CatalogScanState | null = null;
+let inMemoryStatePath: string | null = null;
+
 export function saveCatalogScanState(
   state: CatalogScanState,
   stateFilePath = DEFAULT_STATE_FILE
 ): void {
   ensureDirForFile(stateFilePath);
   state.updatedAt = new Date().toISOString();
+  if (inMemoryStatePath === stateFilePath) {
+    inMemoryState = state;
+  }
   const tmpPath = `${stateFilePath}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(state), 'utf8');
   fs.renameSync(tmpPath, stateFilePath);
 }
-
-let inMemoryState: CatalogScanState | null = null;
-let inMemoryStatePath: string | null = null;
 
 export function getActiveCatalogState(stateFilePath = DEFAULT_STATE_FILE): CatalogScanState {
   if (!inMemoryState || inMemoryStatePath !== stateFilePath) {
@@ -856,7 +868,11 @@ function getBaselineSpiritsdexCards(deps?: CatalogDependencies): BattleSpiritsCa
   }
   const state = getActiveCatalogState(deps?.stateFilePath);
   for (const c of Object.values(state.importedCards)) {
-    if (c && c.id && !map.has(c.id)) {
+    if (!c || !c.id) continue;
+    const existing = map.get(c.id);
+    if (!existing) {
+      map.set(c.id, c);
+    } else if (c.lastRepairedAt && (!existing.lastRepairedAt || c.lastRepairedAt > existing.lastRepairedAt)) {
       map.set(c.id, c);
     }
   }
@@ -1590,19 +1606,34 @@ export function parseUnusualSetListings(
   return results;
 }
 
-function evaluateIncompleteMetadata(card: BattleSpiritsCard, rawArtHint: string): string[] {
+export function evaluateIncompleteMetadata(card: BattleSpiritsCard, rawArtHint: string): string[] {
   const missing: string[] = [];
   if (!card.jpName?.trim()) missing.push('jpName');
   if (!card.illustrator?.trim()) missing.push('illustrator');
   if (!card.flavorText?.trim()) missing.push('flavorText');
   if (
-    !card.effects?.length ||
-    (card.effects.length === 1 &&
-      card.effects[0]?.text === 'No English effect text listed on this card.')
+    !card.isToken &&
+    card.type !== 'Magic' &&
+    card.type !== 'Nexus' &&
+    (!card.families || card.families.length === 0)
   ) {
+    missing.push('families');
+  }
+  if (!hasMeaningfulEffects(card.effects) && card.effectStatus !== 'no_printed_effect') {
     missing.push('effects');
   }
-  if (!rawArtHint) missing.push('artwork');
+  const hasUsableArt =
+    (Boolean(rawArtHint) && !isPlaceholderArtworkUrl(rawArtHint)) ||
+    (Boolean(card.artworkImage) &&
+      !isPlaceholderArtworkUrl(card.artworkImage) &&
+      card.artworkStatus !== 'broken' &&
+      card.artworkStatus !== 'unavailable');
+  if (!hasUsableArt) {
+    missing.push('artwork');
+  }
+  if (!card.isWikiLoaded) {
+    missing.push('wikiVerification');
+  }
   return missing;
 }
 
@@ -1767,10 +1798,9 @@ export function classifyDiscoveredCard(
     if (!matched.card.illustrator?.trim() && card.illustrator?.trim()) deltas.push('illustrator');
     if (!matched.card.flavorText?.trim() && card.flavorText?.trim()) deltas.push('flavorText');
     if (
-      (!matched.card.effects || matched.card.effects.length === 0) &&
-      card.effects &&
-      card.effects.length > 0 &&
-      card.effects[0]?.text !== 'No English effect text listed on this card.'
+      !hasMeaningfulEffects(matched.card.effects) &&
+      matched.card.effectStatus !== 'no_printed_effect' &&
+      hasMeaningfulEffects(card.effects)
     ) {
       deltas.push('effects');
     }
@@ -2416,17 +2446,34 @@ export async function scanWikiSetByCode(
         };
       }
 
+      if (!rawArtFile && hydrated.artworkImage && !isPlaceholderArtworkUrl(hydrated.artworkImage)) {
+        const artParam = extractArtworkFileParam(hydrated.artworkImage);
+        if (artParam && isCardArtworkFile(artParam)) {
+          rawArtFile = artParam;
+        }
+      }
       if (!rawArtFile && bundle?.pageImages && bundle.pageImages.length > 0) {
-        const usablePageImg = bundle.pageImages.find((f) =>
-          /\.(?:png|jpe?g|webp|gif)$/i.test(f)
-        );
+        const usablePageImg = bundle.pageImages.find((f) => isCardArtworkFile(f));
         if (usablePageImg) rawArtFile = usablePageImg;
       }
       if (!rawArtFile && hydrated.galleryImages && hydrated.galleryImages.length > 0) {
         const gUrl = hydrated.galleryImages[0].url || '';
-        if (/^https?:\/\//i.test(gUrl)) {
+        if (/^https?:\/\//i.test(gUrl) && !isPlaceholderArtworkUrl(gUrl)) {
           rawArtFile = gUrl;
         }
+      }
+
+      if (isLikelyNonCardWikiTitle(hydrated.wikiTitle || hydrated.name)) {
+        hydrated = {
+          ...hydrated,
+          isWikiLoaded: false,
+          ...evaluateCardCompleteness(hydrated, { isNonCardPage: true }),
+        };
+      } else if (!hydrated.completionStatus) {
+        hydrated = {
+          ...hydrated,
+          ...evaluateCardCompleteness(hydrated, { wikitextEmpty: !bundle?.wikitext }),
+        };
       }
 
       const incompleteFields = evaluateIncompleteMetadata(hydrated, rawArtFile);
@@ -2802,6 +2849,18 @@ export function validateCatalogImport(
         );
       }
 
+      if (
+        entry.card.needsManualReview ||
+        isLikelyNonCardWikiTitle(entry.sourceWikiTitle || entry.card.wikiTitle || entry.card.name)
+      ) {
+        return buildRejection(
+          `Non-card Wiki article "${entry.sourceWikiTitle || entry.card.name}" requires manual review`,
+          'invalid_or_unsafe',
+          false,
+          'Exclude non-card Wiki navigation/article titles from catalog imports.'
+        );
+      }
+
       if (entry.card.name.trim().length > 160) {
         return buildRejection(
           'Card name exceeds maximum allowed length (160 chars)',
@@ -2919,21 +2978,40 @@ export function executeCatalogImport(
         });
         continue;
       }
-      const enriched: BattleSpiritsCard = {
+      const cleanExistingEffects = sanitizeEffectsArray(targetExisting.effects);
+      const cleanIncomingEffects = sanitizeEffectsArray(entry.card.effects);
+      const existingArtUsable =
+        Boolean(targetExisting.artworkImage?.trim()) &&
+        !isPlaceholderArtworkUrl(targetExisting.artworkImage) &&
+        targetExisting.artworkStatus !== 'broken';
+      const nextArt = manual
+        ? targetExisting.artworkImage
+        : existingArtUsable
+        ? targetExisting.artworkImage
+        : entry.card.artworkImage || targetExisting.artworkImage || '';
+      const enrichedBase: BattleSpiritsCard = {
         ...targetExisting,
         jpName: targetExisting.jpName || entry.card.jpName || '',
         illustrator: targetExisting.illustrator || entry.card.illustrator || '',
         flavorText: targetExisting.flavorText || entry.card.flavorText || '',
         families:
           targetExisting.families?.length > 0 ? targetExisting.families : entry.card.families || [],
-        effects:
-          targetExisting.effects?.length > 0 ? targetExisting.effects : entry.card.effects || [],
+        effects: cleanExistingEffects.length > 0 ? cleanExistingEffects : cleanIncomingEffects,
         cost: targetExisting.cost > 0 ? targetExisting.cost : entry.card.cost ?? 0,
         // Always preserve manual mapping artwork or existing verified artwork
-        artworkImage: manual
-          ? targetExisting.artworkImage
-          : targetExisting.artworkImage || entry.card.artworkImage,
+        artworkImage: nextArt,
         wikiTitle: manual?.wikiTitle || targetExisting.wikiTitle || entry.card.wikiTitle,
+        isWikiLoaded: Boolean(targetExisting.isWikiLoaded || entry.card.isWikiLoaded),
+        recordSaved: true,
+        lastRepairedAt: nowIso,
+      };
+      const enriched: BattleSpiritsCard = {
+        ...enrichedBase,
+        ...evaluateCardCompleteness(enrichedBase, {
+          hasNoPrintedEffectCategory:
+            targetExisting.effectStatus === 'no_printed_effect' ||
+            entry.card.effectStatus === 'no_printed_effect',
+        }),
       };
       state.importedCards[enriched.id] = enriched;
       existingById.set(enriched.id, enriched);
@@ -2965,13 +3043,23 @@ export function executeCatalogImport(
         });
         continue;
       }
-      const finalCard: BattleSpiritsCard = {
+      const cleanedEffects = sanitizeEffectsArray(entry.card.effects);
+      const finalBase: BattleSpiritsCard = {
         ...entry.card,
+        effects: cleanedEffects,
         id: candidateId,
         name: (entry.card.name || entry.card.jpName || entry.card.cardNumber).trim().slice(0, 160),
         setCode: normalizeSetCode(entry.card.setCode || entry.sourceSetCode) || entry.sourceSetCode,
         rarity: (entry.card.rarity || 'C').slice(0, 16) as BattleSpiritsCard['rarity'],
         wikiTitle: manual?.wikiTitle || entry.card.wikiTitle,
+        importedAt: entry.importedAt || nowIso,
+        recordSaved: true,
+      };
+      const finalCard: BattleSpiritsCard = {
+        ...finalBase,
+        ...evaluateCardCompleteness(finalBase, {
+          hasNoPrintedEffectCategory: entry.card.effectStatus === 'no_printed_effect',
+        }),
       };
       state.importedCards[finalCard.id] = finalCard;
       existingById.set(finalCard.id, finalCard);
@@ -3466,6 +3554,21 @@ export function getImportedCatalogPayload(deps?: CatalogDependencies): {
 } {
   const state = getActiveCatalogState(deps?.stateFilePath);
   const sets = Object.values(state.sets).filter((s) => s.inSpiritsdex);
-  const cards = Object.values(state.importedCards);
+  const discoveredByKey = new Map<string, string>();
+  for (const d of Object.values(state.discoveredCards || {})) {
+    if (d.imported && d.importedAt) {
+      if (d.card?.id) discoveredByKey.set(`id:${d.card.id}`, d.importedAt);
+      if (d.card?.cardNumber) {
+        discoveredByKey.set(`num:${String(d.card.cardNumber).trim().toUpperCase()}`, d.importedAt);
+      }
+    }
+  }
+  const cards = Object.values(state.importedCards).map((card) => {
+    if (card.importedAt || card.createdAt) return card;
+    const discoveredTs =
+      discoveredByKey.get(`id:${card.id}`) ||
+      discoveredByKey.get(`num:${String(card.cardNumber || '').trim().toUpperCase()}`);
+    return discoveredTs ? { ...card, importedAt: discoveredTs } : card;
+  });
   return { cards, sets };
 }

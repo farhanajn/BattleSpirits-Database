@@ -604,6 +604,19 @@
         "role": { "type": "string", "enum": ["admin"], "maxLength": 16 }
       },
       "required": ["uid", "role"]
+    },
+    "FeaturedCardsConfig": {
+      "title": "FeaturedCardsConfig",
+      "description": "Global shared configuration for Featured Cards display mode ('random' or 'latest') managed exclusively by administrators.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "mode": { "type": "string", "enum": ["random", "latest"], "maxLength": 16 },
+        "updatedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "mode", "updatedByUid", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -654,6 +667,10 @@
     "/artworkValidations/{mappingKey}": {
       "schema": { "$ref": "#/entities/ArtworkValidationRecord" },
       "description": "Admin-only periodic validation records for manual artwork mappings."
+    },
+    "/appConfig/{configId}": {
+      "schema": { "$ref": "#/entities/FeaturedCardsConfig" },
+      "description": "Global application configuration documents (such as featuredCards mode) publicly readable via get and writable only by administrators."
     },
     "/admins/{userId}": {
       "schema": { "$ref": "#/entities/AdminRoleRecord" },
