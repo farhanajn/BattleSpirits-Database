@@ -16,6 +16,10 @@ import {
   normalizeSetIdentifier,
   type IndexedSetDirectory,
 } from './setMetadataSync';
+import {
+  evaluateCardSearchMatch,
+  type CardSearchEvaluation,
+} from './cardSearch';
 
 export const COST_BRACKET_OPTIONS: readonly CostBracketFilter[] = [
   'All',
@@ -527,6 +531,9 @@ export function resolveSearchSetIntent(
     }
   }
 
+const CANONICAL_SET_CODE_RE =
+  /^(?:26R(?:BS|SD|CB|EB|DB)\d{1,2}|(?:BS|SD|CBX|CB|BSC|PB|PC)\d{1,3}|RP26(?:-STD)?|PX26(?:-STD)?|RPX26)$/i;
+
   const stripped = q.replace(/^set\s+/i, '').trim();
   const compact = stripped.replace(/[\s-]+/g, '').toUpperCase();
   const shortCodeMatch = compact.match(/^(BS|SD|CB|BSC|PB|PC|RP|PX)(\d{1})$/);
@@ -534,8 +541,8 @@ export function resolveSearchSetIntent(
     ? `${shortCodeMatch[1]}0${shortCodeMatch[2]}`
     : compact;
 
-  if (knownSetCodes.has(candidate)) {
-    return { exactSetCode: candidate };
+  if (knownSetCodes.has(candidate) || CANONICAL_SET_CODE_RE.test(candidate)) {
+    return { exactSetCode: normalizeSetIdentifier(candidate) || candidate };
   }
   return null;
 }
@@ -556,6 +563,10 @@ export interface CatalogFilterContext {
   indexedSetDirectory?: IndexedSetDirectory;
   setLookupByCode?: Map<string, ProductSet>;
   releaseRankBySetCode?: Map<string, number>;
+  /** When true and filters.sortBy is 'number' during a text search, strictly sort by Set & Number instead of Relevance. */
+  preserveRequestedSort?: boolean;
+  precomputedSearchSetIntent?: SearchSetIntent | null;
+  precomputedSetQIntent?: SearchSetIntent | null;
 }
 
 function matchesSetIntent(card: BattleSpiritsCard, intent: SearchSetIntent): boolean {
@@ -583,45 +594,57 @@ function matchesSetIntent(card: BattleSpiritsCard, intent: SearchSetIntent): boo
   return false;
 }
 
-export function cardMatchesFilters(
+function evaluateCardFiltersAndSearch(
   card: BattleSpiritsCard,
   filters: FilterState,
   context: CatalogFilterContext = {}
-): boolean {
-  if (normalizeSetIdentifier(card.setCode || '') === 'BSS01') return false;
+): { matched: boolean; searchEval: CardSearchEvaluation } {
+  const emptyEval: CardSearchEvaluation = { matched: false, score: 0 };
+  if (normalizeSetIdentifier(card.setCode || '') === 'BSS01') {
+    return { matched: false, searchEval: emptyEval };
+  }
 
   const formatMatches = matchesFormatFilter(
     Array.isArray(card.formats) ? card.formats : ['Eternal'],
     filters.format
   );
-  if (!formatMatches) return false;
+  if (!formatMatches) return { matched: false, searchEval: emptyEval };
 
-  if (filters.version === 'Original' && card.isRevival) return false;
-  if (filters.version === 'Revival' && !card.isRevival) return false;
+  if (filters.version === 'Original' && card.isRevival) {
+    return { matched: false, searchEval: emptyEval };
+  }
+  if (filters.version === 'Revival' && !card.isRevival) {
+    return { matched: false, searchEval: emptyEval };
+  }
 
   if (filters.setCode !== 'All') {
     const targetSetNorm = normalizeSetIdentifier(filters.setCode);
     if (targetSetNorm === 'TOKENS') {
-      if (!card.isToken) return false;
+      if (!card.isToken) return { matched: false, searchEval: emptyEval };
     } else if (targetSetNorm === 'REVIVAL') {
-      if (!card.isRevival) return false;
+      if (!card.isRevival) return { matched: false, searchEval: emptyEval };
     } else if (normalizeSetIdentifier(card.setCode) !== targetSetNorm) {
-      return false;
+      return { matched: false, searchEval: emptyEval };
     }
   }
 
   const knownSetCodes = context.knownSetCodes || new Set<string>(['TOKENS', 'REVIVAL']);
   const numericSetCodes = context.indexedSetDirectory?.numericSetCodes;
   const setLookup = context.setLookupByCode || context.indexedSetDirectory?.byCode;
+  const matchedSet = setLookup?.get((card.setCode || '').toUpperCase());
 
-  const setQ = filters.setQuery.trim().toLowerCase();
+  const setQ = (filters.setQuery || '').trim().toLowerCase();
   if (setQ) {
     const setQCompact = setQ.replace(/[\s-]+/g, '');
-    const setQIntent = resolveSearchSetIntent(setQ, knownSetCodes, numericSetCodes);
+    const setQIntent =
+      context.precomputedSetQIntent !== undefined
+        ? context.precomputedSetQIntent
+        : resolveSearchSetIntent(setQ, knownSetCodes, numericSetCodes);
     if (setQIntent) {
-      if (!matchesSetIntent(card, setQIntent)) return false;
+      if (!matchesSetIntent(card, setQIntent)) {
+        return { matched: false, searchEval: emptyEval };
+      }
     } else {
-      const matchedSet = setLookup?.get((card.setCode || '').toUpperCase());
       const indexedMatch =
         matchedSet && context.indexedSetDirectory
           ? matchesIndexedSetQuery(matchedSet, setQ, context.indexedSetDirectory.tokensByCode)
@@ -633,27 +656,8 @@ export function cardMatchesFilters(
         !setHay.includes(setQ) &&
         !(setQCompact.length >= 2 && setHayCompact.includes(setQCompact))
       ) {
-        return false;
+        return { matched: false, searchEval: emptyEval };
       }
-    }
-  }
-
-  const q = filters.search.trim().toLowerCase();
-  if (q) {
-    const searchSetIntent = resolveSearchSetIntent(q, knownSetCodes, numericSetCodes);
-    if (searchSetIntent) {
-      if (!matchesSetIntent(card, searchSetIntent)) return false;
-    } else {
-      const qCompact = q.replace(/[\s-]+/g, '');
-      const qTokens = q.split(/\s+/).filter(Boolean);
-      const normalizedFamilies = normalizeCardFamilies(card.families);
-      const hay = `${card.name || ''} ${card.jpName || ''} ${card.cardNumber || ''} ${card.setCode || ''} ${card.setName || ''} ${card.subtypeLabel || ''} ${card.isToken ? 'token' : ''} ${card.isRevival ? 'revival' : ''} ${normalizedFamilies.join(' ')} ${(card.keywords || []).join(' ')} ${card.braveCondition || ''} ${card.summonCondition || ''} ${(card.effects || []).map((e) => `${e.timing} ${e.text}`).join(' ')}`.toLowerCase();
-      const compactHay = hay.replace(/[\s-]+/g, '');
-      const matchesDirect = hay.includes(q) || (qCompact.length >= 2 && compactHay.includes(qCompact));
-      const matchesTokens =
-        qTokens.length > 1 &&
-        qTokens.every((tok) => hay.includes(tok) || compactHay.includes(tok.replace(/-/g, '')));
-      if (!matchesDirect && !matchesTokens) return false;
     }
   }
 
@@ -671,15 +675,63 @@ export function cardMatchesFilters(
       (k) => k.trim().toLowerCase() === filters.keyword.trim().toLowerCase()
     );
 
-  // Strict AND combination across all active facet filters
-  return (
+  // Strict AND combination across all active facet filters before/alongside text search
+  const facetsMatch =
     matchesColorFilter(card, filters.color) &&
     matchesTypeFilter(card, filters.type) &&
     matchesFamilyFilter(card, filters.family) &&
     matchesCostBracket(card, filters.costBracket) &&
     rarityMatches &&
-    keywordMatches
-  );
+    keywordMatches;
+
+  if (!facetsMatch) {
+    return { matched: false, searchEval: emptyEval };
+  }
+
+  const rawSearch = (filters.search || '').trim();
+  if (!rawSearch) {
+    return { matched: true, searchEval: { matched: true, score: 0 } };
+  }
+
+  const searchSetIntent =
+    context.precomputedSearchSetIntent !== undefined
+      ? context.precomputedSearchSetIntent
+      : resolveSearchSetIntent(rawSearch, knownSetCodes, numericSetCodes);
+  const matchedSetIntent = searchSetIntent ? matchesSetIntent(card, searchSetIntent) : false;
+
+  if (searchSetIntent) {
+    if (!matchedSetIntent) {
+      // Allow literal card-name matches when query wasn't prefixed with "set "
+      if (/^set\s+/i.test(rawSearch)) {
+        return { matched: false, searchEval: emptyEval };
+      }
+    } else {
+      const evalWithSet = evaluateCardSearchMatch(card, rawSearch, {
+        matchedSet,
+        matchedSetIntent: true,
+      });
+      return { matched: true, searchEval: evalWithSet };
+    }
+  }
+
+  const searchEval = evaluateCardSearchMatch(card, rawSearch, {
+    matchedSet,
+    matchedSetIntent: false,
+  });
+
+  if (!searchEval.matched) {
+    return { matched: false, searchEval: emptyEval };
+  }
+
+  return { matched: true, searchEval };
+}
+
+export function cardMatchesFilters(
+  card: BattleSpiritsCard,
+  filters: FilterState,
+  context: CatalogFilterContext = {}
+): boolean {
+  return evaluateCardFiltersAndSearch(card, filters, context).matched;
 }
 
 export function filterCatalogCards(
@@ -687,24 +739,48 @@ export function filterCatalogCards(
   filters: FilterState,
   context: CatalogFilterContext = {}
 ): BattleSpiritsCard[] {
-  const knownSetCodes = context.knownSetCodes || new Set<string>(['TOKENS', 'REVIVAL']);
+  const knownSetCodes = (() => {
+    if (context.knownSetCodes) return context.knownSetCodes;
+    const derived = new Set<string>(['TOKENS', 'REVIVAL']);
+    for (const c of cards) {
+      if (c.setCode) {
+        derived.add(c.setCode.trim().toUpperCase());
+        const norm = normalizeSetIdentifier(c.setCode);
+        if (norm) derived.add(norm);
+      }
+    }
+    return derived;
+  })();
+
   const numericSetCodes = context.indexedSetDirectory?.numericSetCodes;
-  const q = filters.search.trim().toLowerCase();
-  const setQ = filters.setQuery.trim().toLowerCase();
+  const q = (filters.search || '').trim().toLowerCase();
+  const setQ = (filters.setQuery || '').trim().toLowerCase();
   const searchSetIntent = q ? resolveSearchSetIntent(q, knownSetCodes, numericSetCodes) : null;
   const setQIntent = setQ ? resolveSearchSetIntent(setQ, knownSetCodes, numericSetCodes) : null;
 
-  const matched = cards.filter((card) => cardMatchesFilters(card, filters, context));
+  const effectiveContext: CatalogFilterContext = {
+    ...context,
+    knownSetCodes,
+    precomputedSearchSetIntent: searchSetIntent,
+    precomputedSetQIntent: setQIntent,
+  };
 
+  const scoredItems: { card: BattleSpiritsCard; score: number }[] = [];
   const seenKeys = new Set<string>();
-  const dedupedList = matched.filter((card) => {
+
+  for (const card of cards) {
+    const res = evaluateCardFiltersAndSearch(card, filters, effectiveContext);
+    if (!res.matched) continue;
+
     const numKey = normalizeCardNumber(card.cardNumber || '');
-    if (!numKey || numKey === 'WIKI') return true;
-    const key = `${numKey}|${card.isRevival ? 'rv' : 'orig'}`;
-    if (seenKeys.has(key)) return false;
-    seenKeys.add(key);
-    return true;
-  });
+    if (numKey && numKey !== 'WIKI') {
+      const key = `${numKey}|${card.isRevival ? 'rv' : 'orig'}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+    }
+
+    scoredItems.push({ card, score: res.searchEval.score });
+  }
 
   const getMaxBp = (c: BattleSpiritsCard) =>
     c.levels && c.levels.length > 0 ? c.levels[c.levels.length - 1].bp : 0;
@@ -736,14 +812,32 @@ export function filterCatalogCards(
     return parsed !== null ? parsed : Number.MAX_SAFE_INTEGER;
   };
 
-  const releaseRankBySetCode = context.releaseRankBySetCode;
+  const releaseRankBySetCode = effectiveContext.releaseRankBySetCode;
+  const useRelevanceRanking =
+    q.length > 0 &&
+    (filters.sortBy === 'relevance' ||
+      (filters.sortBy === 'number' && !effectiveContext.preserveRequestedSort));
 
-  dedupedList.sort((a, b) => {
+  scoredItems.sort((itemA, itemB) => {
+    const a = itemA.card;
+    const b = itemB.card;
+
+    if (useRelevanceRanking) {
+      const scoreDiff = itemB.score - itemA.score;
+      if (scoreDiff !== 0) return scoreDiff;
+      return (
+        (a.isRevival ? 1 : 0) - (b.isRevival ? 1 : 0) ||
+        getNativePriority(a) - getNativePriority(b) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+
     if (filters.sortBy === 'newest') {
       const ra = releaseRankBySetCode?.get((a.setCode || '').toUpperCase()) || 0;
       const rb = releaseRankBySetCode?.get((b.setCode || '').toUpperCase()) || 0;
       return (
         rb - ra ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
         getNativePriority(a) - getNativePriority(b) ||
         a.cardNumber.localeCompare(b.cardNumber)
       );
@@ -751,6 +845,7 @@ export function filterCatalogCards(
     if (filters.sortBy === 'rarity-desc') {
       return (
         (RARITY_RANK[b.rarity] || 0) - (RARITY_RANK[a.rarity] || 0) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
         a.cardNumber.localeCompare(b.cardNumber)
       );
     }
@@ -767,21 +862,35 @@ export function filterCatalogCards(
       );
     }
     if (filters.sortBy === 'cost-asc') {
-      return getComparableCost(a) - getComparableCost(b) || a.cardNumber.localeCompare(b.cardNumber);
+      return (
+        getComparableCost(a) - getComparableCost(b) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
     }
     if (filters.sortBy === 'cost-desc') {
       const ca = normalizeCardCost(a.cost) ?? -1;
       const cb = normalizeCardCost(b.cost) ?? -1;
-      return cb - ca || a.cardNumber.localeCompare(b.cardNumber);
+      return (
+        cb - ca ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
     }
     if (filters.sortBy === 'bp-desc') {
-      return getMaxBp(b) - getMaxBp(a) || a.cardNumber.localeCompare(b.cardNumber);
+      return (
+        getMaxBp(b) - getMaxBp(a) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
     }
     if (filters.sortBy === 'name') {
-      return a.name.localeCompare(b.name);
+      return a.name.localeCompare(b.name) || a.cardNumber.localeCompare(b.cardNumber);
     }
     return getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
   });
 
-  return dedupedList;
+  return scoredItems.map((item) => item.card);
 }
+
+export { evaluateCardSearchMatch, scoreCardSearchMatch } from './cardSearch';

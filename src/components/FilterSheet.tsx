@@ -59,7 +59,7 @@ const FILTER_CATEGORY_METADATA: FilterCategoryMeta[] = [
   },
   { key: 'family', label: 'Card Family', searchTerms: 'card family trait families' },
   { key: 'keyword', label: 'Keyword / Mechanic', searchTerms: 'keyword mechanic ability' },
-  { key: 'sort', label: 'Sort By', searchTerms: 'sort by order newest rarity cost bp name' },
+  { key: 'sort', label: 'Sort By', searchTerms: 'sort by order relevance best match newest rarity cost bp name' },
 ];
 
 interface FilterControlsProps {
@@ -606,6 +606,7 @@ export const FilterControls: React.FC<FilterControlsProps> = ({
             }
             className="w-full min-h-[44px] lg:min-h-[38px] px-3 rounded-xl border border-slate-200 bg-white text-sm lg:text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-600"
           >
+            <option value="relevance">Best Match (Relevance)</option>
             <option value="number">Set &amp; Card Number</option>
             <option value="newest">Newest Release</option>
             <option value="rarity-desc">Highest Rarity</option>

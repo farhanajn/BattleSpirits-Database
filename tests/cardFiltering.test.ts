@@ -201,9 +201,14 @@ test('Card Family filter normalizes comma-separated families and excludes cards 
     'Available dropdown families must never retain unsplit comma-joined strings'
   );
 
-  // Real card BS09-003 has raw families ['Dragon, Terra Dragon']
-  const bs09Dragon = REAL_CATALOG_CARDS.find((c) => c.families.some((f) => f === 'Dragon, Terra Dragon'));
-  assert.ok(bs09Dragon, 'Expected real card with comma-joined "Dragon, Terra Dragon" family');
+  // Real card BS09-003 (repaired from raw ['Dragon, Terra Dragon'] to normalized ['Dragon', 'Terra Dragon'])
+  const bs09Dragon = REAL_CATALOG_CARDS.find((c) => c.cardNumber === 'BS09-003');
+  assert.ok(bs09Dragon, 'Expected real card BS09-003');
+  assert.ok(
+    normalizeCardFamilies(bs09Dragon.families).includes('Dragon') &&
+      normalizeCardFamilies(bs09Dragon.families).includes('Terra Dragon'),
+    'BS09-003 must expose both Dragon and Terra Dragon families'
+  );
 
   const terraResults = filterCatalogCards(
     REAL_CATALOG_CARDS,
@@ -211,13 +216,13 @@ test('Card Family filter normalizes comma-separated families and excludes cards 
   );
   assert.ok(
     terraResults.some((c) => c.cardNumber === bs09Dragon.cardNumber),
-    'Terra Dragon filter must include split comma-joined card'
+    'Terra Dragon filter must include BS09-003'
   );
 
   const dragonResults = filterCatalogCards(REAL_CATALOG_CARDS, makeFilters({ family: 'Dragon' }));
   assert.ok(
     dragonResults.some((c) => c.cardNumber === bs09Dragon.cardNumber),
-    'Dragon filter must include split comma-joined card'
+    'Dragon filter must include BS09-003'
   );
 
   for (const card of terraResults) {

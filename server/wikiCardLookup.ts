@@ -407,9 +407,21 @@ export function extractCardTableMetaFromWikitext(
 
   const kanjiNames = grabFieldValues(/\|\s*(?:kanji|jpname|japanese)\s*=\s*([^\n|}]+)/gi);
   const enNames = grabFieldValues(/\|\s*(?:name|enname|english|title)\s*=\s*([^\n|}]+)/gi);
-  const sets = grabFieldValues(/\|\s*set\d*\s*=\s*([^\n|}]+)/gi).map((s) =>
-    s.toUpperCase()
+  const setSet = new Set<string>(
+    grabFieldValues(/\|\s*set\d*\s*=\s*([^\n|}]+)/gi).map((s) => s.toUpperCase())
   );
+  const releaseLineRegex = /\|\s*released(?:jp|en|it)?\s*=\s*([^\n]+)/gi;
+  const setCodeInLineRegex =
+    /\b((?:26RBS|26RSD|26REB|26RDB|26RCB|BSC|CBX|BS|SD|CB|PB|PC|LM|EX|CP|PX|RP)\d{1,2})\b/gi;
+  let relM: RegExpExecArray | null;
+  while ((relM = releaseLineRegex.exec(wikitext)) !== null) {
+    const line = (relM[1] || '').replace(/<!--[\s\S]*?-->/g, '');
+    let scM: RegExpExecArray | null;
+    while ((scM = setCodeInLineRegex.exec(line)) !== null) {
+      setSet.add(scM[1].toUpperCase());
+    }
+  }
+  const sets = Array.from(setSet);
   const images = grabFieldValues(
     /\|\s*(?:image\d*|bimage|image_?b|imageb|alt(?:image)?\d*)\s*=\s*([^\n|}]+)/gi
   );

@@ -17,6 +17,7 @@ import {
   isLikelyNonCardWikiTitle,
   sanitizeEffectsArray,
 } from '../src/utils/cardCompletion.ts';
+import { scoreCardSearchMatch } from '../src/utils/cardSearch.ts';
 import { WIKI_SET_METADATA } from './setMetadata.ts';
 import {
   findManualCardMapping,
@@ -1279,6 +1280,10 @@ export function cleanWikitextInline(raw: string): string {
       (_m, kind: string, p1: string, p2?: string) =>
         p2 ? `[${kind}: ${p1.trim()} (${p2.trim()})]` : `[${kind}: ${p1.trim()}]`
     )
+    .replace(
+      /\{\{ST\|Legacy(?:\|[^}]*)?\}\}/gi,
+      '[Legacy] (Cost reduction: You can banish an EX Symbol from your Trash to pay cost reduction.)'
+    )
     .replace(/\{\{ST\|([^|}]+)(?:\|[^}]*)?\}\}/gi, '($1)')
     .replace(/\{\{All\}\}/gi, 'All Colors')
     .replace(/\{\{(Red|Purple|White|Yellow|Green|Blue)\}\}/gi, '$1')
@@ -2319,6 +2324,22 @@ export function hydrateCardFromWikitext(
       : '';
   const primaryArtUrl = galleryImages[0]?.url || preservedDirectArt || '';
 
+  // Fix CardTable typos where Magic cards (e.g. BS09-079, BS10-109) have |type=Spirit with empty level/symbols/families and (Main)/(Flash) effects
+  let resolvedType: CardType = type;
+  let resolvedSubtypeLabel = subtypeLabel;
+  let finalResolvedSymbols = resolvedSymbols;
+  if (
+    resolvedType === 'Spirit' &&
+    !rawLevelStr.trim() &&
+    Object.keys(symbols).length === 0 &&
+    families.length === 0 &&
+    /(?:^|\n)\s*(?:\(|\[)(?:Main|Flash)(?:\)|\])/im.test(cleanWikitextInline(rawEffect))
+  ) {
+    resolvedType = 'Magic';
+    resolvedSubtypeLabel = undefined;
+    finalResolvedSymbols = {};
+  }
+
   const restriction = resolveCardRestriction(
     base.cardNumber,
     base.name,
@@ -2331,12 +2352,20 @@ export function hydrateCardFromWikitext(
       ? `${base.name} (Revival)`
       : base.name;
 
+  const jpEffectText = cleanWikitextInline(fields.jpeffect || fields.jp || '').trim();
+  const hasAnyCardTableStats = Boolean(
+    fields.cost?.trim() ||
+      rawLevelStr.trim() ||
+      families.length > 0 ||
+      Object.keys(reductions).length > 0
+  );
   const hasNoPrintedEffectCategory =
     /\[\[Category:No printed effect\]\]/i.test(wikitext) ||
-    /^(?:-|—|–|none)$/i.test(rawEffect.trim());
+    /^(?:-|—|–|none)$/i.test(rawEffect.trim()) ||
+    (!rawEffect.trim() && !jpEffectText && !isToken && hasAnyCardTableStats);
   const hasJpEffectOnly =
     effects.length === 0 &&
-    Boolean(cleanWikitextInline(fields.jpeffect || fields.jp || '').trim()) &&
+    Boolean(jpEffectText) &&
     !hasNoPrintedEffectCategory;
 
   const hydratedDraft: BattleSpiritsCard = {
@@ -2346,13 +2375,13 @@ export function hydrateCardFromWikitext(
     color,
     secondaryColor,
     colors: finalColors,
-    type,
-    subtypeLabel,
+    type: resolvedType,
+    subtypeLabel: resolvedSubtypeLabel,
     isRevival,
     isToken,
     cost,
     reduction: Object.keys(reductions).length > 0 ? reductions : base.reduction,
-    symbols: resolvedSymbols,
+    symbols: finalResolvedSymbols,
     families,
     levels,
     braveBonusBp,
@@ -2364,7 +2393,7 @@ export function hydrateCardFromWikitext(
     illustrator,
     artworkImage: primaryArtUrl,
     galleryImages: galleryImages.length > 0 ? galleryImages : undefined,
-    artVariant: defaultVariant(type, color),
+    artVariant: defaultVariant(resolvedType, color),
     formats,
     blockIcon,
     restriction,
@@ -3492,14 +3521,7 @@ export async function getWikiCardDetail(
   wikiTitle: string,
   fallbackBase?: Partial<BattleSpiritsCard>
 ): Promise<BattleSpiritsCard> {
-  const [, contents] = await Promise.all([
-    ensureBanListLoaded(),
-    batchFetchWikiPages([wikiTitle]),
-  ]);
-  const bundle = contents.get(wikiTitle);
-  const wikitext = bundle?.wikitext || '';
-
-  const base: BattleSpiritsCard = {
+  const seedForManual: BattleSpiritsCard = {
     id: fallbackBase?.id || `wiki-${wikiTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
     cardNumber: fallbackBase?.cardNumber || 'WIKI',
     name: fallbackBase?.name || wikiTitle,
@@ -3530,9 +3552,156 @@ export async function getWikiCardDetail(
     rulings: fallbackBase?.rulings || [],
   };
 
-  if (wikitext) {
-    return hydrateCardFromWikitext(base, wikitext, bundle?.pageImages || []);
+  const manual = findManualCardMapping(seedForManual);
+  const primaryTitle = manual?.wikiTitle || wikiTitle;
+
+  const [, contents] = await Promise.all([
+    ensureBanListLoaded(),
+    batchFetchWikiPages([primaryTitle]),
+  ]);
+
+  let resolvedTitle = primaryTitle;
+  let bundle = contents.get(primaryTitle);
+
+  const isRealCardNumber =
+    Boolean(seedForManual.cardNumber) &&
+    !/^(?:WIKI|REVIVAL|[A-Z0-9]+-(?:WIKI|TOK)-\d+)$/i.test(seedForManual.cardNumber.trim());
+
+  const bundleMatchesPrinting = (title: string, b?: WikiPageBundle): boolean => {
+    if (!b?.wikitext) return false;
+    if (manual) return extractTaggedCardTableBlocks(b.wikitext).length > 0;
+    const scored = scoreWikiCandidatePage(
+      { title, wikitext: b.wikitext, pageImages: b.pageImages || [] },
+      {
+        cardNumber: seedForManual.cardNumber,
+        name: seedForManual.name,
+        jpName: seedForManual.jpName,
+        setCode: seedForManual.setCode,
+        wikiTitle: title,
+        isRevival: seedForManual.isRevival,
+      }
+    );
+    if (!scored.accepted) return false;
+    if (isRealCardNumber && scored.meta.cardNumbersInPage.length > 0) {
+      const compactNum = seedForManual.cardNumber
+        .trim()
+        .toUpperCase()
+        .replace(/\s*\([AB]\)$/i, '')
+        .replace(/[^A-Z0-9]/g, '');
+      const targetSet = (seedForManual.setCode || '').trim().toUpperCase();
+      const pageHasNum =
+        scored.meta.cardNumbersInPage.some(
+          (n) => n.replace(/[^A-Z0-9]/g, '').toUpperCase() === compactNum
+        ) ||
+        b.wikitext.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(compactNum);
+      const pageHasSet = Boolean(
+        targetSet && scored.meta.sets.some((s) => s.toUpperCase() === targetSet)
+      );
+      if (!pageHasNum && !pageHasSet) return false;
+    }
+    return true;
+  };
+
+  if (!manual && !bundleMatchesPrinting(resolvedTitle, bundle)) {
+    const searchQueries: string[] = [];
+    if (isRealCardNumber) {
+      const baseNum = seedForManual.cardNumber.replace(/\s*\([AB]\)$/i, '').trim();
+      if (baseNum) searchQueries.push(`"${baseNum}"`);
+    }
+    const cleanName = seedForManual.name
+      .replace(/\s*\(Revival\)\s*/gi, '')
+      .replace(/\s*\([AB]\)$/i, '')
+      .trim();
+    if (cleanName && !isLikelyNonCardWikiTitle(cleanName)) {
+      searchQueries.push(cleanName);
+    }
+
+    const searchTitles: string[] = [];
+    for (const q of searchQueries.slice(0, 2)) {
+      try {
+        const json = (await fetchWikiJson({
+          action: 'query',
+          list: 'search',
+          srsearch: q,
+          srnamespace: '0',
+          srlimit: '6',
+        })) as { query?: { search?: Array<{ title?: string }> } };
+        for (const hit of json.query?.search || []) {
+          if (hit.title && !isLikelyNonCardWikiTitle(hit.title) && !searchTitles.includes(hit.title)) {
+            searchTitles.push(hit.title);
+          }
+        }
+      } catch {
+        // ignore transient search error
+      }
+      if (searchTitles.length >= 8) break;
+    }
+
+    if (searchTitles.length > 0) {
+      const altBundles = await batchFetchWikiPages(searchTitles.slice(0, 8));
+      let bestScore = -1;
+      for (const candTitle of searchTitles.slice(0, 8)) {
+        const candBundle = altBundles.get(candTitle);
+        if (!candBundle?.wikitext || !bundleMatchesPrinting(candTitle, candBundle)) continue;
+        const sc = scoreWikiCandidatePage(
+          { title: candTitle, wikitext: candBundle.wikitext, pageImages: candBundle.pageImages || [] },
+          {
+            cardNumber: seedForManual.cardNumber,
+            name: seedForManual.name,
+            jpName: seedForManual.jpName,
+            setCode: seedForManual.setCode,
+            wikiTitle: seedForManual.wikiTitle || candTitle,
+            isRevival: seedForManual.isRevival,
+          }
+        );
+        if (sc.score > bestScore) {
+          bestScore = sc.score;
+          resolvedTitle = candTitle;
+          bundle = candBundle;
+        }
+      }
+    }
   }
+
+  const base: BattleSpiritsCard = {
+    ...seedForManual,
+    wikiTitle: resolvedTitle,
+    wikiUrl: `${WIKI_BASE}${encodeURIComponent(resolvedTitle.replace(/ /g, '_'))}`,
+  };
+
+  const wikitext = bundle?.wikitext || '';
+  if (wikitext) {
+    const hydrated = hydrateCardFromWikitext(base, wikitext, bundle?.pageImages || []);
+    const artFileMatch = (hydrated.artworkImage || '').match(/[?&]file=([^&]+)/);
+    if (manual?.artworkUrl && /^https?:\/\//i.test(manual.artworkUrl)) {
+      return {
+        ...hydrated,
+        artworkImage: manual.artworkUrl,
+        artworkVerified: true,
+        artworkStatus: 'verified',
+      };
+    }
+    if (artFileMatch) {
+      let decodedFile = artFileMatch[1];
+      try {
+        decodedFile = decodeURIComponent(decodedFile);
+      } catch {
+        // keep raw
+      }
+      const verifyMap = await batchVerifyWikiFilesExist([decodedFile]);
+      const exists = Boolean(verifyMap.get(decodedFile.toLowerCase()));
+      const comp = evaluateCardCompleteness(hydrated, {
+        hasCardTable: hydrated.isWikiLoaded,
+        hasNoPrintedEffectCategory: hydrated.effectStatus === 'no_printed_effect',
+        hasJpEffectOnly: hydrated.effectStatus === 'unavailable',
+        artworkFileExists: exists,
+        ...(exists ? {} : { artworkFailureReason: 'unavailable_on_wiki' }),
+      });
+      return { ...hydrated, ...comp };
+    }
+    return hydrated;
+  }
+
   const comp = evaluateCardCompleteness(base, {
     wikitextEmpty: true,
     hasCardTable: false,
@@ -4030,6 +4199,18 @@ export async function searchWikiCards(
       const hydratedHub = await hydrateWikiCardsBatch(matchedHubCards.slice(0, 30));
       for (const c of hydratedHub) pushCard(c);
     }
+  }
+
+  if (results.length > 1 && !isSpecificCardNumberQuery) {
+    results.sort((a, b) => {
+      const scoreDiff =
+        scoreCardSearchMatch(b, trimmed) - scoreCardSearchMatch(a, trimmed);
+      if (scoreDiff !== 0) return scoreDiff;
+      return (
+        (a.isRevival ? 1 : 0) - (b.isRevival ? 1 : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    });
   }
 
   return results;

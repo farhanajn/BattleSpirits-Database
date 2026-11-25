@@ -357,6 +357,7 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
   const [auditReport, setAuditReport] = useState<CatalogAuditSummary | null>(null);
   const [repairState, setRepairState] = useState<CatalogRepairSummaryState | null>(null);
   const [repairBusy, setRepairBusy] = useState(false);
+  const [repairedBatchCards, setRepairedBatchCards] = useState<BattleSpiritsCard[]>([]);
 
   const adminFetch = useCallback(
     async (url: string, init: RequestInit = {}) => {
@@ -691,12 +692,37 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Repair batch failed');
       if (data.repairState) setRepairState(data.repairState);
+      const updatedBatch: BattleSpiritsCard[] = Array.isArray(data.updatedCards)
+        ? data.updatedCards
+        : [];
+      if (updatedBatch.length > 0) {
+        onCatalogImported?.([], updatedBatch);
+        setRepairedBatchCards((prev) => {
+          const map = new Map(prev.map((c) => [c.id, c]));
+          for (const c of updatedBatch) map.set(c.id, c);
+          return Array.from(map.values());
+        });
+      }
       onNotify?.(
         `Repair (${mode}): processed ${data.batchProcessedCount}, repaired ${data.stats?.repairedCards ?? 0}, ${data.remainingCount ?? 0} remaining`
       );
       await Promise.all([loadCatalogStatus(), loadRepairStatus()]);
     } catch (err) {
       onNotify?.(err instanceof Error ? err.message : 'Catalog repair failed');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const handleSyncRepairedBatchToCloud = async () => {
+    if (!isAdminCloud || !currentUser || repairedBatchCards.length === 0) return;
+    setRepairBusy(true);
+    try {
+      const cloudMsg = await syncAdditionsWithCloud([], repairedBatchCards);
+      setRepairedBatchCards([]);
+      onNotify?.(`Repaired batch synced${cloudMsg}`);
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : 'Failed to sync repaired cards to Cloud');
     } finally {
       setRepairBusy(false);
     }
@@ -1341,13 +1367,14 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                 </div>
 
                 {auditReport && (
-                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-[11px]">
                     {[
                       { label: 'Verified Complete', val: auditReport.completeVerifiedCount },
-                      { label: 'Missing / Unverified Art', val: auditReport.categories.missingArtworkUrl + auditReport.categories.brokenArtworkUrl + auditReport.categories.placeholderArtwork },
+                      { label: 'Partial / Incomplete', val: auditReport.partialCount + auditReport.incompleteCount },
+                      { label: 'Missing / Broken Art', val: auditReport.categories.missingArtworkUrl + auditReport.categories.brokenArtworkUrl + auditReport.categories.placeholderArtwork },
                       { label: 'Missing / Sentinel Effect', val: auditReport.categories.missingEffectText },
-                      { label: 'Missing Metadata', val: auditReport.categories.missingMetadata },
-                      { label: 'Skipped / Rejected', val: auditReport.categories.skippedOrRejectedEntries },
+                      { label: 'Unavailable / Vanilla', val: auditReport.categories.unavailableEffectText + auditReport.categories.vanillaNoPrintedEffect },
+                      { label: 'Needs Review / Rejected', val: auditReport.needsReviewCount + auditReport.categories.skippedOrRejectedEntries },
                     ].map((stat) => (
                       <div
                         key={stat.label}
@@ -1363,6 +1390,37 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     ))}
                   </div>
                 )}
+
+                {repairState &&
+                  repairState.jobStatus !== 'idle' &&
+                  (repairState.processedCount > 0 ||
+                    repairState.stats.repairedCards > 0 ||
+                    repairState.stats.stillUnresolved > 0) && (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 text-[11px]">
+                      {[
+                        { label: 'Repaired Cards', val: repairState.stats.repairedCards },
+                        { label: 'Art Fixed', val: repairState.stats.repairedArtwork },
+                        { label: 'Effects Fixed', val: repairState.stats.repairedEffects },
+                        { label: 'Wiki Matched', val: repairState.stats.repairedMatches },
+                        { label: 'Rejected Recovered', val: repairState.stats.recoveredRejected },
+                        { label: 'Manual Protected', val: repairState.stats.manualMappingsPreserved },
+                        { label: 'Unavailable', val: repairState.stats.markedUnavailable },
+                        { label: 'Unresolved / Pending', val: repairState.stats.stillUnresolved + repairState.remainingIds.length },
+                      ].map((m) => (
+                        <div
+                          key={m.label}
+                          className="p-2 rounded-xl bg-white border border-slate-200/80"
+                        >
+                          <div className="font-mono text-xs font-bold text-slate-900 tabular-nums">
+                            {m.val}
+                          </div>
+                          <div className="text-[10px] text-slate-500 leading-tight mt-0.5">
+                            {m.label}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
@@ -1432,6 +1490,18 @@ export const AdminCatalogSection: React.FC<AdminCatalogSectionProps> = ({
                     >
                       <Play className="w-3.5 h-3.5" />
                       <span>Resume Repair ({repairState.remainingIds.length})</span>
+                    </button>
+                  )}
+
+                  {isAdminCloud && repairedBatchCards.length > 0 && (
+                    <button
+                      type="button"
+                      disabled={repairBusy || catalogBusy}
+                      onClick={() => void handleSyncRepairedBatchToCloud()}
+                      className="min-h-[36px] px-3 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <CloudUpload className="w-3.5 h-3.5" />
+                      <span>Push Repaired to Cloud ({repairedBatchCards.length})</span>
                     </button>
                   )}
                 </div>

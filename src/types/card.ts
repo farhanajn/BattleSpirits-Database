@@ -122,6 +122,13 @@ export interface BattleSpiritsCard {
     | 'brave';
   wikiTitle?: string;
   wikiUrl: string;
+  aliases?: string[];
+  altNames?: string[];
+  jpEffect?: string;
+  jpEffects?: {
+    timing: string;
+    text: string;
+  }[];
   isWikiLoaded?: boolean;
   createdAt?: string | number;
   importedAt?: string | number;
@@ -166,6 +173,7 @@ export interface Deck {
 }
 
 export type SortOption =
+  | 'relevance'
   | 'number'
   | 'newest'
   | 'rarity-desc'

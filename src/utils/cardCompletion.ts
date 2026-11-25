@@ -11,7 +11,6 @@ export const SENTINEL_EFFECT_PATTERNS: RegExp[] = [
   /^no effect text recorded for this card\.?$/i,
   /^no english effect text available\.?$/i,
   /^no effect text\.?$/i,
-  /^\(legacy\)$/i,
   /^[-–—]+$/,
   /^(?:none|n\/a|tbd|unknown)$/i,
 ];

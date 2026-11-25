@@ -23,7 +23,11 @@ import {
   type CatalogScanState,
 } from '../server/catalogSyncService.ts';
 import { hydrateCardFromWikitext, parseSetTableRows } from '../server/wikiService.ts';
-import { expandWikiFileCandidates, isCardArtworkFile } from '../server/wikiCardLookup.ts';
+import {
+  expandWikiFileCandidates,
+  extractCardTableMetaFromWikitext,
+  isCardArtworkFile,
+} from '../server/wikiCardLookup.ts';
 import {
   registerManualWikiMapping,
   unregisterManualWikiMapping,
@@ -41,6 +45,8 @@ function makeBaseCard(overrides: Partial<BattleSpiritsCard> = {}): BattleSpirits
     cost: 3,
     rarity: 'C',
     formats: ['Eternal'],
+    blockIcon: 'Saga',
+    restriction: 'Unlimited',
     type: 'Spirit',
     families: ['Terra Dragon'],
     symbols: { Red: 1 },
@@ -137,10 +143,10 @@ test('2. URL-encoded & .webp artwork filenames decode cleanly and non-card title
 |}`,
     {
       setCode: 'BS50',
-      category: 'Main',
+      category: 'Booster',
       name: 'BS50',
       jpName: '',
-      productType: 'Booster Pack',
+      productType: 'Booster Set',
       releaseDate: '2019',
       formats: ['Eternal'],
       blockLabel: 'Saga',
@@ -630,7 +636,7 @@ test('5. ManualWikiMapping preservation, vanilla no_printed_effect, resumable ch
     );
     assert.ok(recoveredImported);
   } finally {
-    unregisterManualWikiMapping(manualKey);
+    unregisterManualWikiMapping({ cardNumber: 'BS72-099', name: 'Manual Protected Card' });
   }
 });
 
@@ -656,3 +662,132 @@ test('6. hydrateCardFromWikitext marks non-CardTable pages as isWikiLoaded: fals
   assert.equal(missingImgCard.artworkVerified, false);
   assert.equal(missingImgCard.effectVerified, true);
 });
+
+test('7. {{ST|Legacy}} expands to official Legacy keyword text and is not stripped as sentinel', () => {
+  assert.equal(isSentinelEffectText('(Legacy)'), false);
+  const hydrated = hydrateCardFromWikitext(
+    makeBaseCard({
+      id: '26rbs01-26rbs01-045',
+      cardNumber: '26RBS01-045',
+      setCode: '26RBS01',
+      name: 'Lione-Macina',
+      effects: [],
+      isWikiLoaded: false,
+    }),
+    `{{CardTable3
+|name=Lione-Macina
+|kanji=リオネ・マキナ
+|set1=26RBS01
+|type=Spirit
+|color=Green
+|cost=8
+|family=Oceanic Green
+|level=Level 1: 1 core, 9000 BP<br>Level 2: 3 cores, 12000 BP
+|image=26RBS01-045.png
+|effect={{ST|Legacy}}<br>
+|jpeffect='''《継召》'''<br>トラッシュのEXシンボルを除外し軽減できる。
+}}`,
+    ['File:26RBS01-045.png']
+  );
+
+  assert.equal(hydrated.effects.length, 1);
+  assert.ok(hydrated.effects[0].text.includes('[Legacy]'));
+  assert.equal(hydrated.effectStatus, 'verified');
+  assert.equal(hydrated.effectVerified, true);
+});
+
+test('8. Vanilla cards with empty effect and empty jpeffect classify as no_printed_effect even without category tag', () => {
+  const vanillaWithoutCategory = hydrateCardFromWikitext(
+    makeBaseCard({
+      id: '26rbs01-26rbs01-064',
+      cardNumber: '26RBS01-064',
+      setCode: '26RBS01',
+      name: 'Sorcereed',
+      effects: [],
+    }),
+    `{{CardTable3
+|name=Sorcereed
+|kanji=ソーサリード
+|set1=26RBS01
+|type=Spirit
+|color=Yellow
+|cost=3
+|family=Topaz
+|level=Level 1: 1 core, 4000 BP
+|image=26RBS01-064.png
+|effect=
+|jpeffect=
+}}`,
+    ['File:26RBS01-064.png']
+  );
+  assert.equal(vanillaWithoutCategory.effectStatus, 'no_printed_effect');
+  assert.equal(vanillaWithoutCategory.effectVerified, true);
+
+  const jpOnlyCard = hydrateCardFromWikitext(
+    makeBaseCard({
+      id: 'jp-only-test',
+      cardNumber: 'BS99-002',
+      setCode: 'BS99',
+      name: 'JP Only Card',
+      effects: [],
+    }),
+    `{{CardTable3
+|name=JP Only Card
+|kanji=日本語のみ
+|set1=BS99
+|type=Spirit
+|color=Red
+|cost=3
+|family=Terra Dragon
+|effect=
+|jpeffect=Lv1『このスピリットの召喚時』テスト。
+}}`,
+    []
+  );
+  assert.equal(jpOnlyCard.effectStatus, 'unavailable');
+  assert.equal(jpOnlyCard.effectVerified, false);
+});
+
+test('9. Magic cards mislabeled as Spirit on Wiki CardTable are corrected to Magic', () => {
+  const hydrated = hydrateCardFromWikitext(
+    makeBaseCard({
+      id: 'bs09-bs09-079',
+      cardNumber: 'BS09-079',
+      setCode: 'BS09',
+      name: 'Character Lost',
+      type: 'Spirit',
+      families: [],
+      effects: [],
+    }),
+    `{{CardTableV2
+|name=Character Lost
+|kanji=キャラクターロスト
+|set1=BS09
+|type=Spirit
+|color=Yellow
+|cost=4
+|image=BS09-079.jpg
+|effect={{tk|Main}}<br>Discard your hand.
+{{tk|Flash}}<br>Draw 1 card.
+}}`,
+    ['File:BS09-079.jpg']
+  );
+  assert.equal(hydrated.type, 'Magic');
+  assert.equal(hydrated.artVariant, 'magic');
+  assert.deepEqual(hydrated.symbols, {});
+  assert.equal(hydrated.metadataStatus, 'verified');
+});
+
+test('10. extractCardTableMetaFromWikitext parses releasedJP/releasedEN set codes for Revival matching', () => {
+  const meta = extractCardTableMetaFromWikitext(`{{CardTable
+|name=Silent Wall
+|releasedJP=[[BS01]], [[BSC02]], [[BSC22]]
+|releasedEN=BS01- [[Call of the Core]]
+|image=BSC22-141.jpg
+}}`);
+  assert.ok(meta.sets.includes('BS01'));
+  assert.ok(meta.sets.includes('BSC02'));
+  assert.ok(meta.sets.includes('BSC22'));
+  assert.equal(meta.sets.includes('26RCB02'), false);
+});
+

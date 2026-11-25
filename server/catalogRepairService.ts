@@ -151,6 +151,7 @@ export interface CatalogRepairBatchResult {
   jobStatus: CatalogRepairState['jobStatus'];
   stats: CatalogRepairState['stats'];
   repairedSampleIds: string[];
+  updatedCards: BattleSpiritsCard[];
   reprocessResult?: {
     reprocessedCount: number;
     recoveredToReadyCount: number;
@@ -1093,6 +1094,7 @@ export async function runCatalogRepairBatch(
     .filter((c): c is BattleSpiritsCard => Boolean(c));
 
   const repairedSampleIds: string[] = [];
+  const updatedCards: BattleSpiritsCard[] = [];
   let publicCardsDirty = false;
   let syncStateDirty = false;
 
@@ -1305,6 +1307,13 @@ export async function runCatalogRepairBatch(
           jpName: working.jpName || hydrated.jpName || '',
           illustrator: working.illustrator || hydrated.illustrator || '',
           flavorText: working.flavorText || hydrated.flavorText || '',
+          type: hydrated.type || working.type,
+          subtypeLabel: hydrated.subtypeLabel ?? working.subtypeLabel,
+          artVariant: hydrated.artVariant || working.artVariant,
+          symbols:
+            Object.keys(hydrated.symbols || {}).length > 0 || hydrated.type === 'Magic'
+              ? hydrated.symbols
+              : working.symbols,
           families: nextFamilies,
           effects: nextEffects,
           levels: working.levels?.length ? working.levels : hydrated.levels,
@@ -1441,9 +1450,10 @@ export async function runCatalogRepairBatch(
     if (artRecovered || effRecovered || metaRecovered || comp.completionStatus === 'complete') {
       repairState.stats.repairedCards++;
       if (repairedSampleIds.length < 30) repairedSampleIds.push(updated.id);
-    } else if (comp.completionStatus !== 'complete') {
+    } else {
       repairState.stats.stillUnresolved++;
     }
+    updatedCards.push(updated);
 
     // Write back into publicPayload & state.importedCards
     const pubIdx = publicIndexById.get(updated.id);
@@ -1558,6 +1568,7 @@ export async function runCatalogRepairBatch(
     jobStatus: repairState.jobStatus,
     stats: { ...repairState.stats },
     repairedSampleIds,
+    updatedCards,
     reprocessResult,
     repairState,
   };

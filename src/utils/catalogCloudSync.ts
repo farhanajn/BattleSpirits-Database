@@ -484,6 +484,13 @@ export async function fetchPublishedCatalogAdditions(options?: {
   return { sets, cards };
 }
 
+function utf8ByteLength(str: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(str).length;
+  }
+  return str.length;
+}
+
 function buildCompactCardPayloadJson(card: BattleSpiritsCard, safeId: string): string {
   const baseCard: BattleSpiritsCard = {
     ...card,
@@ -492,7 +499,7 @@ function buildCompactCardPayloadJson(card: BattleSpiritsCard, safeId: string): s
     rulings: (card.rulings || []).slice(0, 6),
   };
   let json = JSON.stringify(baseCard);
-  if (json.length <= 19800) return json;
+  if (utf8ByteLength(json) <= 19800) return json;
 
   json = JSON.stringify({
     ...baseCard,
@@ -501,7 +508,7 @@ function buildCompactCardPayloadJson(card: BattleSpiritsCard, safeId: string): s
     flavorText: (baseCard.flavorText || '').slice(0, 300),
     effects: (baseCard.effects || []).slice(0, 6),
   });
-  if (json.length <= 19800) return json;
+  if (utf8ByteLength(json) <= 19800) return json;
 
   json = JSON.stringify({
     ...baseCard,
@@ -510,7 +517,7 @@ function buildCompactCardPayloadJson(card: BattleSpiritsCard, safeId: string): s
     flavorText: '',
     effects: [],
   });
-  return json.length <= 19800 ? json : '';
+  return utf8ByteLength(json) <= 19800 ? json : '';
 }
 
 export async function publishCatalogAdditionsToFirestore(
@@ -797,6 +804,8 @@ export async function publishCatalogAdditionsToFirestore(
         String(existingCard.name || '') === String(basePayload.name) &&
         String(existingCard.setCode || '') === String(basePayload.setCode) &&
         String(existingCard.restriction || '') === String(basePayload.restriction) &&
+        Number(existingCard.cost ?? -1) === Number(basePayload.cost) &&
+        Boolean(existingCard.missingArtwork) === Boolean(basePayload.missingArtwork) &&
         Boolean(existingCard.isPublished) === true;
       if (unchanged) continue;
     }

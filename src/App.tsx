@@ -110,6 +110,7 @@ import {
   normalizeCardForCatalog,
   normalizeCardTypes,
   resolveSearchSetIntent,
+  scoreCardSearchMatch,
 } from './utils/cardFilterNormalization';
 
 type AppTab = 'catalog' | 'search' | 'decks' | 'settings';
@@ -160,6 +161,7 @@ const VALID_RARITIES: CardRarity[] = [
 ];
 const VALID_COSTS: readonly FilterState['costBracket'][] = COST_BRACKET_OPTIONS;
 const VALID_SORTS: SortOption[] = [
+  'relevance',
   'number',
   'newest',
   'rarity-desc',
@@ -274,11 +276,19 @@ function parseStateFromUrl(): {
         .filter((r): r is CardRarity => VALID_RARITIES.includes(r as CardRarity))
     : [];
 
+  const rawSearch = params.get('q') || '';
+  const resolvedSort: SortOption =
+    rawSort && VALID_SORTS.includes(rawSort)
+      ? rawSort
+      : rawSearch.trim()
+      ? 'relevance'
+      : 'number';
+
   return {
     tab,
     sharedDeck,
     filters: {
-      search: params.get('q') || '',
+      search: rawSearch,
       setQuery: params.get('setq') || '',
       format: rawFmt && VALID_FORMATS.includes(rawFmt) ? rawFmt : 'All',
       version: rawVer && VALID_VERSIONS.includes(rawVer) ? rawVer : 'All',
@@ -293,7 +303,7 @@ function parseStateFromUrl(): {
       })(),
       costBracket: rawCost && VALID_COSTS.includes(rawCost) ? rawCost : 'All',
       keyword: params.get('kw') || 'All',
-      sortBy: rawSort && VALID_SORTS.includes(rawSort) ? rawSort : 'number',
+      sortBy: resolvedSort,
     },
   };
 }
@@ -310,7 +320,8 @@ function buildUrlSearch(tab: AppTab, filters: FilterState): string {
   if (filters.setCode !== 'All') params.set('set', filters.setCode);
   if (filters.costBracket !== 'All') params.set('cost', filters.costBracket);
   if (filters.keyword !== 'All') params.set('kw', filters.keyword);
-  if (filters.sortBy !== 'number') params.set('sort', filters.sortBy);
+  const defaultSortForQuery: SortOption = filters.search.trim() ? 'relevance' : 'number';
+  if (filters.sortBy !== defaultSortForQuery) params.set('sort', filters.sortBy);
   if (filters.setQuery) params.set('setq', filters.setQuery);
   if (filters.search) params.set('q', filters.search);
   const str = params.toString();
@@ -507,8 +518,27 @@ export function mergeCardsIntoMap(
     const existing = next[targetId];
     if (!existing) addedCount++;
 
-    const primary = options?.preferExisting && existing ? existing : c;
-    const secondary = options?.preferExisting && existing ? c : existing;
+    const incomingRepairedNewer = Boolean(
+      c.lastRepairedAt &&
+        (!existing?.lastRepairedAt || c.lastRepairedAt > existing.lastRepairedAt)
+    );
+    const incomingHydratesExisting = Boolean(
+      existing && !existing.isWikiLoaded && c.isWikiLoaded
+    );
+    const incomingCompletesExisting = Boolean(
+      existing &&
+        existing.completionStatus !== 'complete' &&
+        c.completionStatus === 'complete'
+    );
+    const useExistingAsPrimary = Boolean(
+      options?.preferExisting &&
+        existing &&
+        !incomingRepairedNewer &&
+        !incomingHydratesExisting &&
+        !incomingCompletesExisting
+    );
+    const primary = useExistingAsPrimary ? existing! : c;
+    const secondary = useExistingAsPrimary ? c : existing;
 
     const primaryColors = normalizeCardColors(primary);
     const secondaryColors = secondary ? normalizeCardColors(secondary) : [];
@@ -524,7 +554,18 @@ export function mergeCardsIntoMap(
 
     const primaryCost = normalizeCardCost(primary.cost);
     const secondaryCost = secondary ? normalizeCardCost(secondary.cost) : null;
-    const finalCost = primaryCost !== null ? primaryCost : secondaryCost !== null ? secondaryCost : Number.NaN;
+    const finalCost =
+      !primary.isWikiLoaded &&
+      primaryCost === 0 &&
+      secondary?.isWikiLoaded &&
+      secondaryCost !== null &&
+      secondaryCost > 0
+        ? secondaryCost
+        : primaryCost !== null
+        ? primaryCost
+        : secondaryCost !== null
+        ? secondaryCost
+        : Number.NaN;
 
     const primaryCleanEffects = sanitizeEffectsArray(primary.effects);
     const secondaryCleanEffects = secondary ? sanitizeEffectsArray(secondary.effects) : [];
@@ -539,11 +580,20 @@ export function mergeCardsIntoMap(
       Boolean(secondary?.artworkImage?.trim()) &&
       !isPlaceholderArtworkUrl(secondary?.artworkImage) &&
       secondary?.artworkStatus !== 'broken';
-    const preferredRawArtwork = primaryArtUsable
-      ? primary.artworkImage
-      : secondaryArtUsable
-      ? secondary?.artworkImage || ''
-      : primary.artworkImage || secondary?.artworkImage || '';
+    const primaryArtVerified = Boolean(
+      primary.artworkVerified || primary.artworkStatus === 'verified'
+    );
+    const secondaryArtVerified = Boolean(
+      secondary?.artworkVerified || secondary?.artworkStatus === 'verified'
+    );
+    const preferredRawArtwork =
+      !primaryArtVerified && secondaryArtVerified && secondaryArtUsable
+        ? secondary?.artworkImage || ''
+        : primaryArtUsable
+        ? primary.artworkImage
+        : secondaryArtUsable
+        ? secondary?.artworkImage || ''
+        : primary.artworkImage || secondary?.artworkImage || '';
 
     const merged: BattleSpiritsCard = {
       ...(secondary || {}),
@@ -552,8 +602,14 @@ export function mergeCardsIntoMap(
       name: primary.name || secondary?.name || c.cardNumber || targetId,
       jpName: primary.jpName || secondary?.jpName || '',
       cardNumber: primary.cardNumber || secondary?.cardNumber || 'WIKI',
-      setCode: primary.setCode || secondary?.setCode || 'BS01',
-      setName: primary.setName || secondary?.setName || 'Battle Spirits',
+      setCode:
+        options?.preserveSetCode && existing?.setCode && existing.setCode !== 'WIKI'
+          ? existing.setCode
+          : primary.setCode || secondary?.setCode || 'BS01',
+      setName:
+        options?.preserveSetCode && existing?.setName && existing.setCode !== 'WIKI'
+          ? existing.setName
+          : primary.setName || secondary?.setName || 'Battle Spirits',
       color: finalColors[0] || 'Red',
       secondaryColor: finalColors.length >= 2 ? finalColors[1] : undefined,
       cost: finalCost,
@@ -1190,6 +1246,63 @@ export default function App() {
     };
   }, [applyImportedCatalogAdditions]);
 
+  const activeSelectedCard = useMemo(
+    () => (selectedCard ? cardsMap[selectedCard.id] || selectedCard : null),
+    [selectedCard, cardsMap]
+  );
+
+  // Non-destructive live hydration when inspecting an unhydrated or incomplete card
+  const hydratedDetailAttemptedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeSelectedCard || typeof window === 'undefined' || navigator.onLine === false) return;
+    const needsHydration =
+      !activeSelectedCard.isWikiLoaded ||
+      activeSelectedCard.completionStatus === 'incomplete' ||
+      (activeSelectedCard.completionStatus === 'partial' &&
+        activeSelectedCard.effectStatus === 'missing');
+    if (!needsHydration) return;
+    if (hydratedDetailAttemptedRef.current.has(activeSelectedCard.id)) return;
+    hydratedDetailAttemptedRef.current.add(activeSelectedCard.id);
+
+    const targetCard = activeSelectedCard;
+    const lookupTitle = (targetCard.wikiTitle || targetCard.name || '').trim();
+    if (!lookupTitle) return;
+
+    let cancelled = false;
+    const qs = new URLSearchParams({ title: lookupTitle });
+    if (targetCard.name) qs.set('name', targetCard.name);
+    if (targetCard.cardNumber) qs.set('cardNumber', targetCard.cardNumber);
+    if (targetCard.setCode) qs.set('setCode', targetCard.setCode);
+    if (targetCard.setName) qs.set('setName', targetCard.setName);
+    if (targetCard.isRevival !== undefined) {
+      qs.set('isRevival', String(Boolean(targetCard.isRevival)));
+    }
+
+    fetch(`/api/wiki/card?${qs.toString()}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { card?: BattleSpiritsCard } | null) => {
+        if (cancelled || !payload?.card || !payload.card.isWikiLoaded) return;
+        const hydratedCard: BattleSpiritsCard = {
+          ...payload.card,
+          id: targetCard.id,
+        };
+        setCardsMap((prev) => {
+          const { next } = mergeCardsIntoMap(prev, [hydratedCard], {
+            banList,
+            preserveSetCode: true,
+          });
+          return next;
+        });
+      })
+      .catch(() => {
+        // Non-fatal on offline / unreachable Wiki
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSelectedCard, banList]);
+
   // Persist all hydrated or fetched card metadata into IndexedDB (debounced) so offline browsing & card details stay complete
   useEffect(() => {
     const bundledIds = new Set(BATTLE_SPIRITS_CARDS.map((c) => c.id));
@@ -1341,6 +1454,24 @@ export default function App() {
     [filters, updateFilters]
   );
 
+  const handleSearchQueryChange = useCallback((nextSearch: string) => {
+    setFilters((prev) => {
+      const hadQuery = prev.search.trim().length > 0;
+      const hasQuery = nextSearch.trim().length > 0;
+      let nextSort = prev.sortBy;
+      if (!hadQuery && hasQuery && prev.sortBy === 'number') {
+        nextSort = 'relevance';
+      } else if (hadQuery && !hasQuery && prev.sortBy === 'relevance') {
+        nextSort = 'number';
+      }
+      return {
+        ...prev,
+        search: nextSearch,
+        sortBy: nextSort,
+      };
+    });
+  }, []);
+
   const releaseRankBySetCode = useMemo(() => {
     const map = new Map<string, number>();
     const total = syncedProductSets.length;
@@ -1367,6 +1498,7 @@ export default function App() {
         indexedSetDirectory,
         setLookupByCode,
         releaseRankBySetCode,
+        preserveRequestedSort: true,
       }),
     [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]
   );
@@ -1471,7 +1603,7 @@ export default function App() {
     runLiveWikiSearch,
   ]);
 
-  // Deduplicate live Wiki preview cards against already-loaded local catalog
+  // Deduplicate live Wiki preview cards against already-loaded local catalog and preserve relevance ranking
   const uniqueWikiPreviewCards = useMemo(() => {
     if (wikiSearchResults.length === 0) return [];
     const localIds = new Set(allCardsList.map((c) => c.id));
@@ -1483,7 +1615,7 @@ export default function App() {
         })
         .filter(Boolean)
     );
-    return wikiSearchResults.filter((card) => {
+    const deduped = wikiSearchResults.filter((card) => {
       if (localIds.has(card.id)) return false;
       const norm = normalizeCardNumber(card.cardNumber || '');
       if (norm && norm !== 'WIKI') {
@@ -1492,7 +1624,19 @@ export default function App() {
       }
       return true;
     });
-  }, [wikiSearchResults, allCardsList]);
+    const q = filters.search.trim();
+    if (q && filters.sortBy === 'relevance' && deduped.length > 1) {
+      return [...deduped].sort((a, b) => {
+        const diff = scoreCardSearchMatch(b, q) - scoreCardSearchMatch(a, q);
+        if (diff !== 0) return diff;
+        return (
+          (a.isRevival ? 1 : 0) - (b.isRevival ? 1 : 0) ||
+          a.cardNumber.localeCompare(b.cardNumber)
+        );
+      });
+    }
+    return deduped;
+  }, [wikiSearchResults, allCardsList, filters.search, filters.sortBy]);
 
   // Pre-fetch upcoming card images in Search gallery using wikiImageClient cache
   useWikiImagePrefetch({
@@ -2224,6 +2368,7 @@ export default function App() {
                       }
                       className="min-h-[38px] px-2.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-600 cursor-pointer"
                     >
+                      <option value="relevance">Sort: Best Match (Relevance)</option>
                       <option value="number">Sort: Set &amp; Number</option>
                       <option value="newest">Sort: Newest Release</option>
                       <option value="rarity-desc">Sort: Highest Rarity</option>
@@ -2248,14 +2393,14 @@ export default function App() {
                     ref={searchInputRef}
                     type="search"
                     value={filters.search}
-                    onChange={(e) => setFilters({ ...filters, search: e.target.value })}
+                    onChange={(e) => handleSearchQueryChange(e.target.value)}
                     placeholder="Search card name, family, keyword, or English effect..."
                     className="w-full min-h-[44px] pl-10 pr-9 rounded-xl bg-white border border-slate-200 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-600"
                   />
                   {filters.search && (
                     <button
                       type="button"
-                      onClick={() => setFilters({ ...filters, search: '' })}
+                      onClick={() => handleSearchQueryChange('')}
                       className="min-h-[44px] min-w-[44px] flex items-center justify-center absolute right-0 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
                       aria-label="Clear search"
                     >
@@ -2780,10 +2925,10 @@ export default function App() {
 
       {/* Card Detail Bottom Sheet / Modal */}
       <CardDetailSheet
-        card={selectedCard}
+        card={activeSelectedCard}
         allCards={allCardsList}
         navigableCards={navigableCards}
-        deckQty={selectedCard ? activeDeckQtyMap[selectedCard.id] || 0 : 0}
+        deckQty={activeSelectedCard ? activeDeckQtyMap[activeSelectedCard.id] || 0 : 0}
         activeDeckQtyMap={activeDeckQtyMap}
         activeDeckName={activeDeck?.name || 'Deck'}
         activeDeckFormat={activeDeckFormat}
