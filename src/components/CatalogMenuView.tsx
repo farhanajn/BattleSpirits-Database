@@ -21,6 +21,7 @@ import { CardThumbnail } from './CardThumbnail';
 import { SymbolIcon } from './SymbolIcon';
 import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
 import { useAdmin } from '../hooks/useAdmin';
+import type { ConsolidatedCardGroup } from '../utils/reprintConsolidation';
 import {
   buildSetSearchTokens,
   matchesIndexedSetQuery,
@@ -58,6 +59,7 @@ interface CatalogMenuViewProps {
   productSets: ProductSet[];
   cards: BattleSpiritsCard[];
   cardsById: Record<string, BattleSpiritsCard>;
+  groupByMemberId?: Record<string, ConsolidatedCardGroup>;
   activeDeckQtyMap: Record<string, number>;
   activeFormat: FormatFilter;
   currentUser?: User | null;
@@ -79,6 +81,7 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
   productSets,
   cards,
   cardsById,
+  groupByMemberId,
   activeDeckQtyMap,
   activeFormat,
   currentUser = null,
@@ -590,15 +593,20 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
-          {featuredCards.map((card) => (
-            <CardThumbnail
-              key={card.id}
-              card={card}
-              deckQty={activeDeckQtyMap[card.id] || 0}
-              onSelect={onSelectCard}
-              onAddToDeck={onAddToDeck}
-            />
-          ))}
+          {featuredCards.map((card) => {
+            const grp = groupByMemberId?.[card.id];
+            return (
+              <CardThumbnail
+                key={grp?.canonicalId || card.id}
+                card={card}
+                deckQty={activeDeckQtyMap[card.id] || 0}
+                printings={grp?.printings}
+                activeDeckQtyMap={activeDeckQtyMap}
+                onSelect={onSelectCard}
+                onAddToDeck={onAddToDeck}
+              />
+            );
+          })}
         </div>
       </section>
 

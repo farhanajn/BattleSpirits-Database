@@ -64,6 +64,12 @@ import {
   normalizeCardNumber,
 } from './utils/decklistImport';
 import {
+  areSameCardIdentity,
+  buildCompositeCardIdentityKey,
+  getCardVersionVariantKey,
+  isSyntheticCardNumber,
+} from './utils/cardIdentity';
+import {
   loadOfflineSnapshot,
   saveOfflineCards,
   saveOfflineMeta,
@@ -98,9 +104,14 @@ import {
 } from './utils/setMetadataSync';
 import { fetchPublishedCatalogAdditions } from './utils/catalogCloudSync';
 import {
+  consolidateCatalogCards,
+  consolidateWikiPreviewCards,
+  normalizeReprintBaseName,
+} from './utils/reprintConsolidation';
+import {
   COST_BRACKET_OPTIONS,
   extractAvailableFamilies,
-  filterCatalogCards,
+  filterConsolidatedCatalogCards,
   getCardNumberPrefix,
   INITIAL_FILTER_STATE,
   matchesFormatFilter,
@@ -419,28 +430,28 @@ export function mergeCardsIntoMap(
   );
 
   const indexCard = (c: BattleSpiritsCard) => {
-    const ver = c.isRevival ? 'rv' : 'orig';
+    const compKey = `comp:${buildCompositeCardIdentityKey(c)}`;
+    if (!keyToId.has(compKey)) keyToId.set(compKey, c.id);
+
+    const ver = getCardVersionVariantKey(c);
     const normNum = normalizeCardNumber(c.cardNumber || '');
+    const compactNum = compactCardNumber(c.cardNumber || '');
     const normSet = normalizeSetCodeForClient(c.setCode || '');
-    if (normNum && normNum !== 'WIKI') {
+    if (!isSyntheticCardNumber(normNum) && compactNum) {
       if (normSet) {
-        const setNumKey = `num:${normNum}|${normSet}|${ver}`;
+        const setNumKey = `num:${compactNum}|${normSet}|${ver}`;
         if (!keyToId.has(setNumKey)) keyToId.set(setNumKey, c.id);
       }
-      const nk = `num:${normNum}|${ver}`;
+      const nk = `num:${compactNum}|${ver}`;
       if (!keyToId.has(nk)) keyToId.set(nk, c.id);
     }
     const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
-    if (cleanName) {
-      if (normSet) {
-        const setNmKey = `name:${cleanName}|${normSet}|${ver}`;
-        if (!keyToId.has(setNmKey)) keyToId.set(setNmKey, c.id);
-      }
-      const nmKey = `name:${cleanName}|${ver}`;
-      if (!keyToId.has(nmKey)) keyToId.set(nmKey, c.id);
+    if (cleanName && normSet) {
+      const setNmKey = `name:${cleanName}|${normSet}|${ver}`;
+      if (!keyToId.has(setNmKey)) keyToId.set(setNmKey, c.id);
     }
-    if (!c.isRevival && c.wikiTitle) {
-      const wkKey = `wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet || '*'}|orig`;
+    if (!c.isRevival && c.wikiTitle && normSet) {
+      const wkKey = `wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet}|${ver}`;
       if (!keyToId.has(wkKey)) keyToId.set(wkKey, c.id);
     }
   };
@@ -453,12 +464,12 @@ export function mergeCardsIntoMap(
   for (const rawCard of incomingCards) {
     let c = sanitizeCardTextTemplates(rawCard);
     const isRev = options?.forceRevival ?? Boolean(c.isRevival);
-    const ver = isRev ? 'rv' : 'orig';
     const normNum = normalizeCardNumber(c.cardNumber || '');
+    const compactNum = compactCardNumber(c.cardNumber || '');
     const cleanName = normalizeCardName(c.name || '').replace(/\s*\(revival\)\s*$/i, '');
     let normSet = normalizeSetCodeForClient(c.setCode || '');
 
-    // Self-heal cross-set Booster reprint attribution ONLY when not explicitly keyed/imported into its set
+    // Self-heal cross-set Booster reprint attribution ONLY when setCode is unset/placeholder
     const prefix = getCardNumberPrefix(c.cardNumber || '');
     const cardIdEncodesSet =
       Boolean(normSet) && (c.id || '').toUpperCase().startsWith(`${normSet}-`);
@@ -473,7 +484,7 @@ export function mergeCardsIntoMap(
       const prefixSet = productSetByCode.get(prefix);
       if (
         prefixSet &&
-        curSet?.category === 'Booster' &&
+        (!normSet || normSet === 'WIKI' || !curSet) &&
         (prefixSet.category === 'Booster' ||
           prefixSet.category === 'Standard Booster' ||
           prefixSet.category === 'Standard Starter')
@@ -489,29 +500,85 @@ export function mergeCardsIntoMap(
       }
     }
 
-    let targetId = next[c.id] ? c.id : undefined;
-    if (!targetId && normNum && normNum !== 'WIKI') {
-      targetId =
-        (normSet ? keyToId.get(`num:${normNum}|${normSet}|${ver}`) : undefined) ||
-        undefined;
+    const candidateForIdentity: BattleSpiritsCard = { ...c, isRevival: isRev };
+    const ver = getCardVersionVariantKey(candidateForIdentity);
+    const compKey = `comp:${buildCompositeCardIdentityKey(candidateForIdentity)}`;
+    const isCompatibleCandidateRecord = (existingRec: BattleSpiritsCard): boolean =>
+      areSameCardIdentity(existingRec, candidateForIdentity) &&
+      (normalizeReprintBaseName(existingRec.name) ===
+        normalizeReprintBaseName(candidateForIdentity.name) ||
+        (existingRec.type === candidateForIdentity.type &&
+          existingRec.cost === candidateForIdentity.cost));
+
+    const compTarget = keyToId.get(compKey);
+    let targetId: string | undefined = undefined;
+    if (compTarget) {
+      const existingComp = next[compTarget];
+      if (!existingComp || isCompatibleCandidateRecord(existingComp)) {
+        targetId = compTarget;
+      }
+    }
+
+    if (!targetId && next[c.id]) {
+      if (isCompatibleCandidateRecord(next[c.id])) {
+        targetId = c.id;
+      } else {
+        const suffix = (normSet || 'ALT').toLowerCase().replace(/[^a-z0-9-]+/g, '-');
+        let candidateId = `${c.id}-${suffix}`;
+        let counter = 2;
+        while (
+          next[candidateId] &&
+          !isCompatibleCandidateRecord(next[candidateId])
+        ) {
+          candidateId = `${c.id}-${suffix}-${counter++}`;
+        }
+        c = { ...c, id: candidateId };
+        targetId = next[candidateId] ? candidateId : undefined;
+      }
+    }
+
+    if (!targetId && !isSyntheticCardNumber(normNum) && compactNum) {
+      if (normSet) {
+        const numTarget = keyToId.get(`num:${compactNum}|${normSet}|${ver}`);
+        if (numTarget) {
+          const existingNum = next[numTarget];
+          if (!existingNum || isCompatibleCandidateRecord(existingNum)) {
+            targetId = numTarget;
+          }
+        }
+      }
       if (!targetId) {
-        const genericNumTarget = keyToId.get(`num:${normNum}|${ver}`);
+        const genericNumTarget = keyToId.get(`num:${compactNum}|${ver}`);
         if (genericNumTarget) {
-          const existingSet = normalizeSetCodeForClient(next[genericNumTarget]?.setCode || '');
-          if (!normSet || !existingSet || existingSet === normSet) {
+          const existingCandidate =
+            next[genericNumTarget] ||
+            BATTLE_SPIRITS_CARDS.find((b) => b.id === genericNumTarget);
+          if (existingCandidate && isCompatibleCandidateRecord(existingCandidate)) {
             targetId = genericNumTarget;
           }
         }
       }
     }
-    if (!targetId && !isRev && c.wikiTitle) {
-      targetId = keyToId.get(`wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet || '*'}|orig`);
+
+    if (!targetId && !isRev && c.wikiTitle && normSet && isSyntheticCardNumber(normNum)) {
+      const wkTarget = keyToId.get(`wiki:${c.wikiTitle.trim().toLowerCase()}|${normSet}|${ver}`);
+      if (wkTarget) {
+        const existingCandidate =
+          next[wkTarget] || BATTLE_SPIRITS_CARDS.find((b) => b.id === wkTarget);
+        if (!existingCandidate || areSameCardIdentity(existingCandidate, candidateForIdentity)) {
+          targetId = wkTarget;
+        }
+      }
     }
-    if (!targetId && !isRev && cleanName && normSet) {
-      targetId = keyToId.get(`name:${cleanName}|${normSet}|orig`);
-    }
-    if (!targetId && !isRev && cleanName && (!normNum || normNum === 'WIKI')) {
-      targetId = keyToId.get(`name:${cleanName}|orig`);
+    if (!targetId && cleanName && normSet && isSyntheticCardNumber(normNum)) {
+      const nmTarget = keyToId.get(`name:${cleanName}|${normSet}|${ver}`);
+      if (nmTarget) {
+        const existingCandidate =
+          next[nmTarget] || BATTLE_SPIRITS_CARDS.find((b) => b.id === nmTarget);
+        if (!existingCandidate || areSameCardIdentity(existingCandidate, candidateForIdentity)) {
+          targetId = nmTarget;
+        }
+      }
     }
     if (!targetId) targetId = c.id;
 
@@ -1491,17 +1558,26 @@ export default function App() {
 
   const setLookupByCode = indexedSetDirectory.byCode;
 
-  const filteredCards = useMemo(
+  const consolidatedCatalog = useMemo(
+    () => consolidateCatalogCards(allCardsList, syncedProductSets),
+    [allCardsList, syncedProductSets]
+  );
+
+  const consolidatedFilterResult = useMemo(
     () =>
-      filterCatalogCards(allCardsList, filters, {
+      filterConsolidatedCatalogCards(consolidatedCatalog, filters, {
         knownSetCodes,
         indexedSetDirectory,
         setLookupByCode,
         releaseRankBySetCode,
         preserveRequestedSort: true,
       }),
-    [allCardsList, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]
+    [consolidatedCatalog, filters, knownSetCodes, releaseRankBySetCode, setLookupByCode, indexedSetDirectory]
   );
+
+  const filteredCards = consolidatedFilterResult.cards;
+  const filteredGroups = consolidatedFilterResult.groups;
+  const matchedPrintingByCanonicalId = consolidatedFilterResult.matchedPrintingIdByCanonicalId;
 
   useEffect(() => {
     setSearchAnchorIndex(0);
@@ -1603,40 +1679,29 @@ export default function App() {
     runLiveWikiSearch,
   ]);
 
-  // Deduplicate live Wiki preview cards against already-loaded local catalog and preserve relevance ranking
-  const uniqueWikiPreviewCards = useMemo(() => {
-    if (wikiSearchResults.length === 0) return [];
-    const localIds = new Set(allCardsList.map((c) => c.id));
-    const localKeys = new Set(
-      allCardsList
-        .map((c) => {
-          const norm = normalizeCardNumber(c.cardNumber || '');
-          return norm && norm !== 'WIKI' ? `${norm}|${c.isRevival ? 'rv' : 'orig'}` : '';
-        })
-        .filter(Boolean)
-    );
-    const deduped = wikiSearchResults.filter((card) => {
-      if (localIds.has(card.id)) return false;
-      const norm = normalizeCardNumber(card.cardNumber || '');
-      if (norm && norm !== 'WIKI') {
-        const key = `${norm}|${card.isRevival ? 'rv' : 'orig'}`;
-        if (localKeys.has(key)) return false;
-      }
-      return true;
-    });
+  // Consolidate and deduplicate live Wiki preview cards against already-loaded local catalog and preserve relevance ranking
+  const consolidatedWikiPreview = useMemo(() => {
+    if (wikiSearchResults.length === 0) {
+      return { groups: [], cards: [] as BattleSpiritsCard[] };
+    }
+    const base = consolidateWikiPreviewCards(wikiSearchResults, allCardsList, syncedProductSets);
     const q = filters.search.trim();
-    if (q && filters.sortBy === 'relevance' && deduped.length > 1) {
-      return [...deduped].sort((a, b) => {
-        const diff = scoreCardSearchMatch(b, q) - scoreCardSearchMatch(a, q);
+    if (q && filters.sortBy === 'relevance' && base.groups.length > 1) {
+      const sortedGroups = [...base.groups].sort((a, b) => {
+        const diff =
+          scoreCardSearchMatch(b.canonicalCard, q) - scoreCardSearchMatch(a.canonicalCard, q);
         if (diff !== 0) return diff;
         return (
-          (a.isRevival ? 1 : 0) - (b.isRevival ? 1 : 0) ||
-          a.cardNumber.localeCompare(b.cardNumber)
+          (a.canonicalCard.isRevival ? 1 : 0) - (b.canonicalCard.isRevival ? 1 : 0) ||
+          a.canonicalCard.cardNumber.localeCompare(b.canonicalCard.cardNumber)
         );
       });
+      return { groups: sortedGroups, cards: sortedGroups.map((g) => g.canonicalCard) };
     }
-    return deduped;
-  }, [wikiSearchResults, allCardsList, filters.search, filters.sortBy]);
+    return { groups: base.groups, cards: base.consolidatedCards };
+  }, [wikiSearchResults, allCardsList, syncedProductSets, filters.search, filters.sortBy]);
+
+  const uniqueWikiPreviewCards = consolidatedWikiPreview.cards;
 
   // Pre-fetch upcoming card images in Search gallery using wikiImageClient cache
   useWikiImagePrefetch({
@@ -2228,6 +2293,7 @@ export default function App() {
             productSets={syncedProductSets}
             cards={allCardsList}
             cardsById={cardsMap}
+            groupByMemberId={consolidatedCatalog.groupByMemberId}
             activeDeckQtyMap={activeDeckQtyMap}
             activeFormat={filters.format}
             currentUser={currentUser}
@@ -2263,7 +2329,7 @@ export default function App() {
                   )}
                 </div>
                 <span className="font-mono text-xs text-slate-500 tabular-nums">
-                  {filteredCards.length} / {allCardsList.length}
+                  {filteredCards.length} / {consolidatedCatalog.consolidatedCards.length}
                 </span>
               </div>
               <div className="p-4 overflow-y-auto flex-1">
@@ -2573,10 +2639,11 @@ export default function App() {
                         </span>
                       </div>
                       <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-                        {uniqueWikiPreviewCards.map((card) => (
+                        {consolidatedWikiPreview.groups.map((grp) => (
                           <CardThumbnail
-                            key={`wiki-preview-${card.id}`}
-                            card={card}
+                            key={`wiki-preview-${grp.canonicalId}`}
+                            card={grp.canonicalCard}
+                            printings={grp.printings}
                             deckQty={0}
                             onSelect={setSelectedCard}
                             onAddToDeck={() =>
@@ -2595,11 +2662,14 @@ export default function App() {
               ) : (
                 <div className="space-y-6">
                   <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-                    {filteredCards.map((card, idx) => (
+                    {filteredGroups.map((group, idx) => (
                       <CardThumbnail
-                        key={card.id}
-                        card={card}
-                        deckQty={activeDeckQtyMap[card.id] || 0}
+                        key={group.canonicalId}
+                        card={group.canonicalCard}
+                        deckQty={activeDeckQtyMap[group.canonicalCard.id] || 0}
+                        printings={group.printings}
+                        preferredPrintingId={matchedPrintingByCanonicalId[group.canonicalId]}
+                        activeDeckQtyMap={activeDeckQtyMap}
                         onSelect={setSelectedCard}
                         onAddToDeck={handleQuickAddToDeck}
                         onHoverOrFocus={() => setSearchAnchorIndex(idx)}
@@ -2642,10 +2712,11 @@ export default function App() {
                             </span>
                           </div>
                           <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-                            {uniqueWikiPreviewCards.map((card) => (
+                            {consolidatedWikiPreview.groups.map((grp) => (
                               <CardThumbnail
-                                key={`wiki-preview-${card.id}`}
-                                card={card}
+                                key={`wiki-preview-${grp.canonicalId}`}
+                                card={grp.canonicalCard}
+                                printings={grp.printings}
                                 deckQty={0}
                                 onSelect={setSelectedCard}
                                 onAddToDeck={() =>
@@ -2928,6 +2999,10 @@ export default function App() {
         card={activeSelectedCard}
         allCards={allCardsList}
         navigableCards={navigableCards}
+        reprintGroup={
+          activeSelectedCard ? consolidatedCatalog.groupByMemberId[activeSelectedCard.id] : undefined
+        }
+        canonicalIdByMemberId={consolidatedCatalog.canonicalIdByMemberId}
         deckQty={activeSelectedCard ? activeDeckQtyMap[activeSelectedCard.id] || 0 : 0}
         activeDeckQtyMap={activeDeckQtyMap}
         activeDeckName={activeDeck?.name || 'Deck'}

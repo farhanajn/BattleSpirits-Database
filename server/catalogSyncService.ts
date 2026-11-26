@@ -2057,8 +2057,10 @@ export async function scanWikiSetByCode(
   try {
     const rawCardsMap = new Map<string, { card: BattleSpiritsCard; warning?: string }>();
     const addRaw = (c: BattleSpiritsCard, warning?: string) => {
+      const resolvedSet = normalizeSetCode(c.setCode || canonicalCode);
       const normalizedCardNum = normalizeCardNumForCompare(c.cardNumber);
-      const dedupeKey = `${normalizedCardNum}|${(c.wikiTitle || c.name).toLowerCase()}|${c.isRevival ? 'rv' : 'orig'}`;
+      const variantTag = c.isToken ? 'tok' : c.isRevival ? 'rv' : 'orig';
+      const dedupeKey = `${resolvedSet}|${normalizedCardNum}|${(c.wikiTitle || c.name).toLowerCase()}|${variantTag}`;
       if (!rawCardsMap.has(dedupeKey)) {
         rawCardsMap.set(dedupeKey, { card: c, warning });
       }

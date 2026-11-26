@@ -10,7 +10,6 @@ import {
   GameFormat,
   ProductSet,
 } from '../types/card';
-import { normalizeCardNumber } from './decklistImport';
 import {
   matchesIndexedSetQuery,
   normalizeSetIdentifier,
@@ -20,6 +19,11 @@ import {
   evaluateCardSearchMatch,
   type CardSearchEvaluation,
 } from './cardSearch';
+import { buildCompositeCardIdentityKey } from './cardIdentity';
+import type {
+  ConsolidatedCardGroup,
+  ConsolidatedCatalogResult,
+} from './reprintConsolidation';
 
 export const COST_BRACKET_OPTIONS: readonly CostBracketFilter[] = [
   'All',
@@ -772,12 +776,9 @@ export function filterCatalogCards(
     const res = evaluateCardFiltersAndSearch(card, filters, effectiveContext);
     if (!res.matched) continue;
 
-    const numKey = normalizeCardNumber(card.cardNumber || '');
-    if (numKey && numKey !== 'WIKI') {
-      const key = `${numKey}|${card.isRevival ? 'rv' : 'orig'}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-    }
+    const identityKey = buildCompositeCardIdentityKey(card);
+    if (seenKeys.has(identityKey)) continue;
+    seenKeys.add(identityKey);
 
     scoredItems.push({ card, score: res.searchEval.score });
   }
@@ -891,6 +892,243 @@ export function filterCatalogCards(
   });
 
   return scoredItems.map((item) => item.card);
+}
+
+export interface ConsolidatedFilterResult {
+  /** One representative card per matching canonical card group (matched printing if a later printing was targeted, otherwise canonical oldest). */
+  cards: BattleSpiritsCard[];
+  /** Canonical group list in sorted order matching `cards`. */
+  groups: ConsolidatedCardGroup[];
+  /** Maps canonicalId -> matched printing cardId when a non-canonical printing specifically matched the active search/filter criteria. */
+  matchedPrintingIdByCanonicalId: Record<string, string>;
+}
+
+/**
+ * Filters and searches consolidated card groups across ALL printings of each card.
+ * - Searches and facet filters (set, card number, set name, format, rarity, version) evaluate every printing.
+ * - Consolidated cards appear at most once in results (using canonical oldest by default).
+ * - If a query or set/facet filter matches a specific later printing (e.g. searching "CB03" or "CB11-045"),
+ *   that matching printing is automatically selected for display in `matchedPrintingIdByCanonicalId`.
+ */
+export function filterConsolidatedCatalogCards(
+  consolidated: ConsolidatedCatalogResult,
+  filters: FilterState,
+  context: CatalogFilterContext = {}
+): ConsolidatedFilterResult {
+  const knownSetCodes = (() => {
+    if (context.knownSetCodes) return context.knownSetCodes;
+    const derived = new Set<string>(['TOKENS', 'REVIVAL']);
+    for (const group of consolidated.groups) {
+      for (const p of group.printings) {
+        if (p.setCode) {
+          derived.add(p.setCode.trim().toUpperCase());
+          const norm = normalizeSetIdentifier(p.setCode);
+          if (norm) derived.add(norm);
+        }
+      }
+    }
+    return derived;
+  })();
+
+  const numericSetCodes = context.indexedSetDirectory?.numericSetCodes;
+  const q = (filters.search || '').trim().toLowerCase();
+  const setQ = (filters.setQuery || '').trim().toLowerCase();
+  const searchSetIntent = q ? resolveSearchSetIntent(q, knownSetCodes, numericSetCodes) : null;
+  const setQIntent = setQ ? resolveSearchSetIntent(setQ, knownSetCodes, numericSetCodes) : null;
+
+  const effectiveContext: CatalogFilterContext = {
+    ...context,
+    knownSetCodes,
+    precomputedSearchSetIntent: searchSetIntent,
+    precomputedSetQIntent: setQIntent,
+  };
+
+  interface ScoredGroupMatch {
+    group: ConsolidatedCardGroup;
+    displayCard: BattleSpiritsCard;
+    matchedPrintingId?: string;
+    score: number;
+  }
+
+  const scoredItems: ScoredGroupMatch[] = [];
+  const seenCanonicalIds = new Set<string>();
+
+  for (const group of consolidated.groups) {
+    if (seenCanonicalIds.has(group.canonicalId)) continue;
+
+    let bestPrintingIdx = -1;
+    let bestScore = -1;
+    let bestSpecificity = -1;
+
+    for (let i = 0; i < group.printings.length; i++) {
+      const printingCard = group.printings[i].card;
+      const res = evaluateCardFiltersAndSearch(printingCard, filters, effectiveContext);
+      if (!res.matched) continue;
+
+      // Boost specificity when this printing's own set/number matched a query or set filter
+      const pSetNorm = normalizeSetIdentifier(printingCard.setCode);
+      let specificity = 0;
+      if (filters.setCode !== 'All' && pSetNorm === normalizeSetIdentifier(filters.setCode)) {
+        specificity += 100;
+      }
+      if (setQIntent && matchesSetIntent(printingCard, setQIntent)) {
+        specificity += 90;
+      }
+      if (searchSetIntent && matchesSetIntent(printingCard, searchSetIntent)) {
+        specificity += 80;
+      }
+      if (res.searchEval.tier === 'exact_card_number') {
+        specificity += 120;
+      } else if (res.searchEval.tier === 'metadata_match') {
+        specificity += 40;
+      }
+
+      if (
+        bestPrintingIdx === -1 ||
+        res.searchEval.score > bestScore ||
+        (res.searchEval.score === bestScore && specificity > bestSpecificity)
+      ) {
+        bestPrintingIdx = i;
+        bestScore = res.searchEval.score;
+        bestSpecificity = specificity;
+      }
+    }
+
+    if (bestPrintingIdx === -1) continue;
+    seenCanonicalIds.add(group.canonicalId);
+
+    const bestPrinting = group.printings[bestPrintingIdx];
+    const matchedPrintingId =
+      bestPrinting.cardId !== group.canonicalId ? bestPrinting.cardId : undefined;
+
+    scoredItems.push({
+      group,
+      displayCard: bestPrinting.card,
+      matchedPrintingId,
+      score: bestScore,
+    });
+  }
+
+  const getMaxBp = (c: BattleSpiritsCard) =>
+    c.levels && c.levels.length > 0 ? c.levels[c.levels.length - 1].bp : 0;
+
+  const targetExactSet =
+    filters.setCode !== 'All'
+      ? normalizeSetIdentifier(filters.setCode)
+      : setQIntent?.exactSetCode || searchSetIntent?.exactSetCode || '';
+  const targetPaddedNum = setQIntent?.paddedSetNum || searchSetIntent?.paddedSetNum || '';
+
+  const getNativePriority = (c: BattleSpiritsCard): number => {
+    const prefix = getCardNumberPrefix(c.cardNumber);
+    const cardSetNorm = normalizeSetIdentifier(c.setCode);
+    if (targetExactSet) {
+      if (prefix === targetExactSet) return 0;
+      if (cardSetNorm === targetExactSet) return 1;
+      return 2;
+    }
+    if (targetPaddedNum) {
+      if (prefix === `BS${targetPaddedNum}`) return 0;
+      if (new RegExp(`(?:^|[^0-9])${targetPaddedNum}$`, 'i').test(prefix)) return 1;
+      return 2;
+    }
+    return prefix === cardSetNorm ? 0 : 1;
+  };
+
+  const getComparableCost = (c: BattleSpiritsCard): number => {
+    const parsed = normalizeCardCost(c.cost);
+    return parsed !== null ? parsed : Number.MAX_SAFE_INTEGER;
+  };
+
+  const releaseRankBySetCode = effectiveContext.releaseRankBySetCode;
+  const useRelevanceRanking =
+    q.length > 0 &&
+    (filters.sortBy === 'relevance' ||
+      (filters.sortBy === 'number' && !effectiveContext.preserveRequestedSort));
+
+  scoredItems.sort((itemA, itemB) => {
+    const a = itemA.displayCard;
+    const b = itemB.displayCard;
+
+    if (useRelevanceRanking) {
+      const scoreDiff = itemB.score - itemA.score;
+      if (scoreDiff !== 0) return scoreDiff;
+      return (
+        (a.isRevival ? 1 : 0) - (b.isRevival ? 1 : 0) ||
+        getNativePriority(a) - getNativePriority(b) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+
+    if (filters.sortBy === 'newest') {
+      const ra = releaseRankBySetCode?.get((a.setCode || '').toUpperCase()) || 0;
+      const rb = releaseRankBySetCode?.get((b.setCode || '').toUpperCase()) || 0;
+      return (
+        rb - ra ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        getNativePriority(a) - getNativePriority(b) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'rarity-desc') {
+      return (
+        (RARITY_RANK[b.rarity] || 0) - (RARITY_RANK[a.rarity] || 0) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'color') {
+      const colorsA = normalizeCardColors(a);
+      const colorsB = normalizeCardColors(b);
+      const ca = colorsA[0] ? COLOR_SORT_ORDER[colorsA[0]] || 99 : 99;
+      const cb = colorsB[0] ? COLOR_SORT_ORDER[colorsB[0]] || 99 : 99;
+      return (
+        ca - cb ||
+        colorsA.length - colorsB.length ||
+        getComparableCost(a) - getComparableCost(b) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'cost-asc') {
+      return (
+        getComparableCost(a) - getComparableCost(b) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'cost-desc') {
+      const ca = normalizeCardCost(a.cost) ?? -1;
+      const cb = normalizeCardCost(b.cost) ?? -1;
+      return (
+        cb - ca ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'bp-desc') {
+      return (
+        getMaxBp(b) - getMaxBp(a) ||
+        (q.length > 0 ? itemB.score - itemA.score : 0) ||
+        a.cardNumber.localeCompare(b.cardNumber)
+      );
+    }
+    if (filters.sortBy === 'name') {
+      return a.name.localeCompare(b.name) || a.cardNumber.localeCompare(b.cardNumber);
+    }
+    return getNativePriority(a) - getNativePriority(b) || a.cardNumber.localeCompare(b.cardNumber);
+  });
+
+  const matchedPrintingIdByCanonicalId: Record<string, string> = {};
+  for (const item of scoredItems) {
+    if (item.matchedPrintingId) {
+      matchedPrintingIdByCanonicalId[item.group.canonicalId] = item.matchedPrintingId;
+    }
+  }
+
+  return {
+    cards: scoredItems.map((item) => item.displayCard),
+    groups: scoredItems.map((item) => item.group),
+    matchedPrintingIdByCanonicalId,
+  };
 }
 
 export { evaluateCardSearchMatch, scoreCardSearchMatch } from './cardSearch';

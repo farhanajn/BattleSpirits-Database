@@ -18,6 +18,7 @@ import {
   sanitizeEffectsArray,
 } from '../src/utils/cardCompletion.ts';
 import { scoreCardSearchMatch } from '../src/utils/cardSearch.ts';
+import { buildCompositeCardIdentityKey } from '../src/utils/cardIdentity.ts';
 import { WIKI_SET_METADATA } from './setMetadata.ts';
 import {
   findManualCardMapping,
@@ -3933,14 +3934,9 @@ export async function searchWikiCards(
   const results: BattleSpiritsCard[] = [];
   const seenKeys = new Set<string>();
   const pushCard = (card: BattleSpiritsCard) => {
-    const dedupeKey = `${card.cardNumber.toUpperCase()}|${card.isRevival ? 'rv' : 'orig'}`;
-    const altNameKey = !card.isRevival
-      ? `orig-name:${card.name.trim().toLowerCase()}`
-      : `rv-name:${card.name.trim().toLowerCase()}`;
-
-    if (seenKeys.has(dedupeKey) || seenKeys.has(altNameKey)) return;
+    const dedupeKey = buildCompositeCardIdentityKey(card);
+    if (seenKeys.has(dedupeKey)) return;
     seenKeys.add(dedupeKey);
-    seenKeys.add(altNameKey);
 
     if (formatFilter === 'All' || card.formats.includes(formatFilter)) {
       results.push(card);
@@ -4091,24 +4087,18 @@ export async function searchWikiCards(
     if (!wt || !/\{\{CardTable/i.test(wt)) continue;
 
     const taggedBlocks = extractTaggedCardTableBlocks(wt);
-    const originalBlock = taggedBlocks.find((t) => !t.isRevival);
-    const revivalBlock = taggedBlocks.find((t) => t.isRevival);
-
-    const versionsToEmit: TaggedCardBlock[] = [];
-    if (originalBlock) versionsToEmit.push(originalBlock);
-    if (revivalBlock) {
-      versionsToEmit.push(revivalBlock);
-    } else if (
-      originalBlock &&
-      /\|-\|\s*Revival\s*=|\{\{!\}\}-\{\{!\}\}\s*Revival\s*=/i.test(originalBlock.block)
+    const versionsToEmit: TaggedCardBlock[] = [...taggedBlocks];
+    if (
+      !taggedBlocks.some((t) => t.isRevival) &&
+      taggedBlocks[0] &&
+      /\|-\|\s*Revival\s*=|\{\{!\}\}-\{\{!\}\}\s*Revival\s*=/i.test(taggedBlocks[0].block)
     ) {
-      versionsToEmit.push({ ...originalBlock, label: 'Revival', isRevival: true });
-    }
-    if (versionsToEmit.length === 0 && taggedBlocks[0]) {
-      versionsToEmit.push(taggedBlocks[0]);
+      versionsToEmit.push({ ...taggedBlocks[0], label: 'Revival', isRevival: true });
     }
 
-    for (const vBlock of versionsToEmit) {
+    const usedBlockIds = new Set<string>();
+    for (let blockIdx = 0; blockIdx < versionsToEmit.length; blockIdx++) {
+      const vBlock = versionsToEmit[blockIdx];
       const fields = parseTemplateFields(vBlock.block);
       const idSlug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
       const { setCode: setCodeRaw, setName, cardNumber } = inferCardSetAndNumber(
@@ -4120,9 +4110,28 @@ export async function searchWikiCards(
       const knownSet = DIRECTORY_MAP.get(setCodeRaw.toUpperCase());
       const baseName = title.replace(/\s*\([^)]+\)\s*$/, '');
       const displayName = vBlock.isRevival ? `${baseName} (Revival)` : baseName;
+      const setSlug =
+        setCodeRaw && setCodeRaw.toUpperCase() !== 'WIKI'
+          ? setCodeRaw.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+          : '';
+      const numSlug =
+        cardNumber && cardNumber.toUpperCase() !== 'WIKI'
+          ? cardNumber.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+          : '';
+      let blockId = `wiki-${idSlug}${vBlock.isRevival ? '-revival' : ''}${
+        vBlock.isSideB ? '-side-b' : ''
+      }`;
+      if (usedBlockIds.has(blockId)) {
+        const extraSlug = [setSlug, numSlug].filter(Boolean).join('-');
+        blockId = extraSlug ? `${blockId}-${extraSlug}` : `${blockId}-v${blockIdx + 1}`;
+        while (usedBlockIds.has(blockId)) {
+          blockId = `${blockId}-${blockIdx + 1}`;
+        }
+      }
+      usedBlockIds.add(blockId);
 
       const base: BattleSpiritsCard = {
-        id: `wiki-${idSlug}${vBlock.isRevival ? '-revival' : ''}`,
+        id: blockId,
         cardNumber,
         name: displayName,
         jpName: '',

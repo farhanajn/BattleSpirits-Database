@@ -45,11 +45,14 @@ import {
   generateCardShareImage,
 } from '../utils/cardShareImage';
 import { useWikiImagePrefetch } from '../hooks/useWikiImagePrefetch';
+import type { ConsolidatedCardGroup } from '../utils/reprintConsolidation';
 
 interface CardDetailSheetProps {
   card: BattleSpiritsCard | null;
   allCards?: BattleSpiritsCard[];
   navigableCards?: BattleSpiritsCard[];
+  reprintGroup?: ConsolidatedCardGroup;
+  canonicalIdByMemberId?: Record<string, string>;
   deckQty: number;
   activeDeckQtyMap?: Record<string, number>;
   activeDeckName: string;
@@ -76,6 +79,8 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
   card,
   allCards = [],
   navigableCards = [],
+  reprintGroup,
+  canonicalIdByMemberId,
   deckQty,
   activeDeckQtyMap = {},
   activeDeckName,
@@ -217,8 +222,11 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
 
   const navIndex = useMemo(() => {
     if (!card || navigableCards.length === 0) return -1;
-    return navigableCards.findIndex((c) => c.id === card.id);
-  }, [navigableCards, card?.id]);
+    const currentCanonical = canonicalIdByMemberId?.[card.id] || card.id;
+    return navigableCards.findIndex(
+      (c) => (canonicalIdByMemberId?.[c.id] || c.id) === currentCanonical
+    );
+  }, [navigableCards, card?.id, canonicalIdByMemberId]);
 
   const prevCard = navIndex > 0 ? navigableCards[navIndex - 1] : null;
   const nextCard =
@@ -234,11 +242,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
         if (item?.url) urls.push(item.url);
       }
     }
+    if (reprintGroup?.printings) {
+      for (const p of reprintGroup.printings) {
+        if (p.card.artworkImage) urls.push(p.card.artworkImage);
+      }
+    }
     if (compareCard?.artworkImage) {
       urls.push(compareCard.artworkImage);
     }
     return urls;
-  }, [card?.galleryImages, compareCard?.artworkImage]);
+  }, [card?.galleryImages, reprintGroup?.printings, compareCard?.artworkImage]);
 
   useWikiImagePrefetch({
     cards: navigableCards,
@@ -1451,6 +1464,64 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
             </div>
           )}
         </div>
+
+        {/* Row 3: Printings Selector (Shown only when this card has consolidated reprints) */}
+        {reprintGroup && reprintGroup.printings.length > 1 && !compareMode && !synergyMode && (
+          <div
+            data-testid="detail-printings-selector"
+            data-no-swipe="true"
+            className="px-4 sm:px-6 py-2 bg-slate-50/70 border-b border-slate-100 flex items-center gap-1.5 overflow-x-auto no-scrollbar shrink-0"
+          >
+            <span className="text-[11px] font-semibold text-slate-500 shrink-0 mr-1 inline-flex items-center gap-1">
+              <Layers className="w-3.5 h-3.5 text-slate-400" />
+              <span>Printings ({reprintGroup.printings.length}):</span>
+            </span>
+            {reprintGroup.printings.map((printing) => {
+              const isActive = printing.cardId === card.id;
+              return (
+                <button
+                  key={printing.cardId}
+                  type="button"
+                  data-testid={`detail-printing-btn-${printing.setCode}`}
+                  aria-pressed={isActive}
+                  onClick={() => onSelectCard?.(printing.card)}
+                  title={`${printing.setCode} · ${printing.cardNumber} — ${printing.setName}${
+                    printing.releaseDateLabel ? ` (${printing.releaseDateLabel})` : ''
+                  }`}
+                  className={`min-h-[32px] px-2.5 py-1 rounded-lg border text-xs font-mono font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                    isActive
+                      ? 'bg-slate-900 text-white border-slate-900 shadow-xs'
+                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100 hover:border-slate-300'
+                  }`}
+                >
+                  <span>{printing.setCode}</span>
+                  <span className={isActive ? 'text-slate-400' : 'text-slate-400'}>·</span>
+                  <span className={isActive ? 'text-slate-200' : 'text-slate-500'}>
+                    {printing.cardNumber}
+                  </span>
+                  <span
+                    className={`text-[10px] ${
+                      isActive ? 'text-amber-300' : 'text-slate-400'
+                    }`}
+                  >
+                    {printing.rarity}
+                  </span>
+                  {printing.isCanonicalOriginal && (
+                    <span
+                      className={`text-[9px] font-sans uppercase tracking-wide px-1 rounded ${
+                        isActive
+                          ? 'bg-white/15 text-amber-200'
+                          : 'bg-slate-100 text-slate-500'
+                      }`}
+                    >
+                      Orig
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         <div
           className={`overflow-y-auto overflow-x-hidden flex-1 px-4 sm:px-6 py-4 space-y-5 ${

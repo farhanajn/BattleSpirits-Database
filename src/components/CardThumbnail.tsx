@@ -1,14 +1,18 @@
-import React from 'react';
-import { Plus, Check, Ban } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Plus, Check, Ban, ChevronDown } from 'lucide-react';
 import { BattleSpiritsCard, CardColor } from '../types/card';
 import { COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
 import { getMaxCardCopies, getRestrictionBadgeLabel, isTokenCard } from '../utils/cardRules';
+import type { CardPrintingOption } from '../utils/reprintConsolidation';
 
 interface CardThumbnailProps {
   card: BattleSpiritsCard;
   deckQty: number;
+  printings?: CardPrintingOption[];
+  preferredPrintingId?: string;
+  activeDeckQtyMap?: Record<string, number>;
   onSelect: (card: BattleSpiritsCard) => void;
   onAddToDeck: (card: BattleSpiritsCard) => void;
   onHoverOrFocus?: () => void;
@@ -17,25 +21,142 @@ interface CardThumbnailProps {
 export const CardThumbnail: React.FC<CardThumbnailProps> = ({
   card,
   deckQty,
+  printings,
+  preferredPrintingId,
+  activeDeckQtyMap,
   onSelect,
   onAddToDeck,
   onHoverOrFocus,
 }) => {
+  const effectivePrintings = useMemo<CardPrintingOption[]>(() => {
+    if (printings && printings.length > 0) return printings;
+    return [
+      {
+        card,
+        cardId: card.id,
+        setCode: card.setCode,
+        setName: card.setName,
+        cardNumber: card.cardNumber,
+        rarity: card.rarity,
+        formats: card.formats,
+        isRevival: Boolean(card.isRevival),
+        releaseDateLabel: '',
+        releaseSortKey: 0,
+        isCanonicalOriginal: true,
+      },
+    ];
+  }, [printings, card]);
+
+  const [selectedPrintingId, setSelectedPrintingId] = useState<string>(
+    () => preferredPrintingId || effectivePrintings[0]?.cardId || card.id
+  );
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const [maxInlineCount, setMaxInlineCount] = useState(3);
+
+  const badgeRowRef = useRef<HTMLDivElement | null>(null);
+  const popoverContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const nextDefault = preferredPrintingId || effectivePrintings[0]?.cardId || card.id;
+    setSelectedPrintingId(nextDefault);
+    setOverflowOpen(false);
+  }, [preferredPrintingId, card.id, effectivePrintings]);
+
+  useEffect(() => {
+    const el = badgeRowRef.current;
+    if (!el || effectivePrintings.length <= 1) return;
+
+    const computeCapacity = (width: number) => {
+      if (!Number.isFinite(width) || width <= 0) return;
+      // Reserve ~44px for the +N overflow trigger when more badges remain; each compact badge averages ~54px
+      const withoutOverflowCapacity = Math.floor((width + 4) / 56);
+      if (effectivePrintings.length <= withoutOverflowCapacity) {
+        setMaxInlineCount(effectivePrintings.length);
+        return;
+      }
+      const nextMax = Math.max(2, Math.min(4, Math.floor((width - 44) / 56)));
+      setMaxInlineCount(nextMax);
+    };
+
+    computeCapacity(el.clientWidth);
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        computeCapacity(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [effectivePrintings.length]);
+
+  useEffect(() => {
+    if (!overflowOpen) return;
+    const handlePointerDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (popoverContainerRef.current && target && !popoverContainerRef.current.contains(target)) {
+        setOverflowOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOverflowOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('touchstart', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('touchstart', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [overflowOpen]);
+
+  const activePrinting =
+    effectivePrintings.find((p) => p.cardId === selectedPrintingId) ||
+    effectivePrintings[0];
+  const activeCard = activePrinting?.card || card;
+
+  const { inlinePrintings, overflowPrintings } = useMemo(() => {
+    if (effectivePrintings.length <= 1) {
+      return { inlinePrintings: effectivePrintings, overflowPrintings: [] as CardPrintingOption[] };
+    }
+    if (effectivePrintings.length <= maxInlineCount) {
+      return { inlinePrintings: effectivePrintings, overflowPrintings: [] as CardPrintingOption[] };
+    }
+    const baseSlice = effectivePrintings.slice(0, maxInlineCount);
+    const activeIsInline = baseSlice.some((p) => p.cardId === activeCard.id);
+    if (activeIsInline || maxInlineCount < 2) {
+      return {
+        inlinePrintings: baseSlice,
+        overflowPrintings: effectivePrintings.slice(maxInlineCount),
+      };
+    }
+    // Keep oldest canonical badge first and swap active printing into the visible bar
+    const visible = [...effectivePrintings.slice(0, maxInlineCount - 1), activePrinting];
+    const visibleIds = new Set(visible.map((p) => p.cardId));
+    const hidden = effectivePrintings.filter((p) => !visibleIds.has(p.cardId));
+    return { inlinePrintings: visible, overflowPrintings: hidden };
+  }, [effectivePrintings, maxInlineCount, activeCard.id, activePrinting]);
+
+  const activeDeckQty =
+    activeDeckQtyMap !== undefined ? activeDeckQtyMap[activeCard.id] ?? 0 : deckQty;
+
   const cardColors: CardColor[] =
-    card.colors && card.colors.length > 0
-      ? card.colors
-      : card.secondaryColor
-      ? [card.color, card.secondaryColor]
-      : [card.color];
+    activeCard.colors && activeCard.colors.length > 0
+      ? activeCard.colors
+      : activeCard.secondaryColor
+      ? [activeCard.color, activeCard.secondaryColor]
+      : [activeCard.color];
 
-  const meta = COLOR_META[cardColors[0] || card.color];
+  const meta = COLOR_META[cardColors[0] || activeCard.color];
 
-  const isStandardLegal = card.formats.includes('Standard');
-  const isToken = isTokenCard(card);
-  const maxCopies = getMaxCardCopies(card);
-  const restrictionBadge = isToken ? 'TOKEN' : getRestrictionBadgeLabel(card.restriction);
+  const isStandardLegal = activeCard.formats.includes('Standard');
+  const isToken = isTokenCard(activeCard);
+  const maxCopies = getMaxCardCopies(activeCard);
+  const restrictionBadge = isToken ? 'TOKEN' : getRestrictionBadgeLabel(activeCard.restriction);
   const isBanned = !isToken && maxCopies === 0;
-  const cannotAdd = (isToken || isBanned) && deckQty === 0;
+  const cannotAdd = (isToken || isBanned) && activeDeckQty === 0;
 
   const accentBackground =
     cardColors.length > 1
@@ -51,70 +172,227 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       ? `${cardColors[0]}/${cardColors[1]}`
       : `${cardColors.length}-Color`;
 
+  const handleSelectPrinting = (printing: CardPrintingOption, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedPrintingId(printing.cardId);
+    setOverflowOpen(false);
+  };
+
   return (
     <article
       onMouseEnter={onHoverOrFocus}
       onFocus={onHoverOrFocus}
-      className="group bg-white border border-slate-200 rounded-2xl overflow-hidden flex flex-col transition-colors hover:border-slate-300"
+      className={`group relative bg-white border border-slate-200 rounded-2xl flex flex-col transition-colors hover:border-slate-300 ${
+        overflowOpen ? 'z-30' : 'z-0'
+      }`}
     >
       <button
         type="button"
-        onClick={() => onSelect(card)}
-        className="text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600 focus-visible:ring-inset flex-1 flex flex-col cursor-pointer"
+        onClick={() => onSelect(activeCard)}
+        className="text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600 focus-visible:ring-inset cursor-pointer rounded-t-2xl overflow-hidden"
+        aria-label={`View ${activeCard.name} (${activeCard.cardNumber}) details`}
       >
-        <div className="relative aspect-[4/3] w-full">
-          <CardArtwork card={card} className="w-full h-full" />
+        <div className="relative aspect-[4/3] w-full bg-slate-900 overflow-hidden">
+          <CardArtwork card={activeCard} className="w-full h-full" />
+
+          <span
+            data-testid="card-set-badge"
+            title={
+              activeCard.setName
+                ? `${activeCard.setCode || 'WIKI'} — ${activeCard.setName}`
+                : activeCard.setCode || 'WIKI'
+            }
+            className="pointer-events-none absolute top-2 right-2 z-10 inline-flex items-center px-2 py-0.5 rounded-full bg-slate-900/85 backdrop-blur-sm text-white font-mono text-[10px] font-bold tracking-wide shadow-sm ring-1 ring-white/25"
+          >
+            {activeCard.setCode?.trim() || 'WIKI'}
+          </span>
 
           <div
             className="absolute bottom-0 inset-x-0 h-[3px]"
             style={{ background: accentBackground }}
           />
         </div>
+      </button>
 
-        <div className="p-3 pb-2 flex-1 flex flex-col justify-between gap-1.5">
+      {effectivePrintings.length > 1 && (
+        <div
+          ref={popoverContainerRef}
+          data-testid="card-printing-badges"
+          className="relative px-3 pt-2 pb-0.5"
+        >
+          <div
+            ref={badgeRowRef}
+            className="flex items-center flex-wrap gap-1"
+            role="group"
+            aria-label={`Available printings for ${activeCard.name}`}
+          >
+            {inlinePrintings.map((printing) => {
+              const isActive = printing.cardId === activeCard.id;
+              return (
+                <button
+                  key={printing.cardId}
+                  type="button"
+                  data-testid={`printing-badge-${printing.setCode}`}
+                  aria-pressed={isActive}
+                  onClick={(e) => handleSelectPrinting(printing, e)}
+                  title={`${printing.setCode} · ${printing.cardNumber}${
+                    printing.setName ? ` — ${printing.setName}` : ''
+                  }${printing.isCanonicalOriginal ? ' (Original Release)' : ''}`}
+                  className={`px-1.5 py-0.5 rounded-md border font-mono text-[10px] font-bold tracking-tight transition-colors cursor-pointer leading-tight ${
+                    isActive
+                      ? 'bg-slate-900 text-white border-slate-900 shadow-xs'
+                      : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  {printing.setCode}
+                </button>
+              );
+            })}
+
+            {overflowPrintings.length > 0 && (
+              <button
+                type="button"
+                data-testid="printing-badges-overflow"
+                aria-expanded={overflowOpen}
+                aria-haspopup="menu"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setOverflowOpen((prev) => !prev);
+                }}
+                title={`${overflowPrintings.length} more printing${
+                  overflowPrintings.length === 1 ? '' : 's'
+                }`}
+                className={`px-1.5 py-0.5 rounded-md border font-mono text-[10px] font-bold tracking-tight inline-flex items-center gap-0.5 transition-colors cursor-pointer leading-tight ${
+                  overflowOpen
+                    ? 'bg-red-600 text-white border-red-600'
+                    : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200 hover:border-slate-300'
+                }`}
+              >
+                <span>+{overflowPrintings.length}</span>
+                <ChevronDown className="w-2.5 h-2.5" />
+              </button>
+            )}
+          </div>
+
+          {overflowOpen && overflowPrintings.length > 0 && (
+            <div
+              role="menu"
+              data-testid="printing-overflow-popover"
+              aria-label="Additional card printings"
+              className="absolute left-3 right-3 sm:right-auto sm:min-w-[220px] sm:max-w-[260px] top-full mt-1 z-40 rounded-xl border border-slate-200 bg-white shadow-xl p-1.5 space-y-0.5"
+            >
+              <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                Other Printings ({overflowPrintings.length})
+              </div>
+              {overflowPrintings.map((printing) => {
+                const isActive = printing.cardId === activeCard.id;
+                return (
+                  <button
+                    key={printing.cardId}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={isActive}
+                    data-testid={`printing-overflow-item-${printing.setCode}`}
+                    onClick={(e) => handleSelectPrinting(printing, e)}
+                    className={`w-full px-2 py-1.5 rounded-lg text-left flex items-center justify-between gap-2 text-xs transition-colors cursor-pointer ${
+                      isActive
+                        ? 'bg-slate-900 text-white'
+                        : 'text-slate-800 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 font-mono font-bold text-[11px]">
+                        <span>{printing.setCode}</span>
+                        <span className={isActive ? 'text-slate-300' : 'text-slate-400'}>·</span>
+                        <span className={isActive ? 'text-slate-200' : 'text-slate-600'}>
+                          {printing.cardNumber}
+                        </span>
+                      </div>
+                      <div
+                        className={`text-[10px] truncate ${
+                          isActive ? 'text-slate-300' : 'text-slate-500'
+                        }`}
+                      >
+                        {printing.setName}
+                      </div>
+                    </div>
+                    <span
+                      className={`font-mono text-[10px] font-bold shrink-0 ${
+                        isActive ? 'text-amber-300' : 'text-slate-500'
+                      }`}
+                    >
+                      {printing.rarity}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => onSelect(activeCard)}
+        className="text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-red-600 focus-visible:ring-inset flex-1 flex flex-col cursor-pointer"
+      >
+        <div
+          className={`px-3 pb-2 ${
+            effectivePrintings.length > 1 ? 'pt-1.5' : 'pt-3'
+          } flex-1 flex flex-col justify-between gap-1.5 w-full`}
+        >
           <div>
             <div className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
-              <span className="font-mono tabular-nums shrink-0">{card.cardNumber}</span>
+              <span className="font-mono tabular-nums shrink-0">{activeCard.cardNumber}</span>
               <span aria-hidden="true">·</span>
-              <span className="shrink-0">{card.rarity}</span>
+              <span className="shrink-0">{activeCard.rarity}</span>
               <span aria-hidden="true">·</span>
               <span className="inline-flex items-center gap-1 min-w-0">
                 {cardColors.slice(0, 3).map((c) => (
                   <SymbolIcon key={c} color={c} size="xs" variant="gem" />
                 ))}
                 <span className={`${meta.text} font-semibold truncate`}>
-                  {colorLabel} {card.subtypeLabel || card.type}
+                  {colorLabel} {activeCard.subtypeLabel || activeCard.type}
                 </span>
               </span>
             </div>
             <h3 className="mt-1 font-display text-sm font-semibold text-slate-900 leading-snug line-clamp-2">
-              {card.name}
+              {activeCard.name}
             </h3>
           </div>
 
-          <p className="text-[11px] text-slate-500 truncate" title={`${card.setCode} — ${card.setName}`}>
-            {card.families.length > 0 ? card.families.join(' / ') : card.setName}
+          <p
+            className="text-[11px] text-slate-500 truncate"
+            title={`${activeCard.setCode} — ${activeCard.setName}`}
+          >
+            {activeCard.families.length > 0 ? activeCard.families.join(' / ') : activeCard.setName}
           </p>
         </div>
       </button>
 
-      <div className="px-3 pb-2.5 pt-1 border-t border-slate-100 flex items-center justify-between gap-2">
+      <div className="px-3 pb-2.5 pt-1 border-t border-slate-100 flex items-center justify-between gap-2 rounded-b-2xl">
         <div
           className="min-w-0 flex items-center gap-1 text-[11px] text-slate-500 truncate"
-          title={`${card.setCode} — ${card.setName}`}
+          title={`${activeCard.setCode} — ${activeCard.setName}`}
         >
-          <span className="font-mono font-semibold text-slate-700 shrink-0">{card.setCode}</span>
+          <span className="font-mono font-semibold text-slate-700 shrink-0">{activeCard.setCode}</span>
           <span aria-hidden="true">·</span>
-          <span className="truncate">{card.setName}</span>
+          <span className="truncate">{activeCard.setName}</span>
           <span aria-hidden="true">·</span>
-          <span className={`font-mono shrink-0 ${isStandardLegal ? 'text-sky-700 font-semibold' : 'text-amber-700 font-semibold'}`}>
+          <span
+            className={`font-mono shrink-0 ${
+              isStandardLegal ? 'text-sky-700 font-semibold' : 'text-amber-700 font-semibold'
+            }`}
+          >
             {isStandardLegal ? 'STD/ETN' : 'ETN'}
           </span>
-          {card.galleryImages && card.galleryImages.length > 1 && (
+          {activeCard.galleryImages && activeCard.galleryImages.length > 1 && (
             <>
               <span aria-hidden="true">·</span>
               <span className="text-slate-700 font-mono font-semibold shrink-0">
-                {card.galleryImages.length} arts
+                {activeCard.galleryImages.length} arts
               </span>
             </>
           )}
@@ -130,7 +408,7 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
 
         <button
           type="button"
-          onClick={() => onAddToDeck(card)}
+          onClick={() => onAddToDeck(activeCard)}
           disabled={cannotAdd}
           title={
             isToken
@@ -140,34 +418,34 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
               : undefined
           }
           className={`min-h-[44px] min-w-[44px] px-3 inline-flex items-center justify-center gap-1 rounded-xl text-xs font-semibold transition-colors shrink-0 ${
-            isToken && deckQty === 0
+            isToken && activeDeckQty === 0
               ? 'bg-slate-100 text-slate-500 border border-slate-200 cursor-not-allowed'
-              : isBanned && deckQty === 0
+              : isBanned && activeDeckQty === 0
               ? 'bg-red-50 text-red-700/80 border border-red-200 cursor-not-allowed'
-              : deckQty > 0
+              : activeDeckQty > 0
               ? 'bg-red-50 text-red-700 hover:bg-red-100 cursor-pointer'
               : 'bg-slate-100 text-slate-800 hover:bg-slate-200 cursor-pointer'
           }`}
           aria-label={
             isToken
-              ? `${card.name} is a Token card used outside the main deck`
+              ? `${activeCard.name} is a Token card used outside the main deck`
               : isBanned
-              ? `${card.name} is banned from deck construction`
-              : `Add ${card.name} to active deck`
+              ? `${activeCard.name} is banned from deck construction`
+              : `Add ${activeCard.name} to active deck`
           }
         >
-          {isToken && deckQty === 0 ? (
+          {isToken && activeDeckQty === 0 ? (
             <span className="whitespace-nowrap">Token</span>
-          ) : isBanned && deckQty === 0 ? (
+          ) : isBanned && activeDeckQty === 0 ? (
             <>
               <Ban className="w-3.5 h-3.5" />
               <span className="whitespace-nowrap">Banned</span>
             </>
-          ) : deckQty > 0 ? (
+          ) : activeDeckQty > 0 ? (
             <>
               <Check className="w-3.5 h-3.5" />
               <span className="font-mono tabular-nums whitespace-nowrap">
-                {deckQty}/{maxCopies}
+                {activeDeckQty}/{maxCopies}
               </span>
             </>
           ) : (
