@@ -1,11 +1,11 @@
-import type { BattleSpiritsCard } from '../types/card';
+import type { BattleSpiritsCard } from '../types/card.ts';
 import {
   compactCardNumber,
   extractSetCodeFromCardNumber,
   normalizeCardName,
   normalizeCardNumber,
-} from './decklistImport';
-import { normalizeSetIdentifier } from './setMetadataSync';
+} from './decklistImport.ts';
+import { normalizeSetIdentifier } from './setMetadataSync.ts';
 
 export type CardIdentityInput = Partial<
   Pick<

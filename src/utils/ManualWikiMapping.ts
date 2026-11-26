@@ -1,4 +1,4 @@
-import type { BattleSpiritsCard } from '../types/card';
+import type { BattleSpiritsCard } from '../types/card.ts';
 
 export interface ManualWikiMappingEntry {
   /** Primary stable card id (e.g. 'bs72-bs72-084') */

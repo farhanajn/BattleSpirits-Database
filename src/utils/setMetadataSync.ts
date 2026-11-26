@@ -1,4 +1,4 @@
-import type { BattleSpiritsCard, CardColor, GameFormat, ProductSet, SetCategory } from '../types/card';
+import type { BattleSpiritsCard, CardColor, GameFormat, ProductSet, SetCategory } from '../types/card.ts';
 
 const FAST_SET_CACHE_KEY = 'spiritsdex_set_metadata_v1';
 const GENERIC_NAME_RE =

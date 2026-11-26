@@ -1,4 +1,4 @@
-import { BattleSpiritsCard, GameFormat } from '../types/card';
+import type { BattleSpiritsCard, GameFormat } from '../types/card.ts';
 
 export type CardRestrictionLevel =
   | 'Unlimited'

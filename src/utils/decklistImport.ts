@@ -1,5 +1,5 @@
-import { BattleSpiritsCard, DeckEntry, GameFormat } from '../types/card';
-import { getMaxCardCopies, isTokenCard } from './cardRules';
+import type { BattleSpiritsCard, DeckEntry, GameFormat } from '../types/card.ts';
+import { getMaxCardCopies, isTokenCard } from './cardRules.ts';
 
 export type ImportMatchConfidence =
   | 'exact-number'

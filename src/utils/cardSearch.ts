@@ -1,6 +1,6 @@
-import { BattleSpiritsCard, ProductSet } from '../types/card';
-import { compactCardNumber, normalizeCardNumber } from './decklistImport';
-import { normalizeSetIdentifier } from './setMetadataSync';
+import type { BattleSpiritsCard, ProductSet } from '../types/card.ts';
+import { compactCardNumber, normalizeCardNumber } from './decklistImport.ts';
+import { normalizeSetIdentifier } from './setMetadataSync.ts';
 
 const JAPANESE_CHAR_RE = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/;
 
