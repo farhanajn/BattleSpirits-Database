@@ -1,4 +1,3 @@
-import { type User } from 'firebase/auth';
 import {
   collection,
   doc,
@@ -260,19 +259,6 @@ function normalizeValidFormats(raw: unknown): GameFormat[] {
     : [];
   const unique = Array.from(new Set(list));
   return unique.length > 0 ? unique.slice(0, 4) : ['Eternal'];
-}
-
-export async function isVerifiedAdminUser(user: User | null): Promise<boolean> {
-  if (!user || !user.emailVerified) return false;
-  if (user.email && ADMIN_EMAILS.has(user.email.toLowerCase())) {
-    return true;
-  }
-  try {
-    const marker = await getDoc(doc(db, 'admins', user.uid));
-    return marker.exists() && marker.data()?.role === 'admin';
-  } catch {
-    return false;
-  }
 }
 
 const PUBLISHED_CATALOG_CACHE_KEY = 'spiritsdex_published_catalog_cache_v1';

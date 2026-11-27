@@ -43,29 +43,6 @@ export interface SequentialLookupResult {
   fromCache?: boolean;
 }
 
-export interface ClientArtworkDiagnosticItem {
-  cardId: string;
-  cardName: string;
-  cardNumber: string;
-  setCode: string;
-  searchMethodAttempted: string;
-  stagesAttempted: string[];
-  wikiSearchResults: string[];
-  resolvedUrl: string | null;
-  resolvedStage: string | null;
-  ok: boolean;
-  failureReason: string | null;
-  needsManualMapping: boolean;
-}
-
-export interface ClientArtworkDiagnosticReport {
-  totalChecked: number;
-  matchedCount: number;
-  missingCount: number;
-  needsManualMappingCount: number;
-  report: ClientArtworkDiagnosticItem[];
-}
-
 interface PersistedImageEntry {
   s: WikiImageCacheStatus;
   t: number;
@@ -208,11 +185,6 @@ export function clearCardSessionLookupFailure(
   card: Pick<BattleSpiritsCard, 'id' | 'cardNumber' | 'name' | 'jpName' | 'isRevival'>
 ) {
   sessionFailedCards.delete(getCardLookupKey(card));
-}
-
-export function clearAllSessionLookupFailures() {
-  sessionFailedCards.clear();
-  sequentialResolutionCache.clear();
 }
 
 export function normalizeCardNameForMatch(raw: string): string {
@@ -953,62 +925,6 @@ export async function resolveCardArtworkSequential(
 
   inflightCardResolutions.set(cardKey, task);
   return task;
-}
-
-/**
- * Generates a structured diagnostic report for missing/failing artwork across cards.
- */
-export async function diagnoseCardsArtwork(
-  cards: BattleSpiritsCard[],
-  options?: { concurrency?: number; forceRefresh?: boolean; signal?: AbortSignal }
-): Promise<ClientArtworkDiagnosticReport> {
-  const concurrency = Math.max(1, Math.min(8, options?.concurrency ?? 4));
-  const report: ClientArtworkDiagnosticItem[] = new Array(cards.length);
-  let cursor = 0;
-
-  const worker = async () => {
-    while (true) {
-      if (options?.signal?.aborted) break;
-      const idx = cursor++;
-      if (idx >= cards.length) break;
-      const card = cards[idx];
-      const res = await resolveCardArtworkSequential(card, {
-        forceRefresh: options?.forceRefresh,
-        signal: options?.signal,
-      });
-      report[idx] = {
-        cardId: card.id,
-        cardName: card.name,
-        cardNumber: card.cardNumber,
-        setCode: card.setCode,
-        searchMethodAttempted: res.stagesAttempted[0] || 'exact-name',
-        stagesAttempted: res.stagesAttempted,
-        wikiSearchResults: res.wikiSearchResults,
-        resolvedUrl: res.url,
-        resolvedStage: res.stage,
-        ok: res.ok,
-        failureReason: res.failureReason,
-        needsManualMapping: res.needsManualMapping,
-      };
-    }
-  };
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, Math.max(1, cards.length)) }, () => worker())
-  );
-
-  const validReport = report.filter(Boolean);
-  const matchedCount = validReport.filter((r) => r.ok).length;
-  const missingCount = validReport.length - matchedCount;
-  const needsManualMappingCount = validReport.filter((r) => r.needsManualMapping).length;
-
-  return {
-    totalChecked: validReport.length,
-    matchedCount,
-    missingCount,
-    needsManualMappingCount,
-    report: validReport,
-  };
 }
 
 export function preloadWikiImage(src: string): Promise<boolean> {

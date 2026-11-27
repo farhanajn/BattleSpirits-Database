@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { BattleSpiritsCard, FilterState, ProductSet, SortOption } from '../src/types/card';
+import type { BattleSpiritsCard, FilterState, SortOption } from '../src/types/card';
 import {
   filterCatalogCards,
   INITIAL_FILTER_STATE,

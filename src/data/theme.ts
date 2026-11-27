@@ -1,4 +1,4 @@
-import { BattleSymbolKind, CardColor, CardRarity, CardType, GameFormat } from '../types/card';
+import { BattleSymbolKind, CardColor, CardRarity, CardType } from '../types/card';
 
 export interface ColorMeta {
   label: string;
@@ -123,32 +123,6 @@ export const SYMBOL_META: Record<
     hex: '#B45309',
     text: 'text-amber-700',
     image: '/assets/symbols/ultimate.png',
-  },
-};
-
-export const FORMAT_META: Record<
-  GameFormat,
-  {
-    label: string;
-    shortLabel: string;
-    textClass: string;
-    accentBg: string;
-    description: string;
-  }
-> = {
-  Standard: {
-    label: 'Standard',
-    shortLabel: 'STD',
-    textClass: 'text-sky-700',
-    accentBg: 'bg-sky-700',
-    description: 'Curated rotating format using current Block Icon cards & reprints.',
-  },
-  Eternal: {
-    label: 'Eternal',
-    shortLabel: 'ETN',
-    textClass: 'text-amber-700',
-    accentBg: 'bg-amber-700',
-    description: 'All-era legacy format allowing every released set except banned cards.',
   },
 };
 

@@ -141,46 +141,6 @@ function broadcastSharedFeaturedConfig(config: SharedFeaturedConfigState): void 
   }
 }
 
-export async function fetchSharedFeaturedConfig(): Promise<SharedFeaturedConfigState> {
-  const cached = readCachedSharedFeaturedConfig();
-  if (isCloudQuotaCooldownActive()) {
-    return cached;
-  }
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    return cached;
-  }
-
-  try {
-    const snap = await getDoc(
-      doc(db, SHARED_FEATURED_CONFIG_COLLECTION, SHARED_FEATURED_CONFIG_DOC_ID)
-    );
-    if (!snap.exists()) {
-      const fallback: SharedFeaturedConfigState = {
-        mode: DEFAULT_FEATURED_MODE,
-        source: 'default',
-      };
-      writeCachedSharedFeaturedConfig(fallback);
-      return fallback;
-    }
-    const data = snap.data();
-    const state: SharedFeaturedConfigState = {
-      mode: normalizeFeaturedMode(data?.mode),
-      updatedByUid: typeof data?.updatedByUid === 'string' ? data.updatedByUid : undefined,
-      updatedAtIso: extractIsoTimestamp(data?.updatedAt),
-      source: 'firestore',
-    };
-    writeCachedSharedFeaturedConfig(state);
-    return state;
-  } catch (err) {
-    if (isFirestoreQuotaError(err)) {
-      markCloudQuotaExhausted();
-    } else {
-      logFeaturedConfigError(err, OperationType.GET, SHARED_FEATURED_CONFIG_PATH);
-    }
-    return cached;
-  }
-}
-
 /**
  * Subscribes to the shared Firestore Featured Cards config document so mode updates
  * made by an administrator propagate globally to all active users with minimal reads.

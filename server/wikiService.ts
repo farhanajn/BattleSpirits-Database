@@ -10,7 +10,6 @@ import type {
   GameFormat,
   LevelTier,
   ProductSet,
-  SetCategory,
 } from '../src/types/card.ts';
 import {
   evaluateCardCompleteness,

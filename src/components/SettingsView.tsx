@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import {
   Cloud,
   Loader2,
@@ -14,8 +14,11 @@ import type { User } from 'firebase/auth';
 import type { BattleSpiritsCard, ProductSet } from '../types/card';
 import { RulingsView } from './RulingsView';
 import { PWAInstallButton } from './PWAControls';
-import { AdminCatalogSection } from './AdminCatalogSection';
 import { useAdmin } from '../hooks/useAdmin';
+
+const AdminCatalogSection = lazy(() =>
+  import('./AdminCatalogSection').then((m) => ({ default: m.AdminCatalogSection }))
+);
 
 interface SettingsViewProps {
   currentUser: User | null;
@@ -244,12 +247,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       {/* Admin Catalog Sync, Comparison, Safe Import & Manual Artwork URL Validation */}
       {canRenderAdminTools && (
-        <AdminCatalogSection
-          currentUser={currentUser}
-          authReady={authReady}
-          onCatalogImported={onCatalogImported}
-          onNotify={onNotify}
-        />
+        <Suspense fallback={null}>
+          <AdminCatalogSection
+            currentUser={currentUser}
+            authReady={authReady}
+            onCatalogImported={onCatalogImported}
+            onNotify={onNotify}
+          />
+        </Suspense>
       )}
 
       {/* Official Rules, Format Guide & Turn Sequence */}

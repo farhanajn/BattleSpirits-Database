@@ -16,7 +16,6 @@ export const DEFAULT_FEATURED_CARD_COUNT = 8;
  * Indonesia Western Time (WIB / Asia/Jakarta) is fixed at UTC+07:00 year-round (no DST).
  * Rotation boundaries occur strictly at 00:00, 06:00, 12:00, and 18:00 WIB.
  */
-export const WIB_TIMEZONE = 'Asia/Jakarta';
 export const WIB_UTC_OFFSET_MS = 7 * 60 * 60 * 1000;
 export const ROTATION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const WIB_ROTATION_HOURS = [0, 6, 12, 18] as const;

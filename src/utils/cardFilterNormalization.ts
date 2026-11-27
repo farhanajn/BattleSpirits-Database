@@ -732,14 +732,6 @@ function evaluateCardFiltersAndSearch(
   return { matched: true, searchEval };
 }
 
-export function cardMatchesFilters(
-  card: BattleSpiritsCard,
-  filters: FilterState,
-  context: CatalogFilterContext = {}
-): boolean {
-  return evaluateCardFiltersAndSearch(card, filters, context).matched;
-}
-
 export function filterCatalogCards(
   cards: BattleSpiritsCard[],
   filters: FilterState,

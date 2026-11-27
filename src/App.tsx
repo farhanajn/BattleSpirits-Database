@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Search,
   SlidersHorizontal,
@@ -37,13 +37,20 @@ import {
 } from './types/card';
 import { SymbolIcon } from './components/SymbolIcon';
 import { CardThumbnail } from './components/CardThumbnail';
-import { CardDetailSheet } from './components/CardDetailSheet';
 import { FilterControls, FilterSheet } from './components/FilterSheet';
-import { DeckBuilderView } from './components/DeckBuilderView';
-import { SettingsView } from './components/SettingsView';
 import { CatalogMenuView } from './components/CatalogMenuView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { OfflineIndicator } from './components/PWAControls';
+
+const CardDetailSheet = lazy(() =>
+  import('./components/CardDetailSheet').then((m) => ({ default: m.CardDetailSheet }))
+);
+const DeckBuilderView = lazy(() =>
+  import('./components/DeckBuilderView').then((m) => ({ default: m.DeckBuilderView }))
+);
+const SettingsView = lazy(() =>
+  import('./components/SettingsView').then((m) => ({ default: m.SettingsView }))
+);
 import { auth, signInWithGoogle, signOutGoogle } from './firebase';
 import {
   deleteCloudDeck,
@@ -337,11 +344,6 @@ function buildUrlSearch(tab: AppTab, filters: FilterState): string {
   if (filters.search) params.set('q', filters.search);
   const str = params.toString();
   return str ? `?${str}` : '';
-}
-
-export function getCardColors(card: BattleSpiritsCard): CardColor[] {
-  const normalized = normalizeCardColors(card);
-  return normalized.length > 0 ? normalized : [card.color];
 }
 
 const STORAGE_DECKS_KEY = 'spiritsdex_decks_v1';
@@ -2755,30 +2757,39 @@ export default function App() {
             resetLabel="Reset Deck View"
             onReset={() => setActiveTab('catalog')}
           >
-            <DeckBuilderView
-              decks={decks}
-              folders={deckFolders}
-              activeDeckId={activeDeck?.id || ''}
-              cardsById={cardsMap}
-              onSelectDeck={setActiveDeckId}
-              onCreateDeck={handleCreateDeck}
-              onCreateFolder={handleCreateFolder}
-              onRenameFolder={handleRenameFolder}
-              onDeleteFolder={handleDeleteFolder}
-              onMoveDeckToFolder={handleMoveDeckToFolder}
-              onChangeDeckFormat={handleChangeDeckFormat}
-              onRemoveIllegalCards={handleRemoveIllegalCards}
-              onDeleteDeck={handleDeleteDeck}
-              onUpdateCardQty={handleUpdateDeckQty}
-              onImportDeckEntries={handleImportDeckEntries}
-              onInspectCard={setSelectedCard}
-              onBrowseCatalog={openSearchTab}
-              cloudUserEmail={currentUser?.email || null}
-              cloudSyncing={cloudSyncing}
-              onSignInGoogle={() => void handleGoogleSignIn()}
-              onSyncNow={() => void handleManualCloudSync()}
-              onNotify={showToast}
-            />
+            <Suspense
+              fallback={
+                <div className="py-16 flex items-center justify-center gap-2 text-xs font-semibold text-slate-500">
+                  <Loader2 className="w-4 h-4 animate-spin text-red-600" />
+                  <span>Loading Deck Builder...</span>
+                </div>
+              }
+            >
+              <DeckBuilderView
+                decks={decks}
+                folders={deckFolders}
+                activeDeckId={activeDeck?.id || ''}
+                cardsById={cardsMap}
+                onSelectDeck={setActiveDeckId}
+                onCreateDeck={handleCreateDeck}
+                onCreateFolder={handleCreateFolder}
+                onRenameFolder={handleRenameFolder}
+                onDeleteFolder={handleDeleteFolder}
+                onMoveDeckToFolder={handleMoveDeckToFolder}
+                onChangeDeckFormat={handleChangeDeckFormat}
+                onRemoveIllegalCards={handleRemoveIllegalCards}
+                onDeleteDeck={handleDeleteDeck}
+                onUpdateCardQty={handleUpdateDeckQty}
+                onImportDeckEntries={handleImportDeckEntries}
+                onInspectCard={setSelectedCard}
+                onBrowseCatalog={openSearchTab}
+                cloudUserEmail={currentUser?.email || null}
+                cloudSyncing={cloudSyncing}
+                onSignInGoogle={() => void handleGoogleSignIn()}
+                onSyncNow={() => void handleManualCloudSync()}
+                onNotify={showToast}
+              />
+            </Suspense>
           </ErrorBoundary>
         )}
 
@@ -2788,21 +2799,30 @@ export default function App() {
             resetLabel="Return to Catalog"
             onReset={() => setActiveTab('catalog')}
           >
-            <SettingsView
-              currentUser={currentUser}
-              authReady={authReady}
-              isAdmin={isAdmin}
-              adminLoading={adminLoading}
-              signingIn={signingIn}
-              cloudSyncing={cloudSyncing}
-              deckCount={decks.length}
-              folderCount={deckFolders.length}
-              onSignInGoogle={() => void handleGoogleSignIn()}
-              onSignOutGoogle={() => void handleGoogleSignOut()}
-              onSyncNow={() => void handleManualCloudSync()}
-              onCatalogImported={isAdmin && !adminLoading ? applyImportedCatalogAdditions : undefined}
-              onNotify={showToast}
-            />
+            <Suspense
+              fallback={
+                <div className="py-16 flex items-center justify-center gap-2 text-xs font-semibold text-slate-500">
+                  <Loader2 className="w-4 h-4 animate-spin text-red-600" />
+                  <span>Loading Settings...</span>
+                </div>
+              }
+            >
+              <SettingsView
+                currentUser={currentUser}
+                authReady={authReady}
+                isAdmin={isAdmin}
+                adminLoading={adminLoading}
+                signingIn={signingIn}
+                cloudSyncing={cloudSyncing}
+                deckCount={decks.length}
+                folderCount={deckFolders.length}
+                onSignInGoogle={() => void handleGoogleSignIn()}
+                onSignOutGoogle={() => void handleGoogleSignOut()}
+                onSyncNow={() => void handleManualCloudSync()}
+                onCatalogImported={isAdmin && !adminLoading ? applyImportedCatalogAdditions : undefined}
+                onNotify={showToast}
+              />
+            </Suspense>
           </ErrorBoundary>
         )}
       </main>
@@ -3005,24 +3025,26 @@ export default function App() {
       />
 
       {/* Card Detail Bottom Sheet / Modal */}
-      <CardDetailSheet
-        card={activeSelectedCard}
-        allCards={allCardsList}
-        navigableCards={navigableCards}
-        reprintGroup={
-          activeSelectedCard
-            ? consolidatedCatalog.pairedGroupByMemberId[activeSelectedCard.id]
-            : undefined
-        }
-        canonicalIdByMemberId={consolidatedCatalog.pairedCanonicalIdByMemberId}
-        deckQty={activeSelectedCard ? activeDeckQtyMap[activeSelectedCard.id] || 0 : 0}
-        activeDeckQtyMap={activeDeckQtyMap}
-        activeDeckName={activeDeck?.name || 'Deck'}
-        activeDeckFormat={activeDeckFormat}
-        onClose={() => setSelectedCard(null)}
-        onSelectCard={setSelectedCard}
-        onUpdateDeckQty={handleUpdateDeckQty}
-      />
+      {activeSelectedCard && (
+        <Suspense fallback={null}>
+          <CardDetailSheet
+            card={activeSelectedCard}
+            allCards={allCardsList}
+            navigableCards={navigableCards}
+            reprintGroup={
+              consolidatedCatalog.pairedGroupByMemberId[activeSelectedCard.id]
+            }
+            canonicalIdByMemberId={consolidatedCatalog.pairedCanonicalIdByMemberId}
+            deckQty={activeDeckQtyMap[activeSelectedCard.id] || 0}
+            activeDeckQtyMap={activeDeckQtyMap}
+            activeDeckName={activeDeck?.name || 'Deck'}
+            activeDeckFormat={activeDeckFormat}
+            onClose={() => setSelectedCard(null)}
+            onSelectCard={setSelectedCard}
+            onUpdateDeckQty={handleUpdateDeckQty}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }
