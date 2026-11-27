@@ -595,12 +595,18 @@ export const CatalogMenuView: React.FC<CatalogMenuViewProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
           {featuredCards.map((card) => {
             const grp = groupByMemberId?.[card.id];
+            const isSideBFeatured = Boolean(
+              grp?.tenseiPair?.sideBPrintings.some((p) => p.cardId === card.id)
+            );
             return (
               <CardThumbnail
                 key={grp?.canonicalId || card.id}
                 card={card}
                 deckQty={activeDeckQtyMap[card.id] || 0}
                 printings={grp?.printings}
+                tenseiPair={grp?.tenseiPair}
+                preferredPrintingId={grp?.tenseiPair ? card.id : undefined}
+                preferredSide={isSideBFeatured ? 'B' : undefined}
                 activeDeckQtyMap={activeDeckQtyMap}
                 onSelect={onSelectCard}
                 onAddToDeck={onAddToDeck}

@@ -6,7 +6,11 @@ import {
   resolveCanonicalIdentitySetCode,
 } from './cardIdentity';
 import { normalizeCardColors, normalizeCardFamilies } from './cardFilterNormalization';
-import { isTokenCard } from './cardRules';
+import {
+  isTokenCard,
+  linkTenseiRebirthPairs,
+  type TenseiLinkingResult,
+} from './cardRules';
 import { normalizeCardNumber } from './decklistImport';
 import {
   compareCardPrintingChronology,
@@ -28,6 +32,18 @@ export interface CardPrintingOption {
   isCanonicalOriginal: boolean;
 }
 
+export interface TenseiGroupPairInfo {
+  pairKey: string;
+  sideACanonical: BattleSpiritsCard;
+  sideBCanonical: BattleSpiritsCard;
+  sideAPrintings: CardPrintingOption[];
+  sideBPrintings: CardPrintingOption[];
+  /** Maps any confirmed Side A printing cardId -> corresponding Side B printing cardId. */
+  sideBBySideACardId: Record<string, string>;
+  /** Maps any confirmed Side B printing cardId -> corresponding Side A printing cardId. */
+  sideABySideBCardId: Record<string, string>;
+}
+
 export interface ConsolidatedCardGroup {
   canonicalId: string;
   canonicalCard: BattleSpiritsCard;
@@ -35,6 +51,7 @@ export interface ConsolidatedCardGroup {
   printingIds: string[];
   setCodes: string[];
   cardNumbers: string[];
+  tenseiPair?: TenseiGroupPairInfo;
 }
 
 export type UncertainReprintReason =
@@ -59,13 +76,22 @@ export interface ConsolidatedCatalogResult {
   groupByCanonicalId: Record<string, ConsolidatedCardGroup>;
   groupByMemberId: Record<string, ConsolidatedCardGroup>;
   canonicalIdByMemberId: Record<string, string>;
+  pairedCatalogCards: BattleSpiritsCard[];
+  pairedCatalogGroups: ConsolidatedCardGroup[];
+  pairedGroupByCanonicalId: Record<string, ConsolidatedCardGroup>;
+  pairedGroupByMemberId: Record<string, ConsolidatedCardGroup>;
+  pairedCanonicalIdByMemberId: Record<string, string>;
+  tenseiLinking: TenseiLinkingResult;
   uncertainGroups: UncertainReprintGroup[];
   stats: {
     totalInputCards: number;
     consolidatedResultCount: number;
+    pairedCatalogCount: number;
     confirmedGroupCount: number;
     consolidatedReprintMembersCount: number;
     uncertainGroupCount: number;
+    tenseiConfirmedPairCount: number;
+    tenseiUncertainCandidateCount: number;
   };
 }
 
@@ -502,19 +528,119 @@ export function consolidateCatalogCards(
     }
   }
 
+  // Step 3: Link confirmed Tensei / Rebirth Side A + Side B pairs into single paired catalog entries
+  const tenseiLinking = linkTenseiRebirthPairs(uniqueRecords);
+  const suppressedSideBGroupIds = new Set<string>();
+  const claimedSideBGroupIds = new Set<string>();
+  const pairedGroupById = new Map<string, ConsolidatedCardGroup>();
+
+  for (const group of groups) {
+    if (suppressedSideBGroupIds.has(group.canonicalId)) continue;
+
+    const sideAPairMatches = group.printings
+      .map((p) => ({
+        printing: p,
+        pair:
+          tenseiLinking.sideByCardId[p.cardId] === 'A'
+            ? tenseiLinking.pairByCardId[p.cardId]
+            : undefined,
+      }))
+      .filter(
+        (
+          entry
+        ): entry is {
+          printing: CardPrintingOption;
+          pair: NonNullable<typeof entry.pair>;
+        } => Boolean(entry.pair)
+      );
+
+    if (sideAPairMatches.length === 0) continue;
+
+    const primaryMatch =
+      sideAPairMatches.find((m) => m.printing.cardId === group.canonicalId) ||
+      sideAPairMatches[0];
+    const sideBGroup = groupByMemberId[primaryMatch.pair.sideBCardId];
+    if (!sideBGroup || sideBGroup.canonicalId === group.canonicalId) continue;
+    if (claimedSideBGroupIds.has(sideBGroup.canonicalId)) continue;
+
+    const sideBMemberSet = new Set(sideBGroup.printingIds);
+    const allMatchSameSideBGroup = sideAPairMatches.every((m) =>
+      sideBMemberSet.has(m.pair.sideBCardId)
+    );
+    if (!allMatchSameSideBGroup) continue;
+
+    const sideBBySideACardId: Record<string, string> = {};
+    const sideABySideBCardId: Record<string, string> = {};
+    for (const m of sideAPairMatches) {
+      sideBBySideACardId[m.pair.sideACardId] = m.pair.sideBCardId;
+      sideABySideBCardId[m.pair.sideBCardId] = m.pair.sideACardId;
+    }
+
+    const tenseiPair: TenseiGroupPairInfo = {
+      pairKey: primaryMatch.pair.pairKey,
+      sideACanonical: group.canonicalCard,
+      sideBCanonical: sideBGroup.canonicalCard,
+      sideAPrintings: group.printings,
+      sideBPrintings: sideBGroup.printings,
+      sideBBySideACardId,
+      sideABySideBCardId,
+    };
+
+    pairedGroupById.set(group.canonicalId, {
+      ...group,
+      tenseiPair,
+    });
+    claimedSideBGroupIds.add(sideBGroup.canonicalId);
+    suppressedSideBGroupIds.add(sideBGroup.canonicalId);
+  }
+
+  const pairedCatalogGroups: ConsolidatedCardGroup[] = [];
+  const pairedCatalogCards: BattleSpiritsCard[] = [];
+  const pairedGroupByCanonicalId: Record<string, ConsolidatedCardGroup> = {};
+  const pairedGroupByMemberId: Record<string, ConsolidatedCardGroup> = {};
+  const pairedCanonicalIdByMemberId: Record<string, string> = {};
+
+  for (const group of groups) {
+    if (suppressedSideBGroupIds.has(group.canonicalId)) continue;
+    const resolvedGroup = pairedGroupById.get(group.canonicalId) || group;
+    pairedCatalogGroups.push(resolvedGroup);
+    pairedCatalogCards.push(resolvedGroup.canonicalCard);
+    pairedGroupByCanonicalId[resolvedGroup.canonicalId] = resolvedGroup;
+
+    for (const p of resolvedGroup.printings) {
+      pairedGroupByMemberId[p.cardId] = resolvedGroup;
+      pairedCanonicalIdByMemberId[p.cardId] = resolvedGroup.canonicalId;
+    }
+    if (resolvedGroup.tenseiPair) {
+      for (const p of resolvedGroup.tenseiPair.sideBPrintings) {
+        pairedGroupByMemberId[p.cardId] = resolvedGroup;
+        pairedCanonicalIdByMemberId[p.cardId] = resolvedGroup.canonicalId;
+      }
+    }
+  }
+
   return {
     consolidatedCards,
     groups,
     groupByCanonicalId,
     groupByMemberId,
     canonicalIdByMemberId,
+    pairedCatalogCards,
+    pairedCatalogGroups,
+    pairedGroupByCanonicalId,
+    pairedGroupByMemberId,
+    pairedCanonicalIdByMemberId,
+    tenseiLinking,
     uncertainGroups,
     stats: {
       totalInputCards: uniqueRecords.length,
       consolidatedResultCount: consolidatedCards.length,
+      pairedCatalogCount: pairedCatalogCards.length,
       confirmedGroupCount,
       consolidatedReprintMembersCount,
       uncertainGroupCount: uncertainGroups.length,
+      tenseiConfirmedPairCount: tenseiLinking.stats.confirmedPairCount,
+      tenseiUncertainCandidateCount: tenseiLinking.stats.uncertainCandidateCount,
     },
   };
 }

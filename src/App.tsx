@@ -1578,6 +1578,7 @@ export default function App() {
   const filteredCards = consolidatedFilterResult.cards;
   const filteredGroups = consolidatedFilterResult.groups;
   const matchedPrintingByCanonicalId = consolidatedFilterResult.matchedPrintingIdByCanonicalId;
+  const matchedSideByCanonicalId = consolidatedFilterResult.matchedSideByCanonicalId;
 
   useEffect(() => {
     setSearchAnchorIndex(0);
@@ -1686,10 +1687,16 @@ export default function App() {
     }
     const base = consolidateWikiPreviewCards(wikiSearchResults, allCardsList, syncedProductSets);
     const q = filters.search.trim();
-    if (q && filters.sortBy === 'relevance' && base.groups.length > 1) {
-      const sortedGroups = [...base.groups].sort((a, b) => {
-        const diff =
-          scoreCardSearchMatch(b.canonicalCard, q) - scoreCardSearchMatch(a.canonicalCard, q);
+    if (q && filters.sortBy === 'relevance' && base.pairedCatalogGroups.length > 1) {
+      const sortedGroups = [...base.pairedCatalogGroups].sort((a, b) => {
+        const scoreSide = (g: typeof a) => {
+          const sA = scoreCardSearchMatch(g.canonicalCard, q);
+          const sB = g.tenseiPair
+            ? scoreCardSearchMatch(g.tenseiPair.sideBCanonical, q)
+            : 0;
+          return Math.max(sA, sB);
+        };
+        const diff = scoreSide(b) - scoreSide(a);
         if (diff !== 0) return diff;
         return (
           (a.canonicalCard.isRevival ? 1 : 0) - (b.canonicalCard.isRevival ? 1 : 0) ||
@@ -1698,7 +1705,7 @@ export default function App() {
       });
       return { groups: sortedGroups, cards: sortedGroups.map((g) => g.canonicalCard) };
     }
-    return { groups: base.groups, cards: base.consolidatedCards };
+    return { groups: base.pairedCatalogGroups, cards: base.pairedCatalogCards };
   }, [wikiSearchResults, allCardsList, syncedProductSets, filters.search, filters.sortBy]);
 
   const uniqueWikiPreviewCards = consolidatedWikiPreview.cards;
@@ -2293,7 +2300,7 @@ export default function App() {
             productSets={syncedProductSets}
             cards={allCardsList}
             cardsById={cardsMap}
-            groupByMemberId={consolidatedCatalog.groupByMemberId}
+            groupByMemberId={consolidatedCatalog.pairedGroupByMemberId}
             activeDeckQtyMap={activeDeckQtyMap}
             activeFormat={filters.format}
             currentUser={currentUser}
@@ -2329,7 +2336,7 @@ export default function App() {
                   )}
                 </div>
                 <span className="font-mono text-xs text-slate-500 tabular-nums">
-                  {filteredCards.length} / {consolidatedCatalog.consolidatedCards.length}
+                  {filteredCards.length} / {consolidatedCatalog.pairedCatalogCards.length}
                 </span>
               </div>
               <div className="p-4 overflow-y-auto flex-1">
@@ -2644,6 +2651,7 @@ export default function App() {
                             key={`wiki-preview-${grp.canonicalId}`}
                             card={grp.canonicalCard}
                             printings={grp.printings}
+                            tenseiPair={grp.tenseiPair}
                             deckQty={0}
                             onSelect={setSelectedCard}
                             onAddToDeck={() =>
@@ -2668,7 +2676,9 @@ export default function App() {
                         card={group.canonicalCard}
                         deckQty={activeDeckQtyMap[group.canonicalCard.id] || 0}
                         printings={group.printings}
+                        tenseiPair={group.tenseiPair}
                         preferredPrintingId={matchedPrintingByCanonicalId[group.canonicalId]}
+                        preferredSide={matchedSideByCanonicalId[group.canonicalId]}
                         activeDeckQtyMap={activeDeckQtyMap}
                         onSelect={setSelectedCard}
                         onAddToDeck={handleQuickAddToDeck}
@@ -3000,9 +3010,11 @@ export default function App() {
         allCards={allCardsList}
         navigableCards={navigableCards}
         reprintGroup={
-          activeSelectedCard ? consolidatedCatalog.groupByMemberId[activeSelectedCard.id] : undefined
+          activeSelectedCard
+            ? consolidatedCatalog.pairedGroupByMemberId[activeSelectedCard.id]
+            : undefined
         }
-        canonicalIdByMemberId={consolidatedCatalog.canonicalIdByMemberId}
+        canonicalIdByMemberId={consolidatedCatalog.pairedCanonicalIdByMemberId}
         deckQty={activeSelectedCard ? activeDeckQtyMap[activeSelectedCard.id] || 0 : 0}
         activeDeckQtyMap={activeDeckQtyMap}
         activeDeckName={activeDeck?.name || 'Deck'}

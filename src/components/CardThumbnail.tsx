@@ -1,34 +1,72 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, Check, Ban, ChevronDown } from 'lucide-react';
+import { Plus, Check, Ban, ChevronDown, ArrowLeftRight } from 'lucide-react';
 import { BattleSpiritsCard, CardColor } from '../types/card';
 import { COLOR_META } from '../data/theme';
 import { CardArtwork } from './CardArtwork';
 import { SymbolIcon } from './SymbolIcon';
-import { getMaxCardCopies, getRestrictionBadgeLabel, isTokenCard } from '../utils/cardRules';
-import type { CardPrintingOption } from '../utils/reprintConsolidation';
+import {
+  getMaxCardCopies,
+  getRestrictionBadgeLabel,
+  isTokenCard,
+  type TenseiSide,
+} from '../utils/cardRules';
+import type {
+  CardPrintingOption,
+  TenseiGroupPairInfo,
+} from '../utils/reprintConsolidation';
 
 interface CardThumbnailProps {
   card: BattleSpiritsCard;
   deckQty: number;
   printings?: CardPrintingOption[];
+  tenseiPair?: TenseiGroupPairInfo;
   preferredPrintingId?: string;
+  preferredSide?: TenseiSide;
   activeDeckQtyMap?: Record<string, number>;
   onSelect: (card: BattleSpiritsCard) => void;
   onAddToDeck: (card: BattleSpiritsCard) => void;
   onHoverOrFocus?: () => void;
 }
 
+function resolveDefaultTenseiSide(
+  pair?: TenseiGroupPairInfo,
+  prefSide?: TenseiSide,
+  prefPrintingId?: string,
+  baseCardId?: string
+): TenseiSide {
+  if (!pair) return 'A';
+  if (prefSide === 'A' || prefSide === 'B') return prefSide;
+  if (prefPrintingId && pair.sideBPrintings.some((p) => p.cardId === prefPrintingId)) {
+    return 'B';
+  }
+  if (baseCardId && pair.sideBPrintings.some((p) => p.cardId === baseCardId)) {
+    return 'B';
+  }
+  return 'A';
+}
+
 export const CardThumbnail: React.FC<CardThumbnailProps> = ({
   card,
   deckQty,
   printings,
+  tenseiPair,
   preferredPrintingId,
+  preferredSide,
   activeDeckQtyMap,
   onSelect,
   onAddToDeck,
   onHoverOrFocus,
 }) => {
+  const [selectedSide, setSelectedSide] = useState<TenseiSide>(() =>
+    resolveDefaultTenseiSide(tenseiPair, preferredSide, preferredPrintingId, card.id)
+  );
+
   const effectivePrintings = useMemo<CardPrintingOption[]>(() => {
+    if (tenseiPair) {
+      return selectedSide === 'B'
+        ? tenseiPair.sideBPrintings
+        : tenseiPair.sideAPrintings;
+    }
     if (printings && printings.length > 0) return printings;
     return [
       {
@@ -45,11 +83,17 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
         isCanonicalOriginal: true,
       },
     ];
-  }, [printings, card]);
+  }, [tenseiPair, selectedSide, printings, card]);
 
-  const [selectedPrintingId, setSelectedPrintingId] = useState<string>(
-    () => preferredPrintingId || effectivePrintings[0]?.cardId || card.id
-  );
+  const [selectedPrintingId, setSelectedPrintingId] = useState<string>(() => {
+    if (
+      preferredPrintingId &&
+      effectivePrintings.some((p) => p.cardId === preferredPrintingId)
+    ) {
+      return preferredPrintingId;
+    }
+    return effectivePrintings[0]?.cardId || card.id;
+  });
   const [overflowOpen, setOverflowOpen] = useState(false);
   const [maxInlineCount, setMaxInlineCount] = useState(3);
 
@@ -57,10 +101,27 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
   const popoverContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const nextDefault = preferredPrintingId || effectivePrintings[0]?.cardId || card.id;
+    const nextSide = resolveDefaultTenseiSide(
+      tenseiPair,
+      preferredSide,
+      preferredPrintingId,
+      card.id
+    );
+    const sidePool = tenseiPair
+      ? nextSide === 'B'
+        ? tenseiPair.sideBPrintings
+        : tenseiPair.sideAPrintings
+      : printings && printings.length > 0
+      ? printings
+      : [];
+    const nextDefault =
+      preferredPrintingId && sidePool.some((p) => p.cardId === preferredPrintingId)
+        ? preferredPrintingId
+        : sidePool[0]?.cardId || card.id;
+    setSelectedSide(nextSide);
     setSelectedPrintingId(nextDefault);
     setOverflowOpen(false);
-  }, [preferredPrintingId, card.id, effectivePrintings]);
+  }, [tenseiPair, preferredSide, preferredPrintingId, card.id, printings]);
 
   useEffect(() => {
     const el = badgeRowRef.current;
@@ -117,6 +178,26 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
     effectivePrintings[0];
   const activeCard = activePrinting?.card || card;
 
+  const sideADisplayName = useMemo(() => {
+    if (!tenseiPair) return '';
+    if (selectedSide === 'A') return activeCard.name;
+    const linkedId = tenseiPair.sideABySideBCardId[activeCard.id];
+    const linkedCard = linkedId
+      ? tenseiPair.sideAPrintings.find((p) => p.cardId === linkedId)?.card
+      : undefined;
+    return linkedCard?.name || tenseiPair.sideACanonical.name;
+  }, [tenseiPair, selectedSide, activeCard]);
+
+  const sideBDisplayName = useMemo(() => {
+    if (!tenseiPair) return '';
+    if (selectedSide === 'B') return activeCard.name;
+    const linkedId = tenseiPair.sideBBySideACardId[activeCard.id];
+    const linkedCard = linkedId
+      ? tenseiPair.sideBPrintings.find((p) => p.cardId === linkedId)?.card
+      : undefined;
+    return linkedCard?.name || tenseiPair.sideBCanonical.name;
+  }, [tenseiPair, selectedSide, activeCard]);
+
   const { inlinePrintings, overflowPrintings } = useMemo(() => {
     if (effectivePrintings.length <= 1) {
       return { inlinePrintings: effectivePrintings, overflowPrintings: [] as CardPrintingOption[] };
@@ -172,6 +253,26 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       ? `${cardColors[0]}/${cardColors[1]}`
       : `${cardColors.length}-Color`;
 
+  const handleSelectSide = (nextSide: TenseiSide, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!tenseiPair || nextSide === selectedSide) return;
+
+    const currentId = activePrinting?.cardId || card.id;
+    const nextPrintingId =
+      nextSide === 'B'
+        ? tenseiPair.sideBBySideACardId[currentId] ||
+          tenseiPair.sideBPrintings[0]?.cardId
+        : tenseiPair.sideABySideBCardId[currentId] ||
+          tenseiPair.sideAPrintings[0]?.cardId;
+
+    setSelectedSide(nextSide);
+    if (nextPrintingId) {
+      setSelectedPrintingId(nextPrintingId);
+    }
+    setOverflowOpen(false);
+  };
+
   const handleSelectPrinting = (printing: CardPrintingOption, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -214,6 +315,72 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
           />
         </div>
       </button>
+
+      {tenseiPair && (
+        <div
+          data-testid="card-side-selector"
+          role="group"
+          aria-label="Tensei / Rebirth side selector"
+          className="px-3 pt-2 pb-0.5 flex items-center gap-1"
+        >
+          <button
+            type="button"
+            data-testid="side-a-btn"
+            aria-pressed={selectedSide === 'A'}
+            onClick={(e) => handleSelectSide('A', e)}
+            title={`Side A: ${sideADisplayName}`}
+            className={`min-w-0 flex-1 px-2 py-1 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 transition-colors cursor-pointer ${
+              selectedSide === 'A'
+                ? 'bg-slate-900 text-white border-slate-900 shadow-xs'
+                : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200 hover:text-slate-900'
+            }`}
+          >
+            <span
+              className={`font-mono text-[10px] font-bold px-1 rounded shrink-0 ${
+                selectedSide === 'A' ? 'bg-white/20 text-amber-300' : 'bg-slate-200 text-slate-700'
+              }`}
+            >
+              A
+            </span>
+            <span className="truncate">{sideADisplayName}</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="side-swap-btn"
+            onClick={(e) => handleSelectSide(selectedSide === 'A' ? 'B' : 'A', e)}
+            title={`Flip to Side ${selectedSide === 'A' ? 'B' : 'A'}: ${
+              selectedSide === 'A' ? sideBDisplayName : sideADisplayName
+            }`}
+            aria-label={`Flip between Side A (${sideADisplayName}) and Side B (${sideBDisplayName})`}
+            className="px-1.5 py-1 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 text-[11px] inline-flex items-center justify-center shrink-0 transition-colors cursor-pointer"
+          >
+            <ArrowLeftRight className="w-3 h-3" />
+          </button>
+
+          <button
+            type="button"
+            data-testid="side-b-btn"
+            aria-pressed={selectedSide === 'B'}
+            onClick={(e) => handleSelectSide('B', e)}
+            title={`Side B: ${sideBDisplayName}`}
+            className={`min-w-0 flex-1 px-2 py-1 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 transition-colors cursor-pointer ${
+              selectedSide === 'B'
+                ? 'bg-red-700 text-white border-red-700 shadow-xs'
+                : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200 hover:text-slate-900'
+            }`}
+          >
+            <span
+              className={`font-mono text-[10px] font-bold px-1 rounded shrink-0 ${
+                selectedSide === 'B' ? 'bg-white/20 text-amber-200' : 'bg-slate-200 text-slate-700'
+              }`}
+            >
+              B
+            </span>
+            <span className="truncate">{sideBDisplayName}</span>
+          </button>
+        </div>
+      )}
 
       {effectivePrintings.length > 1 && (
         <div
@@ -340,7 +507,7 @@ export const CardThumbnail: React.FC<CardThumbnailProps> = ({
       >
         <div
           className={`px-3 pb-2 ${
-            effectivePrintings.length > 1 ? 'pt-1.5' : 'pt-3'
+            effectivePrintings.length > 1 || Boolean(tenseiPair) ? 'pt-1.5' : 'pt-3'
           } flex-1 flex flex-col justify-between gap-1.5 w-full`}
         >
           <div>

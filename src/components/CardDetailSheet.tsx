@@ -39,6 +39,7 @@ import {
   getCardLegalityStatus,
   getMaxCardCopies,
   isTokenCard,
+  type TenseiSide,
 } from '../utils/cardRules';
 import {
   CardShareImageResult,
@@ -235,6 +236,52 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
       : null;
   const hasNavigation = navIndex >= 0 && navigableCards.length > 1 && Boolean(onSelectCard);
 
+  const tenseiPair = reprintGroup?.tenseiPair;
+  const currentTenseiSide: TenseiSide = useMemo(() => {
+    if (!card || !tenseiPair) return 'A';
+    return tenseiPair.sideBPrintings.some((p) => p.cardId === card.id) ? 'B' : 'A';
+  }, [card?.id, tenseiPair]);
+
+  const detailSideACard = useMemo(() => {
+    if (!card || !tenseiPair) return null;
+    if (currentTenseiSide === 'A') return card;
+    const linkedAId = tenseiPair.sideABySideBCardId[card.id];
+    return (
+      (linkedAId && tenseiPair.sideAPrintings.find((p) => p.cardId === linkedAId)?.card) ||
+      tenseiPair.sideACanonical
+    );
+  }, [card, tenseiPair, currentTenseiSide]);
+
+  const detailSideBCard = useMemo(() => {
+    if (!card || !tenseiPair) return null;
+    if (currentTenseiSide === 'B') return card;
+    const linkedBId = tenseiPair.sideBBySideACardId[card.id];
+    return (
+      (linkedBId && tenseiPair.sideBPrintings.find((p) => p.cardId === linkedBId)?.card) ||
+      tenseiPair.sideBCanonical
+    );
+  }, [card, tenseiPair, currentTenseiSide]);
+
+  const activeSidePrintings = useMemo(() => {
+    if (tenseiPair) {
+      return currentTenseiSide === 'B'
+        ? tenseiPair.sideBPrintings
+        : tenseiPair.sideAPrintings;
+    }
+    return reprintGroup?.printings || [];
+  }, [tenseiPair, currentTenseiSide, reprintGroup?.printings]);
+
+  const handleSwitchDetailSide = React.useCallback(
+    (targetSide: TenseiSide) => {
+      if (!onSelectCard || !tenseiPair || targetSide === currentTenseiSide) return;
+      const targetCard = targetSide === 'B' ? detailSideBCard : detailSideACard;
+      if (targetCard) {
+        onSelectCard(targetCard);
+      }
+    },
+    [onSelectCard, tenseiPair, currentTenseiSide, detailSideACard, detailSideBCard]
+  );
+
   const detailExtraUrls = useMemo(() => {
     const urls: string[] = [];
     if (card?.galleryImages) {
@@ -247,11 +294,16 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
         if (p.card.artworkImage) urls.push(p.card.artworkImage);
       }
     }
+    if (tenseiPair) {
+      for (const p of tenseiPair.sideBPrintings) {
+        if (p.card.artworkImage) urls.push(p.card.artworkImage);
+      }
+    }
     if (compareCard?.artworkImage) {
       urls.push(compareCard.artworkImage);
     }
     return urls;
-  }, [card?.galleryImages, reprintGroup?.printings, compareCard?.artworkImage]);
+  }, [card?.galleryImages, reprintGroup?.printings, tenseiPair, compareCard?.artworkImage]);
 
   useWikiImagePrefetch({
     cards: navigableCards,
@@ -1465,8 +1517,82 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           )}
         </div>
 
-        {/* Row 3: Printings Selector (Shown only when this card has consolidated reprints) */}
-        {reprintGroup && reprintGroup.printings.length > 1 && !compareMode && !synergyMode && (
+        {/* Row 3A: Tensei / Rebirth Side Selector */}
+        {tenseiPair && detailSideACard && detailSideBCard && !compareMode && !synergyMode && (
+          <div
+            data-testid="detail-side-selector"
+            data-no-swipe="true"
+            className="px-4 sm:px-6 py-2 bg-slate-50/90 border-b border-slate-100 flex flex-wrap items-center gap-2 shrink-0"
+          >
+            <span className="text-[11px] font-semibold text-slate-500 shrink-0 inline-flex items-center gap-1">
+              <ArrowLeftRight className="w-3.5 h-3.5 text-slate-400" />
+              <span>Tensei / Rebirth:</span>
+            </span>
+            <div className="inline-flex items-center gap-1.5 min-w-0 flex-1 sm:flex-initial">
+              <button
+                type="button"
+                data-testid="detail-side-a-btn"
+                aria-pressed={currentTenseiSide === 'A'}
+                onClick={() => handleSwitchDetailSide('A')}
+                className={`min-h-[34px] px-3 py-1 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer min-w-0 ${
+                  currentTenseiSide === 'A'
+                    ? 'bg-slate-900 text-white border-slate-900 shadow-xs'
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                <span
+                  className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                    currentTenseiSide === 'A'
+                      ? 'bg-white/20 text-amber-300'
+                      : 'bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  Side A
+                </span>
+                <span className="truncate">{detailSideACard.name}</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="detail-side-swap-btn"
+                onClick={() =>
+                  handleSwitchDetailSide(currentTenseiSide === 'A' ? 'B' : 'A')
+                }
+                aria-label={`Flip between Side A (${detailSideACard.name}) and Side B (${detailSideBCard.name})`}
+                title="Flip Side A / Side B"
+                className="min-h-[34px] px-2.5 py-1 rounded-xl border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 inline-flex items-center justify-center shrink-0 transition-colors cursor-pointer"
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                type="button"
+                data-testid="detail-side-b-btn"
+                aria-pressed={currentTenseiSide === 'B'}
+                onClick={() => handleSwitchDetailSide('B')}
+                className={`min-h-[34px] px-3 py-1 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer min-w-0 ${
+                  currentTenseiSide === 'B'
+                    ? 'bg-red-700 text-white border-red-700 shadow-xs'
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                <span
+                  className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                    currentTenseiSide === 'B'
+                      ? 'bg-white/20 text-amber-200'
+                      : 'bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  Side B
+                </span>
+                <span className="truncate">{detailSideBCard.name}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Row 3B: Printings Selector (Shown when active side has consolidated reprints) */}
+        {activeSidePrintings.length > 1 && !compareMode && !synergyMode && (
           <div
             data-testid="detail-printings-selector"
             data-no-swipe="true"
@@ -1474,9 +1600,9 @@ export const CardDetailSheet: React.FC<CardDetailSheetProps> = ({
           >
             <span className="text-[11px] font-semibold text-slate-500 shrink-0 mr-1 inline-flex items-center gap-1">
               <Layers className="w-3.5 h-3.5 text-slate-400" />
-              <span>Printings ({reprintGroup.printings.length}):</span>
+              <span>Printings ({activeSidePrintings.length}):</span>
             </span>
-            {reprintGroup.printings.map((printing) => {
+            {activeSidePrintings.map((printing) => {
               const isActive = printing.cardId === card.id;
               return (
                 <button

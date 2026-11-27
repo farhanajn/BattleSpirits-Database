@@ -20,7 +20,9 @@ import {
   type CardSearchEvaluation,
 } from './cardSearch';
 import { buildCompositeCardIdentityKey } from './cardIdentity';
+import type { TenseiSide } from './cardRules';
 import type {
+  CardPrintingOption,
   ConsolidatedCardGroup,
   ConsolidatedCatalogResult,
 } from './reprintConsolidation';
@@ -895,20 +897,25 @@ export function filterCatalogCards(
 }
 
 export interface ConsolidatedFilterResult {
-  /** One representative card per matching canonical card group (matched printing if a later printing was targeted, otherwise canonical oldest). */
+  /** One representative card per matching canonical card group (matched printing/side if targeted, otherwise canonical oldest Side A). */
   cards: BattleSpiritsCard[];
   /** Canonical group list in sorted order matching `cards`. */
   groups: ConsolidatedCardGroup[];
-  /** Maps canonicalId -> matched printing cardId when a non-canonical printing specifically matched the active search/filter criteria. */
+  /** Maps canonicalId -> matched printing cardId when a non-canonical printing or Side B specifically matched the active search/filter criteria. */
   matchedPrintingIdByCanonicalId: Record<string, string>;
+  /** Maps canonicalId -> automatically selected Tensei/Rebirth side ('A' or 'B') for paired cards. */
+  matchedSideByCanonicalId: Record<string, TenseiSide>;
 }
 
 /**
- * Filters and searches consolidated card groups across ALL printings of each card.
- * - Searches and facet filters (set, card number, set name, format, rarity, version) evaluate every printing.
- * - Consolidated cards appear at most once in results (using canonical oldest by default).
- * - If a query or set/facet filter matches a specific later printing (e.g. searching "CB03" or "CB11-045"),
- *   that matching printing is automatically selected for display in `matchedPrintingIdByCanonicalId`.
+ * Filters and searches consolidated card groups across ALL printings (and both Side A & Side B
+ * for Tensei/Rebirth paired cards).
+ * - Searches and facet filters (set, card number, set name, format, rarity, version, type, cost, etc.)
+ *   evaluate every printing and both linked sides.
+ * - Consolidated/paired cards appear at most once in results (using canonical oldest Side A by default).
+ * - If a query or filter matches Side B more strongly (or exclusively) — e.g. searching "Leo-Breaker" or "BS52-007(B)" —
+ *   the SAME paired group is returned with Side B automatically selected in `matchedSideByCanonicalId`.
+ * - Ties / shared queries / general browsing default cleanly to Side A.
  */
 export function filterConsolidatedCatalogCards(
   consolidated: ConsolidatedCatalogResult,
@@ -943,29 +950,23 @@ export function filterConsolidatedCatalogCards(
     precomputedSetQIntent: setQIntent,
   };
 
-  interface ScoredGroupMatch {
-    group: ConsolidatedCardGroup;
-    displayCard: BattleSpiritsCard;
-    matchedPrintingId?: string;
+  interface BestPrintingMatch {
+    printing: CardPrintingOption;
     score: number;
+    specificity: number;
   }
 
-  const scoredItems: ScoredGroupMatch[] = [];
-  const seenCanonicalIds = new Set<string>();
+  const evaluateBestPrintingInList = (
+    printingList: CardPrintingOption[]
+  ): BestPrintingMatch | null => {
+    let best: BestPrintingMatch | null = null;
 
-  for (const group of consolidated.groups) {
-    if (seenCanonicalIds.has(group.canonicalId)) continue;
-
-    let bestPrintingIdx = -1;
-    let bestScore = -1;
-    let bestSpecificity = -1;
-
-    for (let i = 0; i < group.printings.length; i++) {
-      const printingCard = group.printings[i].card;
+    for (let i = 0; i < printingList.length; i++) {
+      const printing = printingList[i];
+      const printingCard = printing.card;
       const res = evaluateCardFiltersAndSearch(printingCard, filters, effectiveContext);
       if (!res.matched) continue;
 
-      // Boost specificity when this printing's own set/number matched a query or set filter
       const pSetNorm = normalizeSetIdentifier(printingCard.setCode);
       let specificity = 0;
       if (filters.setCode !== 'All' && pSetNorm === normalizeSetIdentifier(filters.setCode)) {
@@ -984,28 +985,99 @@ export function filterConsolidatedCatalogCards(
       }
 
       if (
-        bestPrintingIdx === -1 ||
-        res.searchEval.score > bestScore ||
-        (res.searchEval.score === bestScore && specificity > bestSpecificity)
+        !best ||
+        res.searchEval.score > best.score ||
+        (res.searchEval.score === best.score && specificity > best.specificity)
       ) {
-        bestPrintingIdx = i;
-        bestScore = res.searchEval.score;
-        bestSpecificity = specificity;
+        best = {
+          printing,
+          score: res.searchEval.score,
+          specificity,
+        };
       }
     }
 
-    if (bestPrintingIdx === -1) continue;
-    seenCanonicalIds.add(group.canonicalId);
+    return best;
+  };
 
-    const bestPrinting = group.printings[bestPrintingIdx];
+  interface ScoredGroupMatch {
+    group: ConsolidatedCardGroup;
+    displayCard: BattleSpiritsCard;
+    matchedPrintingId?: string;
+    matchedSide?: TenseiSide;
+    score: number;
+  }
+
+  const scoredItems: ScoredGroupMatch[] = [];
+  const seenCanonicalIds = new Set<string>();
+  const sourceGroups =
+    consolidated.pairedCatalogGroups && consolidated.pairedCatalogGroups.length > 0
+      ? consolidated.pairedCatalogGroups
+      : consolidated.groups;
+
+  for (const group of sourceGroups) {
+    if (seenCanonicalIds.has(group.canonicalId)) continue;
+
+    if (!group.tenseiPair) {
+      const best = evaluateBestPrintingInList(group.printings);
+      if (!best) continue;
+
+      seenCanonicalIds.add(group.canonicalId);
+      const matchedPrintingId =
+        best.printing.cardId !== group.canonicalId ? best.printing.cardId : undefined;
+
+      scoredItems.push({
+        group,
+        displayCard: best.printing.card,
+        matchedPrintingId,
+        score: best.score,
+      });
+      continue;
+    }
+
+    const bestA = evaluateBestPrintingInList(group.tenseiPair.sideAPrintings);
+    const bestB = evaluateBestPrintingInList(group.tenseiPair.sideBPrintings);
+    if (!bestA && !bestB) continue;
+
+    let chosenSide: TenseiSide = 'A';
+    let chosenMatch: BestPrintingMatch;
+
+    if (!bestA && bestB) {
+      chosenSide = 'B';
+      chosenMatch = bestB;
+    } else if (bestA && !bestB) {
+      chosenSide = 'A';
+      chosenMatch = bestA;
+    } else if (bestA && bestB) {
+      // Side B wins only when it clearly outscores Side A (beyond small field-length bonuses <= 500)
+      // or achieves higher specificity (e.g. exact card number BS52-007(B) or Side B-specific set/metadata)
+      const clearScoreLeadB = bestB.score - bestA.score > 500;
+      const tiedScoreHigherSpecB =
+        Math.abs(bestB.score - bestA.score) <= 500 && bestB.specificity > bestA.specificity;
+
+      if (clearScoreLeadB || tiedScoreHigherSpecB) {
+        chosenSide = 'B';
+        chosenMatch = bestB;
+      } else {
+        chosenSide = 'A';
+        chosenMatch = bestA;
+      }
+    } else {
+      continue;
+    }
+
+    seenCanonicalIds.add(group.canonicalId);
     const matchedPrintingId =
-      bestPrinting.cardId !== group.canonicalId ? bestPrinting.cardId : undefined;
+      chosenMatch.printing.cardId !== group.canonicalId
+        ? chosenMatch.printing.cardId
+        : undefined;
 
     scoredItems.push({
       group,
-      displayCard: bestPrinting.card,
+      displayCard: chosenMatch.printing.card,
       matchedPrintingId,
-      score: bestScore,
+      matchedSide: chosenSide,
+      score: chosenMatch.score,
     });
   }
 
@@ -1118,9 +1190,13 @@ export function filterConsolidatedCatalogCards(
   });
 
   const matchedPrintingIdByCanonicalId: Record<string, string> = {};
+  const matchedSideByCanonicalId: Record<string, TenseiSide> = {};
   for (const item of scoredItems) {
     if (item.matchedPrintingId) {
       matchedPrintingIdByCanonicalId[item.group.canonicalId] = item.matchedPrintingId;
+    }
+    if (item.matchedSide) {
+      matchedSideByCanonicalId[item.group.canonicalId] = item.matchedSide;
     }
   }
 
@@ -1128,6 +1204,7 @@ export function filterConsolidatedCatalogCards(
     cards: scoredItems.map((item) => item.displayCard),
     groups: scoredItems.map((item) => item.group),
     matchedPrintingIdByCanonicalId,
+    matchedSideByCanonicalId,
   };
 }
 
