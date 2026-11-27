@@ -1168,7 +1168,8 @@ export default function App() {
         .catch((err) => {
           if (isFirestoreQuotaError(err)) {
             markCloudQuotaExhausted();
-            showToast('Firestore daily free-tier quota limit reached — decks saved locally');
+            lastSyncedLibrarySignatureRef.current = currentSignature;
+            showToast('Firestore daily free-tier quota limit reached (resets tomorrow) — decks saved locally');
           } else {
             console.warn('Cloud auto-save error:', err);
           }
@@ -2196,6 +2197,10 @@ export default function App() {
 
   const handleManualCloudSync = async () => {
     if (!currentUser || cloudSyncing) return;
+    if (isCloudWriteCooldownActive()) {
+      showToast('Firestore daily free-tier quota reached (resets tomorrow) — decks saved locally');
+      return;
+    }
     setCloudSyncing(true);
     try {
       await syncAllDecksAndFoldersToCloud(currentUser.uid, deckFolders, decks, { force: true });
@@ -2204,7 +2209,7 @@ export default function App() {
     } catch (err) {
       if (isFirestoreQuotaError(err)) {
         markCloudQuotaExhausted();
-        showToast('Firestore daily free-tier quota limit reached — decks remain saved locally');
+        showToast('Firestore daily free-tier quota limit reached (resets tomorrow) — decks remain saved locally');
       } else {
         showToast('Cloud sync failed — please retry');
       }

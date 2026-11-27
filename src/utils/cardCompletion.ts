@@ -95,7 +95,7 @@ export function isDirectVerifiedArtworkUrl(artworkImage?: string | null): boolea
 }
 
 const NON_CARD_TITLE_RE =
-  /^(?:Introduction|Contents|External Articles|Main Page|Card Sets|Banned and Restricted Cards|Battle Spirits Wiki|V Jump|Saikyo Jump|Promo Cards(?:\/.*)?|Standard Promo Cards(?:\/.*)?|(?:LM|SJ)\d{2}[A-Z]?)$/i;
+  /^(?:Introduction|Contents|External Articles|Main Page|Card Sets|Banned and Restricted Cards|Battle Spirits Wiki|V Jump|Saikyo Jump|Kerokero Ace|Promo Cards(?:\/.*)?|Standard Promo Cards(?:\/.*)?)$/i;
 
 export function isLikelyNonCardWikiTitle(title?: string | null): boolean {
   const clean = (title || '').trim();
@@ -116,6 +116,12 @@ export interface CardCompletenessHints {
   artworkFileExists?: boolean;
   artworkFailureReason?: 'unavailable_on_wiki' | 'broken_url' | 'placeholder' | 'missing';
   isNonCardPage?: boolean;
+  wikiPageType?:
+    | 'confirmed_card'
+    | 'confirmed_card_list'
+    | 'confirmed_set_or_product'
+    | 'confirmed_non_card'
+    | 'uncertain_needs_review';
   wikiMatchConfidence?: number;
 }
 

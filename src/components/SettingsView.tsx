@@ -12,6 +12,12 @@ import {
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import type { BattleSpiritsCard, ProductSet } from '../types/card';
+import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  isCloudQuotaCooldownActive,
+  onCloudQuotaCleared,
+  onCloudQuotaExhausted,
+} from '../utils/firestoreQuota';
 import { RulingsView } from './RulingsView';
 import { PWAInstallButton } from './PWAControls';
 import { useAdmin } from '../hooks/useAdmin';
@@ -66,15 +72,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [isOnline, setIsOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
+  const [cloudQuotaPaused, setCloudQuotaPaused] = useState(() =>
+    isCloudQuotaCooldownActive()
+  );
 
   useEffect(() => {
     const goOnline = () => setIsOnline(true);
     const goOffline = () => setIsOnline(false);
     window.addEventListener('online', goOnline);
     window.addEventListener('offline', goOffline);
+    const unsubExhausted = onCloudQuotaExhausted(() => setCloudQuotaPaused(true));
+    const unsubCleared = onCloudQuotaCleared(() => setCloudQuotaPaused(false));
     return () => {
       window.removeEventListener('online', goOnline);
       window.removeEventListener('offline', goOffline);
+      unsubExhausted();
+      unsubCleared();
     };
   }, []);
 
@@ -220,15 +233,48 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
+            {cloudQuotaPaused && (
+              <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-1.5">
+                <p className="font-semibold">
+                  Cloud sync paused — Firestore daily free-tier quota exceeded.
+                </p>
+                <p className="text-[11px] text-amber-900 leading-relaxed">
+                  Your decks and folders remain safely saved on this device. Free daily quota resets tomorrow (midnight Pacific Time).
+                </p>
+                <div className="flex flex-wrap gap-3 pt-0.5 text-[11px] font-semibold">
+                  <a
+                    href="https://firebase.google.com/pricing#cloud-firestore"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-amber-900 underline hover:text-amber-700"
+                  >
+                    Spark / Enterprise Quota Info
+                  </a>
+                  <a
+                    href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-amber-900 underline hover:text-amber-700"
+                  >
+                    Open Firebase Console
+                  </a>
+                </div>
+              </div>
+            )}
+
             {currentUser ? (
               <button
                 type="button"
                 onClick={onSyncNow}
-                disabled={cloudSyncing}
+                disabled={cloudSyncing || cloudQuotaPaused}
                 className="w-full min-h-[44px] px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 transition-colors"
               >
                 <RefreshCw className={`w-4 h-4 ${cloudSyncing ? 'animate-spin' : ''}`} />
-                <span>Backup {deckCount} Decks to Google Cloud</span>
+                <span>
+                  {cloudQuotaPaused
+                    ? 'Cloud Sync Paused Until Daily Reset'
+                    : `Backup ${deckCount} Decks to Google Cloud`}
+                </span>
               </button>
             ) : (
               <button

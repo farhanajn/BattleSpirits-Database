@@ -6,12 +6,19 @@ import { terminate } from 'firebase/firestore';
 import { db } from '../src/firebase.ts';
 import {
   clearCloudQuotaCooldown,
+  computeMsUntilNextPacificMidnight,
+  guardFirestoreWrite,
   isCloudQuotaCooldownActive,
   isCloudWriteCooldownActive,
   isFirestoreQuotaError,
   markCloudQuotaExhausted,
+  onCloudQuotaCleared,
+  onCloudQuotaExhausted,
 } from '../src/utils/firestoreQuota.ts';
-import { fetchUserCloudLibrary } from '../src/utils/cloudSync.ts';
+import {
+  fetchUserCloudLibrary,
+  syncAllDecksAndFoldersToCloud,
+} from '../src/utils/cloudSync.ts';
 import {
   fetchPublishedCatalogAdditions,
   fetchValidationRecordsFromFirestore,
@@ -69,7 +76,7 @@ describe('Firestore Read/Write Quota Protection & Cooldown', () => {
     assert.equal(isFirestoreQuotaError(null), false);
   });
 
-  test('active quota cooldown persists across storage instances and blocks redundant Firestore reads', async () => {
+  test('active quota cooldown persists across storage instances and blocks redundant Firestore reads and force writes', async () => {
     assert.equal(isCloudQuotaCooldownActive(), false);
     assert.equal(isCloudWriteCooldownActive(), false);
 
@@ -82,8 +89,67 @@ describe('Firestore Read/Write Quota Protection & Cooldown', () => {
       (err: unknown) => isFirestoreQuotaError(err)
     );
 
+    await assert.rejects(
+      () => syncAllDecksAndFoldersToCloud('test-uid-123', [], [], { force: true }),
+      (err: unknown) => isFirestoreQuotaError(err)
+    );
+
     const validationRows = await fetchValidationRecordsFromFirestore();
     assert.deepEqual(validationRows, []);
+  });
+
+  test('guardFirestoreWrite aborts hanging SDK writes immediately when quota exhaustion triggers', async () => {
+    let exhaustedEvents = 0;
+    let clearedEvents = 0;
+    const unsubEx = onCloudQuotaExhausted(() => {
+      exhaustedEvents++;
+    });
+    const unsubCl = onCloudQuotaCleared(() => {
+      clearedEvents++;
+    });
+
+    try {
+      let called = false;
+      const hangingWrite = guardFirestoreWrite(
+        () =>
+          new Promise<void>(() => {
+            called = true;
+            // Simulates Firestore WriteStream hanging in 60s backoff on resource-exhausted
+          })
+      );
+      assert.equal(called, true);
+
+      setTimeout(() => markCloudQuotaExhausted(60_000), 15);
+
+      await assert.rejects(
+        () => hangingWrite,
+        (err: unknown) => isFirestoreQuotaError(err)
+      );
+      assert.equal(exhaustedEvents, 1);
+
+      // Subsequent guarded write short-circuits without invoking operation at all
+      let secondCalled = false;
+      await assert.rejects(
+        () =>
+          guardFirestoreWrite(async () => {
+            secondCalled = true;
+          }),
+        (err: unknown) => isFirestoreQuotaError(err)
+      );
+      assert.equal(secondCalled, false);
+
+      clearCloudQuotaCooldown();
+      assert.equal(clearedEvents, 1);
+    } finally {
+      unsubEx();
+      unsubCl();
+    }
+  });
+
+  test('computeMsUntilNextPacificMidnight stays within valid daily reset bounds', () => {
+    const ms = computeMsUntilNextPacificMidnight(Date.UTC(2026, 10, 27, 18, 25, 0));
+    assert.ok(ms >= 30 * 60 * 1000);
+    assert.ok(ms <= 24 * 60 * 60 * 1000 + 60_000);
   });
 
   test('fetchPublishedCatalogAdditions returns cached data with zero Firestore reads when cache is fresh or cooldown active', async () => {

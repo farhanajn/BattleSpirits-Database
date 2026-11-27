@@ -19,6 +19,11 @@ import {
 } from '../src/utils/cardCompletion.ts';
 import { isCardArtworkFile } from './wikiCardLookup.ts';
 import {
+  classifyWikiPageBundle,
+  isStrictSystemWikiTitle,
+  type WikiPageClassification,
+} from './wikiPageClassifier.ts';
+import {
   batchFetchWikiPages,
   cleanWikitextInline,
   defaultVariant,
@@ -112,6 +117,18 @@ export interface DiscoveredCardEntry {
   approvedForImport: boolean;
   imported: boolean;
   importedAt?: string | null;
+  wikiPageType?: WikiPageClassification;
+  pageTypeReason?: string;
+  lastRetryAt?: string | null;
+  lastRetryOutcome?:
+    | 'imported'
+    | 'matched_existing'
+    | 'updated_metadata'
+    | 'reconciled_set_page'
+    | 'non_card_excluded'
+    | 'still_recoverable'
+    | 'needs_review'
+    | 'failed';
 }
 
 export interface CatalogScanErrorLog {
@@ -119,6 +136,41 @@ export interface CatalogScanErrorLog {
   page?: string;
   message: string;
   timestamp: string;
+}
+
+export interface CatalogRetrySummary {
+  mode: 'recoverable' | 'single' | 'needs_review' | 'all';
+  ranAt: string;
+  recoverableFound: number;
+  reprocessedCount: number;
+  recoveredToReadyCount: number;
+  importedCount: number;
+  matchedExistingCount: number;
+  updatedExistingCount: number;
+  extractedFromSetPagesCount: number;
+  nonCardExcludedCount: number;
+  resolvedCount: number;
+  stillRecoverableCount: number;
+  needsReviewRemainingCount: number;
+  failedAgainCount: number;
+  failureReasons: Array<{
+    category: RejectionDiagnosticCategory;
+    reason: string;
+    count: number;
+    sampleCardNumbers: string[];
+  }>;
+  nextCursor?: string | null;
+  remainingBatchCount?: number;
+}
+
+export interface CatalogDiagnosticsSnapshot {
+  rejectedCards: RejectedCatalogCard[];
+  failedImports: FailedImportRecord[];
+  confirmedDuplicatesCount: number;
+  nonCardExcludedCount: number;
+  setPagesReconciledCount: number;
+  lastRetrySummary: CatalogRetrySummary | null;
+  updatedAt: string;
 }
 
 export interface CatalogScanState {
@@ -135,6 +187,10 @@ export interface CatalogScanState {
   sets: Record<string, DiscoveredSetRecord>;
   discoveredCards: Record<string, DiscoveredCardEntry>;
   importedCards: Record<string, BattleSpiritsCard>;
+  lastFailedImports?: FailedImportRecord[];
+  lastRetrySummary?: CatalogRetrySummary | null;
+  nonCardExcludedCount?: number;
+  setPagesReconciledCount?: number;
 }
 
 export interface CatalogDependencies {
@@ -201,6 +257,8 @@ export interface RejectedCatalogCard {
   missingFields: string[];
   duplicateMatch?: string;
   classification: ComparisonClassification;
+  wikiPageType?: WikiPageClassification;
+  matchConfidence?: number;
 }
 
 export interface ImportValidationReport {
@@ -356,10 +414,31 @@ export function buildCardNumberCompareKeys(raw?: string, setCodeHint?: string): 
 
   expandNumber(base);
 
-  // Prefixless DB/Wiki numbers scoped by setCode (e.g., CP02 inside BS45 -> BS45-CP02)
+  // Prefixless & shortened promo numbers scoped strictly within same canonical set
+  // (e.g., CP02 inside BS45 -> BS45-CP02; 19-16 inside P19 <-> P19-16; PX-05 inside PX19 <-> PX19-05)
   const normSet = setCodeHint ? normalizeSetCode(setCodeHint) : '';
-  if (normSet && !base.includes('-') && !base.startsWith(normSet)) {
-    expandNumber(`${normSet}-${base}`);
+  if (normSet) {
+    if (!base.includes('-') && !base.startsWith(normSet)) {
+      expandNumber(`${normSet}-${base}`);
+    }
+    const pSetMatch = normSet.match(/^P(\d{2,3})$/);
+    if (pSetMatch) {
+      const yr = pSetMatch[1];
+      if (base.startsWith(`${yr}-`)) {
+        expandNumber(`P${base}`);
+      } else if (base.startsWith(`P${yr}-`)) {
+        expandNumber(base.slice(1));
+      }
+    }
+    const pxSetMatch = normSet.match(/^PX(\d{2,3})$/);
+    if (pxSetMatch) {
+      const yr = pxSetMatch[1];
+      if (base.startsWith('PX-')) {
+        expandNumber(`PX${yr}-${base.slice(3)}`);
+      } else if (base.startsWith(`PX${yr}-`)) {
+        expandNumber(`PX-${base.slice(pxSetMatch[0].length + 1)}`);
+      }
+    }
   }
 
   return Array.from(keys);
@@ -494,6 +573,18 @@ const PROMO_WIKI_TITLE_TO_CODE: Record<string, string> = {
   'standard promo cards/promo x-rares': 'PX26-STD',
 };
 
+const PROMO_SLUG_ALIAS_TO_CODE: Record<string, string> = {
+  'PROMO-CARDS': 'PROMO-X',
+  'PROMO-CARDS-PROMO-X-RARES': 'PROMO-PX',
+  'PROMO-CARDS-REGULAR-PROMOS': 'PROMO-REG',
+  'PROMO-CARDS-CAMPAIGN-PROMOS': 'PROMO-CMP',
+  'PROMO-CARDS-LIMITED-PACK-PROMOS': 'PROMO-LIM',
+  'PROMO-CARDS-JUMP-PROMOS': 'PROMO-JMP',
+  'PROMO-CARDS-ANIME-PROMOS': 'PROMO-ANM',
+  'STANDARD-PROMO-CARDS-REGULAR-PROMOS': 'RP26-STD',
+  'STANDARD-PROMO-CARDS-PROMO-X-RARES': 'PX26-STD',
+};
+
 /**
  * Normalizes spacing/hyphenation/casing variants of set identifiers (e.g. "BS 23", "bs-23" -> "BS23",
  * "26R SD 01" -> "26RSD01", "PX 25" -> "PX25") without collapsing distinct sets ("BS01" vs "SD01" vs "01").
@@ -502,6 +593,14 @@ export function normalizeSetCode(rawCode: string): string {
   const rawLower = String(rawCode || '').trim().toLowerCase();
   if (PROMO_WIKI_TITLE_TO_CODE[rawLower]) {
     return PROMO_WIKI_TITLE_TO_CODE[rawLower];
+  }
+  const rawSlugUpper = String(rawCode || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (PROMO_SLUG_ALIAS_TO_CODE[rawSlugUpper]) {
+    return PROMO_SLUG_ALIAS_TO_CODE[rawSlugUpper];
   }
 
   const cleaned = String(rawCode || '')
@@ -529,6 +628,14 @@ export function sanitizeSetCode(rawTitle: string): string {
   const rawLower = rawTitle.trim().toLowerCase();
   if (PROMO_WIKI_TITLE_TO_CODE[rawLower]) {
     return PROMO_WIKI_TITLE_TO_CODE[rawLower];
+  }
+  const rawSlugUpper = rawTitle
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (PROMO_SLUG_ALIAS_TO_CODE[rawSlugUpper]) {
+    return PROMO_SLUG_ALIAS_TO_CODE[rawSlugUpper];
   }
 
   const cleaned = rawTitle
@@ -563,6 +670,9 @@ export function sanitizeSetCode(rawTitle: string): string {
     .replace(/[^A-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 48);
+  if (PROMO_SLUG_ALIAS_TO_CODE[slug]) {
+    return PROMO_SLUG_ALIAS_TO_CODE[slug];
+  }
   return slug || `SET-${crypto.createHash('sha1').update(rawTitle).digest('hex').slice(0, 8).toUpperCase()}`;
 }
 
@@ -779,6 +889,10 @@ export function loadCatalogScanState(stateFilePath = DEFAULT_STATE_FILE): Catalo
           parsed.importedCards && typeof parsed.importedCards === 'object'
             ? parsed.importedCards
             : {},
+        lastFailedImports: Array.isArray(parsed.lastFailedImports) ? parsed.lastFailedImports : [],
+        lastRetrySummary: parsed.lastRetrySummary || null,
+        nonCardExcludedCount: Number(parsed.nonCardExcludedCount) || 0,
+        setPagesReconciledCount: Number(parsed.setPagesReconciledCount) || 0,
       };
       // Reset stale "running" status across process restarts to "paused" so admin can cleanly resume
       if (state.jobStatus === 'running') {
@@ -804,6 +918,10 @@ export function loadCatalogScanState(stateFilePath = DEFAULT_STATE_FILE): Catalo
     sets: {},
     discoveredCards: {},
     importedCards: {},
+    lastFailedImports: [],
+    lastRetrySummary: null,
+    nonCardExcludedCount: 0,
+    setPagesReconciledCount: 0,
   };
 }
 

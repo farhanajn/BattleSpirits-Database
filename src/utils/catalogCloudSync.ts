@@ -27,6 +27,7 @@ import {
 } from './cardFilterNormalization';
 import { isPlaceholderArtworkUrl } from './cardCompletion';
 import {
+  guardFirestoreWrite,
   isCloudQuotaCooldownActive,
   isCloudWriteCooldownActive,
   isFirestoreQuotaError,
@@ -650,7 +651,7 @@ export async function publishCatalogAdditionsToFirestore(
           });
         }
       }
-      await batch.commit();
+      await guardFirestoreWrite(() => batch.commit());
     };
 
     try {
@@ -689,16 +690,20 @@ export async function publishCatalogAdditionsToFirestore(
           await withTransientFirestoreRetry(async () => {
             const existing = await getDoc(ref);
             if (existing.exists()) {
-              await updateDoc(ref, {
-                ...item.basePayload,
-                updatedAt: serverTimestamp(),
-              });
+              await guardFirestoreWrite(() =>
+                updateDoc(ref, {
+                  ...item.basePayload,
+                  updatedAt: serverTimestamp(),
+                })
+              );
             } else {
-              await setDoc(ref, {
-                ...item.basePayload,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
+              await guardFirestoreWrite(() =>
+                setDoc(ref, {
+                  ...item.basePayload,
+                  createdAt: serverTimestamp(),
+                  updatedAt: serverTimestamp(),
+                })
+              );
             }
           });
           existingSetsById.set(item.safeCode, item.basePayload);
@@ -821,7 +826,7 @@ export async function publishCatalogAdditionsToFirestore(
           });
         }
       }
-      await batch.commit();
+      await guardFirestoreWrite(() => batch.commit());
     };
 
     try {
@@ -860,16 +865,20 @@ export async function publishCatalogAdditionsToFirestore(
           await withTransientFirestoreRetry(async () => {
             const existing = await getDoc(ref);
             if (existing.exists()) {
-              await updateDoc(ref, {
-                ...item.basePayload,
-                updatedAt: serverTimestamp(),
-              });
+              await guardFirestoreWrite(() =>
+                updateDoc(ref, {
+                  ...item.basePayload,
+                  updatedAt: serverTimestamp(),
+                })
+              );
             } else {
-              await setDoc(ref, {
-                ...item.basePayload,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
+              await guardFirestoreWrite(() =>
+                setDoc(ref, {
+                  ...item.basePayload,
+                  createdAt: serverTimestamp(),
+                  updatedAt: serverTimestamp(),
+                })
+              );
             }
           });
           existingCardsById.set(item.safeId, item.basePayload);
@@ -908,6 +917,8 @@ export async function publishCatalogAdditionsToFirestore(
   return { pushedSets, pushedCards, failedSets, failedCards, failures };
 }
 
+const syncedValidationSignatureByKey = new Map<string, string>();
+
 export async function syncValidationRecordsToFirestore(
   records: ClientArtworkValidationRecord[]
 ): Promise<SyncValidationResult> {
@@ -924,7 +935,7 @@ export async function syncValidationRecordsToFirestore(
     };
   }
 
-  const entries: Array<{ safeKey: string; payload: Record<string, unknown> }> = [];
+  const entries: Array<{ safeKey: string; sig: string; payload: Record<string, unknown> }> = [];
   const seenKeys = new Set<string>();
 
   for (const r of records) {
@@ -932,38 +943,55 @@ export async function syncValidationRecordsToFirestore(
     if (seenKeys.has(safeKey)) continue;
     seenKeys.add(safeKey);
 
+    const payloadWithoutTimestamp = {
+      mappingKey: safeKey,
+      cardId: String(r.cardId || '').slice(0, 128),
+      cardName: String(r.cardName || '').slice(0, 200),
+      cardNumber: String(r.cardNumber || '').slice(0, 64),
+      setCode: String(r.setCode || '').slice(0, 64),
+      mappingType: ['direct_url', 'wiki_file', 'wiki_title'].includes(r.mappingType)
+        ? r.mappingType
+        : 'wiki_title',
+      originalUrl: String(r.originalUrl || '').slice(0, 1000),
+      wikiTitle: String(r.wikiTitle || '').slice(0, 200),
+      fileName: String(r.fileName || '').slice(0, 250),
+      status: ['healthy', 'broken', 'redirected', 'unverified', 'temporarily_unavailable'].includes(
+        r.status
+      )
+        ? r.status
+        : 'unverified',
+      httpStatus: Math.max(0, Math.min(999, Math.round(Number(r.httpStatus) || 0))),
+      finalUrl: String(r.finalUrl || '').slice(0, 1000),
+      lastCheckedAt: String(r.lastCheckedAt || '').slice(0, 40),
+      lastSuccessAt: String(r.lastSuccessAt || '').slice(0, 40),
+      consecutiveFailures: Math.max(0, Math.round(Number(r.consecutiveFailures) || 0)),
+      failureReason: String(r.failureReason || '').slice(0, 500),
+      lastCycleId: String(r.lastCycleId || '').slice(0, 80),
+    };
+
+    const sig = JSON.stringify([
+      payloadWithoutTimestamp.status,
+      payloadWithoutTimestamp.httpStatus,
+      payloadWithoutTimestamp.finalUrl,
+      payloadWithoutTimestamp.originalUrl,
+      payloadWithoutTimestamp.consecutiveFailures,
+      payloadWithoutTimestamp.failureReason,
+    ]);
+    if (syncedValidationSignatureByKey.get(safeKey) === sig) {
+      continue;
+    }
+
     entries.push({
       safeKey,
+      sig,
       payload: {
-        mappingKey: safeKey,
-        cardId: String(r.cardId || '').slice(0, 128),
-        cardName: String(r.cardName || '').slice(0, 200),
-        cardNumber: String(r.cardNumber || '').slice(0, 64),
-        setCode: String(r.setCode || '').slice(0, 64),
-        mappingType: ['direct_url', 'wiki_file', 'wiki_title'].includes(r.mappingType)
-          ? r.mappingType
-          : 'wiki_title',
-        originalUrl: String(r.originalUrl || '').slice(0, 1000),
-        wikiTitle: String(r.wikiTitle || '').slice(0, 200),
-        fileName: String(r.fileName || '').slice(0, 250),
-        status: ['healthy', 'broken', 'redirected', 'unverified', 'temporarily_unavailable'].includes(
-          r.status
-        )
-          ? r.status
-          : 'unverified',
-        httpStatus: Math.max(0, Math.min(999, Math.round(Number(r.httpStatus) || 0))),
-        finalUrl: String(r.finalUrl || '').slice(0, 1000),
-        lastCheckedAt: String(r.lastCheckedAt || '').slice(0, 40),
-        lastSuccessAt: String(r.lastSuccessAt || '').slice(0, 40),
-        consecutiveFailures: Math.max(0, Math.round(Number(r.consecutiveFailures) || 0)),
-        failureReason: String(r.failureReason || '').slice(0, 500),
-        lastCycleId: String(r.lastCycleId || '').slice(0, 80),
+        ...payloadWithoutTimestamp,
         updatedAt: serverTimestamp(),
       },
     });
   }
 
-  let quotaHit = false;
+  let quotaHit = isCloudWriteCooldownActive();
   for (let i = 0; i < entries.length && !quotaHit; i += BATCH_CHUNK_SIZE) {
     const chunk = entries.slice(i, i + BATCH_CHUNK_SIZE);
     const batch = writeBatch(db);
@@ -972,7 +1000,8 @@ export async function syncValidationRecordsToFirestore(
     }
 
     try {
-      await batch.commit();
+      await guardFirestoreWrite(() => batch.commit());
+      for (const item of chunk) syncedValidationSignatureByKey.set(item.safeKey, item.sig);
       syncedCount += chunk.length;
     } catch (chunkErr) {
       if (isFirestoreQuotaError(chunkErr)) {
@@ -985,9 +1014,15 @@ export async function syncValidationRecordsToFirestore(
         break;
       }
       for (const item of chunk) {
-        if (quotaHit) break;
+        if (quotaHit || isCloudWriteCooldownActive()) {
+          quotaHit = true;
+          break;
+        }
         try {
-          await setDoc(doc(db, 'artworkValidations', item.safeKey), item.payload);
+          await guardFirestoreWrite(() =>
+            setDoc(doc(db, 'artworkValidations', item.safeKey), item.payload)
+          );
+          syncedValidationSignatureByKey.set(item.safeKey, item.sig);
           syncedCount++;
         } catch (err) {
           if (isFirestoreQuotaError(err)) {

@@ -22,6 +22,8 @@ import {
 
 import {
   clearCloudQuotaCooldown,
+  createQuotaExceededError,
+  guardFirestoreWrite,
   isCloudQuotaCooldownActive,
   isCloudWriteCooldownActive,
   isFirestoreQuotaError,
@@ -45,12 +47,6 @@ function sanitizeOptionalColor(c: unknown): CardColor | '' {
 function sanitizeId(raw: string): string {
   const cleaned = raw.replace(/[^a-zA-Z0-9_\-]/g, '-').slice(0, 128);
   return cleaned || `id-${Date.now()}`;
-}
-
-function createQuotaExceededError(message = 'Quota limit exceeded. Daily free-tier limit reached.'): Error {
-  const err = new Error(message) as Error & { code?: string };
-  err.code = 'resource-exhausted';
-  return err;
 }
 
 function rethrowFirestoreError(
@@ -125,23 +121,27 @@ export async function syncUserAccountsOnSignIn(user: User): Promise<void> {
         String(existingData.photoURL || '') === photoURL;
       if (!unchanged) {
         currentOp = OperationType.UPDATE;
-        await updateDoc(userRef, {
-          email,
-          displayName,
-          photoURL,
-          updatedAt: serverTimestamp(),
-        });
+        await guardFirestoreWrite(() =>
+          updateDoc(userRef, {
+            email,
+            displayName,
+            photoURL,
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } else {
       currentOp = OperationType.CREATE;
-      await setDoc(userRef, {
-        uid,
-        email,
-        displayName,
-        photoURL,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      await guardFirestoreWrite(() =>
+        setDoc(userRef, {
+          uid,
+          email,
+          displayName,
+          photoURL,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
     }
   } catch (error) {
     rethrowFirestoreError(error, currentOp, `users/${uid}`);
@@ -157,25 +157,29 @@ export async function syncUserAccountsOnSignIn(user: User): Promise<void> {
         String(existingProf.photoURL || '') === photoURL;
       if (!unchanged) {
         profileOp = OperationType.UPDATE;
-        await updateDoc(profileRef, {
-          displayName,
-          photoURL,
-          updatedAt: serverTimestamp(),
-        });
+        await guardFirestoreWrite(() =>
+          updateDoc(profileRef, {
+            displayName,
+            photoURL,
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } else {
       profileOp = OperationType.CREATE;
-      await setDoc(profileRef, {
-        uid,
-        displayName,
-        photoURL,
-        bio: 'Battle Spirits deck architect & tournament contender.',
-        favoriteColor: 'Red',
-        followersCount: 0,
-        isPublic: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      await guardFirestoreWrite(() =>
+        setDoc(profileRef, {
+          uid,
+          displayName,
+          photoURL,
+          bio: 'Battle Spirits deck architect & tournament contender.',
+          favoriteColor: 'Red',
+          followersCount: 0,
+          isPublic: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
     }
     syncedAccountSignatureByUid.set(uid, accountSig);
   } catch (error) {
@@ -277,12 +281,20 @@ export async function syncAllDecksAndFoldersToCloud(
   options?: { force?: boolean }
 ): Promise<void> {
   if (!uid) return;
-  if (!options?.force && isCloudQuotaCooldownActive()) return;
+  if (isCloudQuotaCooldownActive()) {
+    if (options?.force) {
+      throw createQuotaExceededError();
+    }
+    return;
+  }
 
   const folderSnapshots = getUidSnapshotMap(syncedFolderSnapshotByUid, uid);
   const deckSnapshots = getUidSnapshotMap(syncedDeckSnapshotByUid, uid);
 
   for (const folder of folders) {
+    if (isCloudQuotaCooldownActive()) {
+      throw createQuotaExceededError();
+    }
     const folderId = sanitizeId(folder.id);
     const colorVal = sanitizeOptionalColor(folder.color);
     const safeName = (folder.name || 'Untitled Folder').trim().slice(0, 80) || 'Folder';
@@ -297,11 +309,13 @@ export async function syncAllDecksAndFoldersToCloud(
     try {
       if (folderSnapshots.has(folderId)) {
         try {
-          await updateDoc(ref, {
-            name: safeName,
-            color: colorVal,
-            updatedAt: serverTimestamp(),
-          });
+          await guardFirestoreWrite(() =>
+            updateDoc(ref, {
+              name: safeName,
+              color: colorVal,
+              updatedAt: serverTimestamp(),
+            })
+          );
           folderSnapshots.set(folderId, nextSig);
           continue;
         } catch (updateErr) {
@@ -321,22 +335,26 @@ export async function syncAllDecksAndFoldersToCloud(
           String(existing.name || '') === safeName &&
           String(existing.color || '') === colorVal;
         if (!unchanged) {
-          await updateDoc(ref, {
-            name: safeName,
-            color: colorVal,
-            updatedAt: serverTimestamp(),
-          });
+          await guardFirestoreWrite(() =>
+            updateDoc(ref, {
+              name: safeName,
+              color: colorVal,
+              updatedAt: serverTimestamp(),
+            })
+          );
         }
       } else {
-        await setDoc(ref, {
-          id: folderId,
-          ownerUid: uid,
-          name: safeName,
-          color: colorVal,
-          clientCreatedAt: (folder.createdAt || new Date().toISOString().slice(0, 10)).slice(0, 40),
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await guardFirestoreWrite(() =>
+          setDoc(ref, {
+            id: folderId,
+            ownerUid: uid,
+            name: safeName,
+            color: colorVal,
+            clientCreatedAt: (folder.createdAt || new Date().toISOString().slice(0, 10)).slice(0, 40),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
       folderSnapshots.set(folderId, nextSig);
     } catch (error) {
@@ -345,6 +363,9 @@ export async function syncAllDecksAndFoldersToCloud(
   }
 
   for (const deck of decks) {
+    if (isCloudQuotaCooldownActive()) {
+      throw createQuotaExceededError();
+    }
     const deckId = sanitizeId(deck.id);
     const cleanEntries = (deck.entries || [])
       .filter((e) => e && e.cardId && e.quantity > 0)
@@ -379,16 +400,18 @@ export async function syncAllDecksAndFoldersToCloud(
     try {
       if (deckSnapshots.has(deckId)) {
         try {
-          await updateDoc(ref, {
-            name: safeName,
-            format: safeFmt,
-            archetype: safeArch,
-            folderId: safeFolderId,
-            category: safeCat,
-            clientUpdatedAt: safeUpdated,
-            entries: cleanEntries,
-            updatedAt: serverTimestamp(),
-          });
+          await guardFirestoreWrite(() =>
+            updateDoc(ref, {
+              name: safeName,
+              format: safeFmt,
+              archetype: safeArch,
+              folderId: safeFolderId,
+              category: safeCat,
+              clientUpdatedAt: safeUpdated,
+              entries: cleanEntries,
+              updatedAt: serverTimestamp(),
+            })
+          );
           deckSnapshots.set(deckId, nextSig);
           continue;
         } catch (updateErr) {
@@ -419,7 +442,24 @@ export async function syncAllDecksAndFoldersToCloud(
           String(existing.clientUpdatedAt || '') === safeUpdated &&
           JSON.stringify(existingEntries) === JSON.stringify(cleanEntries);
         if (!unchanged) {
-          await updateDoc(ref, {
+          await guardFirestoreWrite(() =>
+            updateDoc(ref, {
+              name: safeName,
+              format: safeFmt,
+              archetype: safeArch,
+              folderId: safeFolderId,
+              category: safeCat,
+              clientUpdatedAt: safeUpdated,
+              entries: cleanEntries,
+              updatedAt: serverTimestamp(),
+            })
+          );
+        }
+      } else {
+        await guardFirestoreWrite(() =>
+          setDoc(ref, {
+            id: deckId,
+            ownerUid: uid,
             name: safeName,
             format: safeFmt,
             archetype: safeArch,
@@ -427,32 +467,15 @@ export async function syncAllDecksAndFoldersToCloud(
             category: safeCat,
             clientUpdatedAt: safeUpdated,
             entries: cleanEntries,
+            createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
-          });
-        }
-      } else {
-        await setDoc(ref, {
-          id: deckId,
-          ownerUid: uid,
-          name: safeName,
-          format: safeFmt,
-          archetype: safeArch,
-          folderId: safeFolderId,
-          category: safeCat,
-          clientUpdatedAt: safeUpdated,
-          entries: cleanEntries,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+          })
+        );
       }
       deckSnapshots.set(deckId, nextSig);
     } catch (error) {
       rethrowFirestoreError(error, OperationType.WRITE, path);
     }
-  }
-
-  if (options?.force) {
-    clearCloudQuotaCooldown();
   }
 }
 
@@ -461,7 +484,7 @@ export async function deleteCloudDeck(uid: string, deckId: string): Promise<void
   const safeId = sanitizeId(deckId);
   const path = `users/${uid}/decks/${safeId}`;
   try {
-    await deleteDoc(doc(db, path));
+    await guardFirestoreWrite(() => deleteDoc(doc(db, path)));
     syncedDeckSnapshotByUid.get(uid)?.delete(safeId);
   } catch (error) {
     rethrowFirestoreError(error, OperationType.DELETE, path);
@@ -473,7 +496,7 @@ export async function deleteCloudFolder(uid: string, folderId: string): Promise<
   const safeId = sanitizeId(folderId);
   const path = `users/${uid}/folders/${safeId}`;
   try {
-    await deleteDoc(doc(db, path));
+    await guardFirestoreWrite(() => deleteDoc(doc(db, path)));
     syncedFolderSnapshotByUid.get(uid)?.delete(safeId);
   } catch (error) {
     rethrowFirestoreError(error, OperationType.DELETE, path);

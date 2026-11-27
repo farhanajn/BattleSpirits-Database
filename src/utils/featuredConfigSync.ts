@@ -11,6 +11,7 @@ import { auth, db, OperationType, type FirestoreErrorInfo } from '../firebase';
 import { resolveAdminStatusFromUser } from '../hooks/useAdmin';
 import { DEFAULT_FEATURED_MODE, type FeaturedCardsMode } from './featuredCards';
 import {
+  guardFirestoreWrite,
   isCloudQuotaCooldownActive,
   isCloudWriteCooldownActive,
   isFirestoreQuotaError,
@@ -251,19 +252,23 @@ export async function updateSharedFeaturedMode(
       const ref = doc(db, SHARED_FEATURED_CONFIG_COLLECTION, SHARED_FEATURED_CONFIG_DOC_ID);
       const existing = await getDoc(ref);
       if (existing.exists()) {
-        await updateDoc(ref, {
-          mode: targetMode,
-          updatedByUid: adminUid,
-          updatedAt: serverTimestamp(),
-        });
+        await guardFirestoreWrite(() =>
+          updateDoc(ref, {
+            mode: targetMode,
+            updatedByUid: adminUid,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } else {
-        await setDoc(ref, {
-          id: SHARED_FEATURED_CONFIG_DOC_ID,
-          mode: targetMode,
-          updatedByUid: adminUid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await guardFirestoreWrite(() =>
+          setDoc(ref, {
+            id: SHARED_FEATURED_CONFIG_DOC_ID,
+            mode: targetMode,
+            updatedByUid: adminUid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     });
 
